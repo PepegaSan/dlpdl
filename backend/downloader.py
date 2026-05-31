@@ -328,7 +328,7 @@ class _DownloadWorker:
         batch_dir = os.path.join(self.temp_dir, 'clip')
         os.makedirs(batch_dir, exist_ok=True)
         try:
-            produced = self._merge_part(
+            produced, detail = self._merge_part(
                 0, start, end, batch_dir, 0.0, 0.94, 1, ytdl_params,
             )
             if not produced or not os.path.isfile(produced):
@@ -338,7 +338,7 @@ class _DownloadWorker:
                 if os.path.exists(final):
                     os.remove(final)
                 shutil.move(produced, final)
-            self._mark_finished(final, msg='Fertig (Smart-Clip)')
+            self._mark_finished(final, msg=f'Fertig ({detail})')
             return True
         finally:
             shutil.rmtree(batch_dir, ignore_errors=True)
@@ -369,7 +369,7 @@ class _DownloadWorker:
             except OSError:
                 pass
         if ok:
-            self._mark_finished(out_name, msg='Fertig (Smart-Clip)')
+            self._mark_finished(out_name, msg=f'Fertig ({msg})')
             return True
         log.error('smart-clip failed: %s', msg)
         return False
@@ -421,7 +421,7 @@ class _DownloadWorker:
         part_scale: float,
         total_parts: int,
         ytdl_params: dict,
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], str]:
         """Download one merge segment. HLS uses smart_clip directly (yt-dlp often hangs on clipped HLS)."""
         part_out = os.path.join(batch_dir, f'part_{index:03d}.mp4')
         if self._treat_as_hls():
@@ -453,9 +453,9 @@ class _DownloadWorker:
                 except OSError:
                     pass
             if ok and os.path.isfile(part_out):
-                return part_out
+                return part_out, err
             log.error('merge part %s smart-clip failed: %s', index, err)
-            return None
+            return None, err
 
         part_tmpl = os.path.join(batch_dir, f'part_{index:03d}.%(ext)s')
         part_params = {
@@ -474,7 +474,7 @@ class _DownloadWorker:
         if code == 0:
             matches = sorted(glob.glob(os.path.join(batch_dir, f'part_{index:03d}.*')))
             produced = matches[0] if matches else None
-        return produced
+        return produced, 'yt-dlp'
 
     def _merge_clips(self, ytdl_params: dict) -> int:
         ranges = list(self.spec.clip_ranges)
@@ -494,7 +494,7 @@ class _DownloadWorker:
                     fraction=part_base,
                     msg=f'Teil {i + 1}/{total_parts}: starte…',
                 ))
-                produced = self._merge_part(i, start, end, batch_dir, part_base, part_scale, total_parts, ytdl_params)
+                produced, _detail = self._merge_part(i, start, end, batch_dir, part_base, part_scale, total_parts, ytdl_params)
                 if produced is None:
                     self._put({'status': 'error', 'msg': f'Teil {i + 1}/{total_parts} fehlgeschlagen'})
                     return 1

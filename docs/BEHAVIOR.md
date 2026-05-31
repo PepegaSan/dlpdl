@@ -6,7 +6,8 @@ This document records flows that were fixed during development so they are not a
 
 | Scenario | How to queue | Why |
 | --- | --- | --- |
-| **Normal page with `<video>`** (YouTube, direct MP4, etc.) | Clip bar or popup → send clips; uses **page URL** if no sniffed stream | yt-dlp handles the page URL; worked without iframe sniffer |
+| **Normal page with `<video>`** (YouTube, Vimeo, …) | **In Queue** | **Page URL** to yt-dlp (same as MeTube) — not auto-replaced by sniffed CDN URLs. |
+| **Shell pages** (`.php` / `.html` player) | **In Queue** | Needs a **usable** sniffed stream or `<video src>`; page URL alone would hit yt-dlp `php` extension errors. Use **Mit Schnitt** on a listed stream if queue fails. |
 | **Embed / iframe hosters** (StreamSB, Streamtape, …) | Mark times in iframe bar → popup → **Mit Schnitt** on a **detected stream** | Page URL is not downloadable; need `.m3u8` + Referer from sniffer |
 | **Queue buttons** (`In Queue einzeln/merged`) on embed pages | Auto-uses best **HLS stream** for the tab when available (`queueClips` → `queueStream`) | Avoids sending only the aggregator page URL |
 
@@ -26,16 +27,17 @@ Branding: UI strings and DOM ids use `clip-direct-*`, not `metube-*`. Reload hin
 
 Output filenames use `clip_MM-SS-MM-SS_` (no `:`) for cross-platform safety.
 
-### HLS picture glitches at clip start (first seconds blocky)
+### HLS clipping (`hls_clipper.py`)
 
-HLS segments often start with P-frames that need an earlier keyframe. Fix in `hls_clipper.py`:
+**Primary:** ffmpeg reads the **`.m3u8` URL** directly (`-ss` / `-to` on the playlist timeline). Job status may show `HLS: ffmpeg schneidet…`; finished message includes **`ok (ffmpeg-hls)`** when this path succeeded.
 
-- Download **one segment before** the clip window (decoder preroll).
-- ffmpeg: `-ss` **before** `-i` (keyframe-aligned cut), `+discardcorrupt`, audio `aresample=async=1`.
+**Fallback:** download TS segments → **ffmpeg concat demuxer** (not raw byte concat) → `-ss` / `-t` on the merged timeline. Message: **`ok (segments)`**.
 
-### Frozen picture at end while audio continues
+**Start quality:** native path uses ~10s decode preroll (`-ss` before + after `-i`). Fallback prepends **two** HLS segments and uses `trim`/`atrim` on the concat demuxer.
 
-Some HLS TS muxes have longer audio than video in the downloaded window. ffmpeg uses **`-shortest`** so output ends when the video stream ends (no 30s frozen last frame).
+**Duration check:** if native ffmpeg output is much longer than `end − start`, fallback runs automatically.
+
+Docker dev: `deploy/docker-compose.yml` mounts `../backend` into the container so rebuild is not required for Python-only changes (restart container after edits).
 
 ## Web UI (`ui/app.js`)
 

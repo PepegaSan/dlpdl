@@ -12,4 +12,5 @@ services:
       PORT: "8090"
     volumes:
       - ../downloads:/downloads
+      - ../backend:/app/backend:ro
     restart: unless-stopped

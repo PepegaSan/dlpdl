@@ -9,6 +9,7 @@ from aiohttp import web
 
 from .clip_parse import ClipParseError, optional_clip_field, parse_clips_list
 from .downloader import JobRunner, JobSpec, parse_ytdl_overrides
+from .smart_clip import is_hls_url
 
 log = logging.getLogger('clip_direct')
 
@@ -70,8 +71,7 @@ def _job_spec_from_post(post: dict) -> JobSpec:
             clip_start = 0.0
 
     overrides = parse_ytdl_overrides(post.get('ytdl_options_overrides'))
-    is_hls = '.m3u8' in url.lower()
-    if is_hls:
+    if is_hls_url(url):
         overrides.setdefault('hls_use_mpegts', True)
         overrides.setdefault('external_downloader', {'m3u8': 'ffmpeg'})
 

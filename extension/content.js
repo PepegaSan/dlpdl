@@ -231,6 +231,51 @@ function videoArea(v) {
   }
 }
 
+function mediaUrlLooksLikeStream(url) {
+  if (!url || typeof url !== 'string') {
+    return false;
+  }
+  const u = url.toLowerCase();
+  if (u.startsWith('blob:') || u.startsWith('data:')) {
+    return false;
+  }
+  if (!/^https?:\/\//i.test(u)) {
+    return false;
+  }
+  return /\.m3u8|m3u8%2f|format=m3u8|\.mp4|\.webm|\.mkv|\/hls\/|manifest/i.test(u);
+}
+
+function collectVideoSourceUrls(video) {
+  const urls = [];
+  const push = (u) => {
+    if (u && typeof u === 'string') {
+      urls.push(u);
+    }
+  };
+  push(video.currentSrc);
+  push(video.src);
+  for (const source of video.querySelectorAll('source')) {
+    push(source.src);
+  }
+  push(video.getAttribute('data-src'));
+  push(video.getAttribute('data-url'));
+  return urls.filter((u) => !u.startsWith('blob:') && !u.startsWith('data:'));
+}
+
+function getVideoMediaUrlFromPage() {
+  const video = getActiveVideo();
+  if (!video) {
+    return Promise.resolve({ ok: false, error: 'no_video' });
+  }
+  const urls = collectVideoSourceUrls(video);
+  const stream = urls.find(mediaUrlLooksLikeStream);
+  const url = stream || urls.find((u) => /^https?:\/\//i.test(u));
+  if (!url) {
+    return Promise.resolve({ ok: false, error: 'no_media_url' });
+  }
+  return Promise.resolve({ ok: true, url });
+}
+
 function getActiveVideo() {
   let candidates = [];
   try {
@@ -666,6 +711,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (handleInvalidExtensionContext()) {
     sendResponse({ ok: false, error: 'context_invalidated', hint: 'reload_tab' });
+    return true;
+  }
+  if (msg?.action === 'getVideoMediaUrl') {
+    getVideoMediaUrlFromPage().then(sendResponse);
     return true;
   }
   if (msg?.action === 'getVideoState') {
