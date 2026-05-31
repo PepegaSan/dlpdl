@@ -1,38 +1,19 @@
-import { apiUrl, buildJobBody, buildStreamJobBody } from './lib/clip-direct-api.js';
+import {
+  buildPageJobPayload,
+  buildStreamJobPayload,
+  jobsEndpoint,
+} from './lib/jobs-client.js';
+import {
+  classifyMediaUrl,
+  preferHlsStream,
+  requestHeadersMap,
+} from './lib/media-sniffer.js';
 import { openClipDirectUi } from './lib/open-ui.js';
 import { loadSettings } from './lib/storage.js';
+import { TabSessionStore } from './lib/tab-session.js';
 
-const SESSION_KEY = 'detectedStreams';
-const CLIPS_SESSION_KEY = 'tabClips';
-const MAX_PER_TAB = 30;
 const BADGE_COLOR = '#22c55e';
-
-let tabClips = {};
-
-chrome.storage.session.get(CLIPS_SESSION_KEY).then((stored) => {
-  const persisted = stored[CLIPS_SESSION_KEY] || {};
-  for (const [tabId, value] of Object.entries(persisted)) {
-    if (!tabClips[tabId]) tabClips[tabId] = value;
-  }
-}).catch(() => {});
-
-let clipsPersistTimer = null;
-function persistClipsSoon() {
-  if (clipsPersistTimer) return;
-  clipsPersistTimer = setTimeout(() => {
-    clipsPersistTimer = null;
-    chrome.storage.session.set({ [CLIPS_SESSION_KEY]: tabClips }).catch(() => {});
-  }, 250);
-}
-
-let memCache = {};
-
-chrome.storage.session.get(SESSION_KEY).then((stored) => {
-  const persisted = stored[SESSION_KEY] || {};
-  for (const [tabId, list] of Object.entries(persisted)) {
-    if (!memCache[tabId]) memCache[tabId] = list;
-  }
-}).catch(() => {});
+const session = new TabSessionStore();
 
 try {
   chrome.action.setBadgeBackgroundColor({ color: BADGE_COLOR });
@@ -40,48 +21,9 @@ try {
   /* ignore */
 }
 
-let persistTimer = null;
-function persistSoon() {
-  if (persistTimer) return;
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    chrome.storage.session.set({ [SESSION_KEY]: memCache }).catch(() => {});
-  }, 250);
-}
-
-function streamKind(url) {
-  let path;
-  let full;
-  try {
-    const u = new URL(url);
-    path = u.pathname.toLowerCase();
-    full = url.toLowerCase();
-  } catch {
-    return null;
-  }
-  if (path.endsWith('.m3u8') || full.includes('.m3u8?') || full.includes('.m3u8&')) return 'hls';
-  if (path.endsWith('.mpd') || full.includes('.mpd?')) return 'dash';
-  if (path.endsWith('.f4m')) return 'hds';
-  if (/\.(mp4|webm|mkv|mov)(\?|$)/.test(path) || /\.(mp4|webm|mkv|mov)(\?|&)/.test(full)) {
-    return 'file';
-  }
-  if (/\.(m4a|mp3|aac|ogg)(\?|$)/.test(path)) return 'audio';
-  return null;
-}
-
-function headersToMap(requestHeaders) {
-  const map = {};
-  if (Array.isArray(requestHeaders)) {
-    for (const h of requestHeaders) {
-      if (h?.name) map[h.name.toLowerCase()] = h.value || '';
-    }
-  }
-  return map;
-}
-
 function updateBadge(tabId) {
   if (tabId == null || tabId < 0) return;
-  const count = (memCache[tabId] || []).length;
+  const count = session.streams(tabId).length;
   try {
     chrome.action.setBadgeText({ tabId, text: count ? String(count) : '' });
   } catch {
@@ -89,24 +31,13 @@ function updateBadge(tabId) {
   }
 }
 
-function addStream(tabId, entry) {
-  if (tabId == null || tabId < 0) return;
-  const list = memCache[tabId] ? memCache[tabId] : [];
-  if (list.some((e) => e.url === entry.url)) return;
-  list.unshift(entry);
-  memCache[tabId] = list.slice(0, MAX_PER_TAB);
-  persistSoon();
-  updateBadge(tabId);
-}
-
-/** Primary sniffer: capture Referer/UA before the request is sent. */
-function captureBeforeSendHeaders(details) {
+function onBeforeSendHeaders(details) {
   const { tabId, url, requestHeaders, type } = details;
   if (tabId == null || tabId < 0) return;
-  const kind = streamKind(url);
+  const kind = classifyMediaUrl(url);
   if (!kind) return;
-  const headers = headersToMap(requestHeaders);
-  addStream(tabId, {
+  const headers = requestHeadersMap(requestHeaders);
+  session.addStream(tabId, {
     url,
     kind,
     type: type || '',
@@ -115,13 +46,13 @@ function captureBeforeSendHeaders(details) {
     userAgent: headers['user-agent'] || '',
     ts: Date.now(),
   });
+  updateBadge(tabId);
 }
 
-/** Fallback when onBeforeSendHeaders misses (e.g. some iframe/CDN requests). */
-function captureCompleted(details) {
+function onCompleted(details) {
   const { tabId, url, type, initiator, documentUrl } = details;
   if (tabId == null || tabId < 0) return;
-  const kind = streamKind(url);
+  const kind = classifyMediaUrl(url);
   if (!kind) return;
   const referer = initiator || documentUrl || '';
   let origin = '';
@@ -132,7 +63,7 @@ function captureCompleted(details) {
       /* ignore */
     }
   }
-  addStream(tabId, {
+  session.addStream(tabId, {
     url,
     kind,
     type: type || '',
@@ -141,13 +72,14 @@ function captureCompleted(details) {
     userAgent: '',
     ts: Date.now(),
   });
+  updateBadge(tabId);
 }
 
 try {
   chrome.webRequest.onBeforeSendHeaders.addListener(
     (details) => {
       try {
-        captureBeforeSendHeaders(details);
+        onBeforeSendHeaders(details);
       } catch {
         /* never break the request */
       }
@@ -156,76 +88,41 @@ try {
     ['requestHeaders'],
   );
 } catch (err) {
-  console.error('Clip-Direct: onBeforeSendHeaders registration failed', err);
+  console.error('Clip-Direct: sniffer registration failed', err);
 }
 
 chrome.webRequest.onCompleted.addListener(
   (details) => {
     try {
-      captureCompleted(details);
+      onCompleted(details);
     } catch {
-      /* never break */
+      /* ignore */
     }
   },
   { urls: ['<all_urls>'] },
 );
 
-function clearTabCaptureState(tabId) {
-  if (tabId == null || tabId < 0) return;
-  memCache[tabId] = [];
-  persistSoon();
-  updateBadge(tabId);
-  if (tabClips[tabId]) {
-    delete tabClips[tabId];
-    persistClipsSoon();
-  }
-}
-
-// Only clear on real top-level navigation (not SPA hash / tab metadata updates).
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.type === 'main_frame' && details.tabId >= 0) {
-      clearTabCaptureState(details.tabId);
+      session.clearTab(details.tabId);
+      updateBadge(details.tabId);
     }
   },
   { urls: ['<all_urls>'], types: ['main_frame'] },
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (memCache[tabId]) {
-    delete memCache[tabId];
-    persistSoon();
-  }
-  if (tabClips[tabId]) {
-    delete tabClips[tabId];
-    persistClipsSoon();
-  }
+  session.clearTab(tabId);
 });
 
-function detectedForTab(tabId) {
-  return tabId != null && memCache[tabId] ? memCache[tabId] : [];
-}
-
-/** Prefer HLS — same source merge uses when user sends from the stream list. */
-function pickBestStream(streams) {
-  if (!streams?.length) return null;
-  const hls = streams.find(
-    (s) => s?.url && (s.kind === 'hls' || /\.m3u8(\?|$|&)/i.test(s.url)),
-  );
-  return hls || streams.find((s) => s?.url) || null;
-}
-
-function clipsForTab(tabId) {
-  return tabId != null && tabClips[tabId] ? tabClips[tabId] : null;
-}
-
-async function getActiveTabId() {
+async function activeTabId() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab?.id;
 }
 
 async function postJob(settings, body) {
-  const url = apiUrl(settings.clipDirectBaseUrl);
+  const url = jobsEndpoint(settings.clipDirectBaseUrl);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -235,16 +132,14 @@ async function postJob(settings, body) {
   if (!res.ok) {
     return { ok: false, error: text || res.statusText };
   }
-  let data;
   try {
-    data = JSON.parse(text);
+    return { ok: true, data: JSON.parse(text) };
   } catch {
-    data = { raw: text };
+    return { ok: true, data: { raw: text } };
   }
-  return { ok: true, data };
 }
 
-async function openUiIfNeeded(settings) {
+async function maybeOpenUi(settings) {
   if (!settings.openUiAfterQueue) return;
   try {
     await openClipDirectUi(settings.clipDirectBaseUrl);
@@ -254,14 +149,16 @@ async function openUiIfNeeded(settings) {
 }
 
 async function queueStream(stream, pageUrl, clips, mergeClips) {
-  if (!stream?.url) return { ok: false, error: 'no_stream' };
+  if (!stream?.url) {
+    return { ok: false, error: 'no_stream' };
+  }
   const enriched = { ...stream };
   if (!enriched.referer) {
-    const tabId = await getActiveTabId();
+    const tabId = await activeTabId();
     if (tabId != null) {
       try {
         const tab = await chrome.tabs.get(tabId);
-        enriched.referer = tab.url || pageUrl || enriched.documentUrl || '';
+        enriched.referer = tab.url || pageUrl || '';
       } catch {
         enriched.referer = pageUrl || '';
       }
@@ -270,27 +167,35 @@ async function queueStream(stream, pageUrl, clips, mergeClips) {
     }
   }
   const settings = await loadSettings();
-  const body = buildStreamJobBody(settings, enriched, pageUrl, Array.isArray(clips) ? clips : [], !!mergeClips);
+  const body = buildStreamJobPayload(
+    settings,
+    enriched,
+    pageUrl,
+    Array.isArray(clips) ? clips : [],
+    !!mergeClips,
+  );
   const result = await postJob(settings, body);
-  if (result.ok) await openUiIfNeeded(settings);
+  if (result.ok) await maybeOpenUi(settings);
   return result;
 }
 
 async function queueClips(pageUrl, clips, mergeClips) {
-  if (!clips?.length) return { ok: false, error: 'no_clips' };
-  const tabId = await getActiveTabId();
-  const stream = pickBestStream(detectedForTab(tabId));
+  if (!clips?.length) {
+    return { ok: false, error: 'no_clips' };
+  }
+  const tabId = await activeTabId();
+  const stream = preferHlsStream(session.streams(tabId));
   if (stream?.url) {
     return queueStream(stream, pageUrl, clips, mergeClips);
   }
   const settings = await loadSettings();
-  const body = buildJobBody(settings, pageUrl, clips, !!mergeClips);
+  const body = buildPageJobPayload(settings, pageUrl, clips, !!mergeClips);
   const result = await postJob(settings, body);
-  if (result.ok) await openUiIfNeeded(settings);
+  if (result.ok) await maybeOpenUi(settings);
   return result;
 }
 
-async function sendToTab(tabId, payload) {
+async function forwardToTab(tabId, payload) {
   try {
     return await chrome.tabs.sendMessage(tabId, payload);
   } catch (err) {
@@ -302,29 +207,26 @@ async function sendToTab(tabId, payload) {
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.action === 'queueClips') {
     queueClips(msg.pageUrl, msg.clips, msg.mergeClips)
-      .then((result) => sendResponse(result))
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+    return true;
+  }
+
+  if (msg?.action === 'queueStream') {
+    queueStream(msg.stream, msg.pageUrl, msg.clips, msg.mergeClips)
+      .then(sendResponse)
       .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
     return true;
   }
 
   if (msg?.action === 'reportClips') {
-    const tabId = _sender?.tab?.id;
+    const tabId = sender?.tab?.id;
     if (tabId != null && tabId >= 0) {
       const clips = Array.isArray(msg.clips) ? msg.clips : [];
-      if (clips.length) {
-        tabClips[tabId] = {
-          clips,
-          pageUrl: msg.pageUrl || '',
-          pageKey: msg.pageKey || '',
-          ts: Date.now(),
-        };
-      } else if (tabClips[tabId]) {
-        delete tabClips[tabId];
-      }
-      persistClipsSoon();
+      session.setClips(tabId, clips, msg.pageUrl, msg.pageKey);
     }
     sendResponse({ ok: true });
     return true;
@@ -332,66 +234,45 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg?.action === 'getTabClips') {
     (async () => {
-      const tabId = msg.tabId ?? (await getActiveTabId());
-      sendResponse({ ok: true, tabClips: clipsForTab(tabId) });
+      const tabId = msg.tabId ?? (await activeTabId());
+      sendResponse({ ok: true, tabClips: session.clipEntry(tabId) });
     })();
     return true;
   }
 
   if (msg?.action === 'removeTabClip') {
     (async () => {
-      const tabId = msg.tabId ?? (await getActiveTabId());
-      const entry = tabId != null ? tabClips[tabId] : null;
-      if (!entry?.clips) {
-        sendResponse({ ok: false, error: 'no_clips', clips: [] });
-        return;
+      const tabId = msg.tabId ?? (await activeTabId());
+      const result = session.removeClipAt(tabId, Number(msg.index));
+      if (result.ok && tabId != null) {
+        try {
+          chrome.tabs.sendMessage(tabId, {
+            action: 'removeClip',
+            pageKey: result.pageKey,
+            index: msg.index,
+          });
+        } catch {
+          /* ignore */
+        }
       }
-      const index = Number(msg.index);
-      const clips = entry.clips.slice();
-      if (!Number.isInteger(index) || index < 0 || index >= clips.length) {
-        sendResponse({ ok: false, error: 'bad_index', clips });
-        return;
-      }
-      const pageKey = entry.pageKey || '';
-      clips.splice(index, 1);
-      if (clips.length) {
-        entry.clips = clips;
-        entry.ts = Date.now();
-      } else {
-        delete tabClips[tabId];
-      }
-      persistClipsSoon();
-      try {
-        chrome.tabs.sendMessage(tabId, { action: 'removeClip', pageKey, index });
-      } catch {
-        /* ignore */
-      }
-      sendResponse({ ok: true, clips });
+      sendResponse(result);
     })();
     return true;
   }
 
   if (msg?.action === 'getDetectedStreams') {
     (async () => {
-      const tabId = msg.tabId ?? (await getActiveTabId());
-      sendResponse({ ok: true, streams: detectedForTab(tabId) });
+      const tabId = msg.tabId ?? (await activeTabId());
+      sendResponse({ ok: true, streams: session.streams(tabId) });
     })();
-    return true;
-  }
-
-  if (msg?.action === 'queueStream') {
-    queueStream(msg.stream, msg.pageUrl, msg.clips, msg.mergeClips)
-      .then((result) => sendResponse(result))
-      .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
     return true;
   }
 
   if (msg?.action === 'clearDetectedStreams') {
     (async () => {
-      const tabId = msg.tabId ?? (await getActiveTabId());
+      const tabId = msg.tabId ?? (await activeTabId());
       if (tabId != null) {
-        memCache[tabId] = [];
-        persistSoon();
+        session.clearStreams(tabId);
         updateBadge(tabId);
       }
       sendResponse({ ok: true });
@@ -402,12 +283,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const tabActions = ['getVideoState', 'markStart', 'markEnd', 'clearPending', 'showBar'];
   if (tabActions.includes(msg?.action)) {
     (async () => {
-      const tabId = msg.tabId ?? (await getActiveTabId());
+      const tabId = msg.tabId ?? (await activeTabId());
       if (!tabId) {
         sendResponse({ ok: false, error: 'no_tab' });
         return;
       }
-      sendResponse(await sendToTab(tabId, { action: msg.action }));
+      sendResponse(await forwardToTab(tabId, { action: msg.action }));
     })();
     return true;
   }

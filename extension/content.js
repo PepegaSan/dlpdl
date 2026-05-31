@@ -1,4 +1,5 @@
-import { normalizeStorageKey, pageUrlForClipDirect } from './lib/page-key.js';
+import { formatClockTime } from './lib/format-time.js';
+import { draftKeyForHref, submitUrlForHref } from './lib/page-url.js';
 
 const CLIPS_KEY = 'clipDraftByUrl';
 const BAR_HIDDEN_KEY = 'clipDirectBarHidden';
@@ -30,7 +31,7 @@ function reportClipsToBackground() {
     chrome.runtime.sendMessage({
       action: 'reportClips',
       clips: sessionClipsByKey[key] ? [...sessionClipsByKey[key]] : [],
-      pageUrl: pageUrlForClipDirect(location.href),
+      pageUrl: submitUrlForHref(location.href),
       pageKey: key,
       isTop: IS_TOP_FRAME,
     });
@@ -176,21 +177,6 @@ function safeVideoTime(video) {
   }
 }
 
-function formatClipTime(seconds) {
-  const n = typeof seconds === 'number' ? seconds : parseFloat(String(seconds));
-  if (!isFiniteNum(n) || n < 0) {
-    return '0:00';
-  }
-  const total = Math.floor(n);
-  const s = total % 60;
-  const m = Math.floor(total / 60) % 60;
-  const h = Math.floor(total / 3600);
-  if (h > 0) {
-    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  }
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
 function videoArea(v) {
   try {
     if (!v?.isConnected) return 0;
@@ -237,7 +223,7 @@ let sessionBarHidden = false;
 const sessionClipsByKey = {};
 
 function storageKey() {
-  return normalizeStorageKey(location.href);
+  return draftKeyForHref(location.href);
 }
 
 function pendingStorageItemKey() {
@@ -337,10 +323,10 @@ function updateOverlayUiNow() {
   if (pendingStart) {
     statusEl.textContent = `Start ${pendingStart} — spule zum Ende, dann Ende`;
   } else if (clipCount > 0) {
-    statusEl.textContent = `${clipCount} Clip(s) — Extension-Popup: Queue`;
+    statusEl.textContent = `${clipCount} Clip(s) — Extension-Popup senden`;
   } else {
     const v = getActiveVideo();
-    statusEl.textContent = v ? `Jetzt: ${formatClipTime(safeVideoTime(v))}` : 'Kein Video';
+    statusEl.textContent = v ? `Jetzt: ${formatClockTime(safeVideoTime(v))}` : 'Kein Video';
   }
 }
 
@@ -349,7 +335,7 @@ function doMarkStart() {
   if (!video) {
     return Promise.resolve({ ok: false, error: 'no_video' });
   }
-  pendingStart = formatClipTime(safeVideoTime(video));
+  pendingStart = formatClockTime(safeVideoTime(video));
   updateOverlayUiNow();
   return savePendingToStorage(pendingStart).then(() => {
     updateOverlayUiNow();
@@ -357,7 +343,7 @@ function doMarkStart() {
     return {
       ok: true,
       pendingStart,
-      pageUrl: pageUrlForClipDirect(location.href),
+      pageUrl: submitUrlForHref(location.href),
       pageKey: storageKey(),
     };
   });
@@ -372,7 +358,7 @@ function doMarkEnd() {
     if (!start) {
       return { ok: false, error: 'no_pending_start' };
     }
-    const end = formatClipTime(safeVideoTime(video));
+    const end = formatClockTime(safeVideoTime(video));
     const clip = { start, end };
     pendingStart = null;
     updateOverlayUiNow();
@@ -385,7 +371,7 @@ function doMarkEnd() {
           ok: true,
           clip,
           clips,
-          pageUrl: pageUrlForClipDirect(location.href),
+          pageUrl: submitUrlForHref(location.href),
           pageKey: storageKey(),
         };
       });
@@ -403,7 +389,7 @@ function doClearPending() {
 }
 
 function getVideoStateResponse() {
-  const pageUrl = pageUrlForClipDirect(location.href);
+  const pageUrl = submitUrlForHref(location.href);
   const pageKey = storageKey();
   return ensurePendingLoaded().then(async (pending) => {
     const clips = await loadClipsForPage();
@@ -422,7 +408,7 @@ function getVideoStateResponse() {
       ok: true,
       currentTime: safeVideoTime(video),
       duration: isFiniteNum(video.duration) ? video.duration : 0,
-      formatted: formatClipTime(safeVideoTime(video)),
+      formatted: formatClockTime(safeVideoTime(video)),
       pageUrl,
       pageKey,
       pendingStart: pending,
@@ -566,7 +552,7 @@ function syncOverlayState() {
         } else {
           const v = getActiveVideo();
           statusEl.textContent = v
-            ? `Jetzt: ${formatClipTime(safeVideoTime(v))}`
+            ? `Jetzt: ${formatClockTime(safeVideoTime(v))}`
             : 'Kein Video';
         }
       })

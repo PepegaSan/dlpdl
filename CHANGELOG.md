@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0 — Variant B extension (clean-room modules)
+
+- New extension libs: `tab-session`, `media-sniffer`, `jobs-client`, `page-url`, `format-time`
+- Rewritten `background.js` (same behavior, new structure)
+- `content.js` uses clean-room URL/time helpers
+- Extension **1.2.0** — reload extension + F5 on video tabs after update
+
 ## 1.1.0 — Variant A (release-ready, AGPL)
 
 ### Extension (1.1.0)

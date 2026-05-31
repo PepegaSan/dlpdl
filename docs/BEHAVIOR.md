@@ -34,7 +34,20 @@ Output filenames use `clip_MM-SS-MM-SS_` (no `:`) for cross-platform safety.
 
 ## HLS implementation (`backend/hls_clipper.py`)
 
-Branch `clean-room`: HLS clipping is implemented in **`hls_clipper.py`** (clean-room). [`smart_clip.py`](backend/smart_clip.py) only re-exports `is_hls_url` and `smart_clip_hls` for compatibility.
+HLS clipping is implemented in **`hls_clipper.py`** (clean-room). [`smart_clip.py`](../backend/smart_clip.py) re-exports `is_hls_url` and `smart_clip_hls`.
+
+## Extension (clean-room modules)
+
+| Module | Role |
+| --- | --- |
+| `lib/tab-session.js` | Per-tab streams + clip bundles |
+| `lib/media-sniffer.js` | URL classification + HLS preference |
+| `lib/jobs-client.js` | REST job payloads |
+| `lib/page-url.js` | Draft keys + submit URLs |
+| `lib/format-time.js` | Clock formatting for markers |
+| `background.js` | Service worker wiring |
+
+Legacy filenames (`page-key.js`, `clip-direct-api.js`, `time.js`) are thin re-exports only.
 
 ## Non-iframe video
 

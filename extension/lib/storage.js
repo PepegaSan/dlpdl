@@ -1,4 +1,4 @@
-import { normalizeStorageKey } from './page-key.js';
+import { draftKeyForHref } from './page-url.js';
 
 /** @typedef {object} ExtensionSettings
  * @property {string} clipDirectBaseUrl
@@ -39,7 +39,7 @@ export function keyForPage(pageUrlOrKey) {
   if (pageUrlOrKey.startsWith('youtube:')) {
     return pageUrlOrKey;
   }
-  return normalizeStorageKey(pageUrlOrKey);
+  return draftKeyForHref(pageUrlOrKey);
 }
 
 export async function loadAllClipDrafts() {
