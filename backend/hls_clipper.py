@@ -54,7 +54,10 @@ def url_looks_like_hls(url: Optional[str]) -> bool:
     if not url:
         return False
     low = urllib.parse.unquote(url).lower()
-    return bool(M3U8_RE.search(url)) or '.m3u8' in low or 'm3u8' in low
+    # Single .ts chunks (e.g. phncdn seg-NNN.ts) are not playlists.
+    if re.search(r'\.ts(\?|$|&)', low) and '.m3u8' not in low:
+        return False
+    return bool(M3U8_RE.search(url)) or '.m3u8' in low
 
 
 def is_hls_url(url: Optional[str]) -> bool:

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Clip-Direct",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Mark clip times on video pages and send them to Clip-Direct for download to your PC.",
   "permissions": ["storage", "activeTab", "scripting", "webRequest", "tabs"],
   "host_permissions": ["<all_urls>"],

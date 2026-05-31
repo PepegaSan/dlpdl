@@ -5,6 +5,9 @@ import {
 } from './lib/jobs-client.js';
 import {
   classifyMediaUrl,
+  guessPlaylistUrlFromSegment,
+  isHlsPlaylistUrl,
+  isHlsSegmentUrl,
   isLikelyPageShellUrl,
   isUsableStreamUrl,
   preferBestStream,
@@ -34,29 +37,33 @@ function updateBadge(tabId) {
   }
 }
 
+function recordDetectedUrl(tabId, url, meta) {
+  const kind = classifyMediaUrl(url);
+  if (!kind) return;
+  if (kind === 'hls-segment') {
+    session.rememberHlsSegment(tabId, url);
+    return;
+  }
+  session.addStream(tabId, { url, kind, ...meta });
+  updateBadge(tabId);
+}
+
 function onBeforeSendHeaders(details) {
   const { tabId, url, requestHeaders, type } = details;
   if (tabId == null || tabId < 0) return;
-  const kind = classifyMediaUrl(url);
-  if (!kind) return;
   const headers = requestHeadersMap(requestHeaders);
-  session.addStream(tabId, {
-    url,
-    kind,
+  recordDetectedUrl(tabId, url, {
     type: type || '',
     referer: headers.referer || headers.origin || '',
     origin: headers.origin || '',
     userAgent: headers['user-agent'] || '',
     ts: Date.now(),
   });
-  updateBadge(tabId);
 }
 
 function onCompleted(details) {
   const { tabId, url, type, initiator, documentUrl } = details;
   if (tabId == null || tabId < 0) return;
-  const kind = classifyMediaUrl(url);
-  if (!kind) return;
   const referer = initiator || documentUrl || '';
   let origin = '';
   if (referer) {
@@ -66,16 +73,46 @@ function onCompleted(details) {
       /* ignore */
     }
   }
-  session.addStream(tabId, {
-    url,
-    kind,
+  recordDetectedUrl(tabId, url, {
     type: type || '',
     referer,
     origin,
     userAgent: '',
     ts: Date.now(),
   });
-  updateBadge(tabId);
+}
+
+function normalizeStreamForQueue(stream) {
+  if (!stream?.url) return stream;
+  if (isHlsPlaylistUrl(stream.url)) {
+    return { ...stream, kind: 'hls' };
+  }
+  if (isHlsSegmentUrl(stream.url)) {
+    const guessed = guessPlaylistUrlFromSegment(stream.url);
+    if (guessed) {
+      return { ...stream, url: guessed, kind: 'hls', inferredPlaylist: true };
+    }
+  }
+  return stream;
+}
+
+function streamsForTab(tabId) {
+  const usable = usableStreams(session.streams(tabId));
+  if (usable.length) return usable;
+  const seg = session.lastHlsSegmentUrl(tabId);
+  const guessed = seg ? guessPlaylistUrlFromSegment(seg) : null;
+  if (!guessed) return session.streams(tabId);
+  return [
+    {
+      url: guessed,
+      kind: 'hls',
+      inferredPlaylist: true,
+      referer: '',
+      origin: '',
+      userAgent: '',
+      ts: Date.now(),
+    },
+  ];
 }
 
 try {
@@ -155,7 +192,10 @@ async function queueStream(stream, pageUrl, clips, mergeClips) {
   if (!stream?.url) {
     return { ok: false, error: 'no_stream' };
   }
-  const enriched = { ...stream };
+  const enriched = normalizeStreamForQueue({ ...stream });
+  if (!isUsableStreamUrl(enriched.url) && !isHlsPlaylistUrl(enriched.url)) {
+    return { ok: false, errorKey: 'error.hlsSegmentOnly' };
+  }
   if (!enriched.referer) {
     const tabId = await activeTabId();
     if (tabId != null) {
@@ -231,7 +271,8 @@ async function streamFromActiveVideo(tabId, pageUrl) {
         }
         function looksLikeMedia(u) {
           const l = u.toLowerCase();
-          return /\.m3u8|m3u8%2f|\.mp4|\.webm|\/hls\//.test(l);
+          if (/\.ts(\?|$)/.test(l) && !l.includes('.m3u8')) return false;
+          return /\.m3u8|m3u8%2f|\.mp4|\.webm/.test(l);
         }
         const videos = Array.from(document.querySelectorAll('video'));
         let best = null;
@@ -268,11 +309,25 @@ async function streamFromActiveVideo(tabId, pageUrl) {
 }
 
 async function pickStreamForShellPage(tabId, pageUrl) {
-  const sniffed = preferBestStream(usableStreams(session.streams(tabId)));
-  if (sniffed?.url) {
-    return sniffed;
+  let sniffed = preferBestStream(session.streams(tabId));
+  if (!sniffed?.url) {
+    const seg = session.lastHlsSegmentUrl(tabId);
+    const guessed = seg ? guessPlaylistUrlFromSegment(seg) : null;
+    if (guessed) {
+      sniffed = {
+        url: guessed,
+        kind: 'hls',
+        referer: pageUrl || '',
+        inferredPlaylist: true,
+        ts: Date.now(),
+      };
+    }
   }
-  return streamFromActiveVideo(tabId, pageUrl);
+  if (sniffed?.url) {
+    return normalizeStreamForQueue(sniffed);
+  }
+  const fromVideo = await streamFromActiveVideo(tabId, pageUrl);
+  return fromVideo ? normalizeStreamForQueue(fromVideo) : null;
 }
 
 async function queueClips(pageUrl, clips, mergeClips) {
@@ -367,7 +422,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.action === 'getDetectedStreams') {
     (async () => {
       const tabId = msg.tabId ?? (await activeTabId());
-      sendResponse({ ok: true, streams: session.streams(tabId) });
+      sendResponse({ ok: true, streams: streamsForTab(tabId) });
     })();
     return true;
   }

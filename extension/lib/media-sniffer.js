@@ -2,6 +2,51 @@
  * Classify media URLs captured from webRequest (clean-room).
  */
 
+export function isHlsSegmentUrl(url) {
+  if (!url) return false;
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    return /\.ts$/i.test(path) || /\/seg[^/]*\.ts$/i.test(path);
+  } catch {
+    return false;
+  }
+}
+
+/** True for an HLS playlist/manifest — not a single .ts chunk. */
+export function isHlsPlaylistUrl(url) {
+  if (!url || isHlsSegmentUrl(url)) {
+    return false;
+  }
+  const low = url.toLowerCase();
+  return (
+    /\.m3u8(\?|$|&)/i.test(low)
+    || low.includes('m3u8%2f')
+    || low.includes('format=m3u8')
+    || low.includes('type=m3u8')
+  );
+}
+
+/**
+ * Many CDNs (e.g. phncdn) expose seg-NNN.ts in devtools; the playlist is sibling master.m3u8.
+ */
+export function guessPlaylistUrlFromSegment(segmentUrl) {
+  if (!segmentUrl || !isHlsSegmentUrl(segmentUrl)) {
+    return null;
+  }
+  try {
+    const u = new URL(segmentUrl);
+    const base = u.pathname.replace(/\/[^/]*\.ts$/i, '');
+    for (const name of ['master.m3u8', 'index.m3u8', 'playlist.m3u8', 'manifest.m3u8']) {
+      const trial = new URL(segmentUrl);
+      trial.pathname = `${base}/${name}`;
+      return trial.toString();
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function classifyMediaUrl(url) {
   let pathname;
   let full;
@@ -12,20 +57,15 @@ export function classifyMediaUrl(url) {
   } catch {
     return null;
   }
-  // Obfuscated CDN / PHP wrappers (common on embed hosters and aggregator pages).
-  if (
-    full.includes('.m3u8')
-    || full.includes('m3u8%2f')
-    || full.includes('format=m3u8')
-    || full.includes('type=m3u8')
-    || /\/hls\//.test(pathname)
-    || /\/manifest(\/|$|\?)/.test(pathname)
-  ) {
+
+  if (isHlsSegmentUrl(url)) {
+    return 'hls-segment';
+  }
+
+  if (isHlsPlaylistUrl(url)) {
     return 'hls';
   }
-  if (pathname.endsWith('.m3u8') || full.includes('.m3u8?') || full.includes('.m3u8&')) {
-    return 'hls';
-  }
+
   if (pathname.endsWith('.mpd') || full.includes('.mpd?')) {
     return 'dash';
   }
@@ -58,28 +98,49 @@ export function requestHeadersMap(requestHeaders) {
 }
 
 export function preferHlsStream(streams) {
-  if (!streams?.length) {
-    return null;
-  }
-  const hls = streams.find(
-    (s) => s?.url && (s.kind === 'hls' || classifyMediaUrl(s.url) === 'hls'),
-  );
-  return hls || streams.find((s) => s?.url) || null;
+  return pickStreamForDownload(streams);
 }
 
-/** Prefer HLS, then progressive file, then other sniffed media. */
+/** Prefer m3u8 playlist, then progressive file; infer playlist from .ts if needed. */
 export function preferBestStream(streams) {
-  if (!streams?.length) {
+  return pickStreamForDownload(streams);
+}
+
+export function pickStreamForDownload(streams) {
+  const list = streams || [];
+  if (!list.length) {
     return null;
   }
-  const order = ['hls', 'file', 'dash', 'hds', 'audio'];
-  for (const kind of order) {
-    const hit = streams.find((s) => s?.url && s.kind === kind);
-    if (hit) {
-      return hit;
+
+  const playlists = list.filter((s) => s?.url && isHlsPlaylistUrl(s.url));
+  if (playlists.length) {
+    const order = ['hls'];
+    for (const kind of order) {
+      const hit = playlists.find((s) => s.kind === kind || isHlsPlaylistUrl(s.url));
+      if (hit) return hit;
+    }
+    return playlists[0];
+  }
+
+  const files = list.filter((s) => s?.url && classifyMediaUrl(s.url) === 'file');
+  if (files.length) {
+    return files[0];
+  }
+
+  const segment = list.find((s) => s?.url && (s.kind === 'hls-segment' || isHlsSegmentUrl(s.url)));
+  if (segment) {
+    const guessed = guessPlaylistUrlFromSegment(segment.url);
+    if (guessed) {
+      return {
+        ...segment,
+        url: guessed,
+        kind: 'hls',
+        inferredPlaylist: true,
+      };
     }
   }
-  return streams.find((s) => s?.url) || null;
+
+  return list.find((s) => s?.url && isUsableStreamUrl(s.url)) || null;
 }
 
 export function isLikelyPageShellUrl(pageUrl) {
@@ -94,16 +155,15 @@ export function isLikelyPageShellUrl(pageUrl) {
   }
 }
 
-/**
- * True when the URL is a direct media resource for yt-dlp/ffmpeg — not a page shell
- * (.php player without manifest) that triggers "unusual extension php" errors.
- */
 export function isUsableStreamUrl(url) {
   if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
     return false;
   }
+  if (isHlsSegmentUrl(url) && !isHlsPlaylistUrl(url)) {
+    return false;
+  }
   const kind = classifyMediaUrl(url);
-  if (!kind) {
+  if (!kind || kind === 'hls-segment') {
     return false;
   }
   try {
@@ -113,12 +173,7 @@ export function isUsableStreamUrl(url) {
     }
     const full = url.toLowerCase();
     if (kind === 'hls') {
-      return (
-        full.includes('.m3u8')
-        || full.includes('m3u8%2f')
-        || /\/hls\//.test(path)
-        || /\/manifest/.test(path)
-      );
+      return isHlsPlaylistUrl(url);
     }
     if (kind === 'file') {
       return /\.(mp4|webm|mkv|mov)/i.test(full);

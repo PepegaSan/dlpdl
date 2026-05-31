@@ -75,6 +75,7 @@
   "bar.status.videoNotReady": "Video not ready",
   "popup.pendingLabel": "Start: {start}",
   "error.shellPagePhp": "This page (.php) can only be downloaded via a detected stream. Play the video, reload (F5), then use Cut on a stream — or check Detected streams in the popup.",
+  "error.hlsSegmentOnly": "Only an HLS segment was detected, not the playlist. Play the video briefly, reload (F5), then use Cut on the m3u8 stream in the popup.",
   "ui.subtitle": "Clips from the extension — when Ready, auto-save (checkbox) or Save to PC.",
   "ui.tabWarn": "Multiple tabs with this page open cause duplicate save dialogs. Close the other tabs.",
   "ui.empty": "No jobs yet. Send a clip from the extension.",

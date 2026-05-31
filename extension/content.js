@@ -249,7 +249,10 @@ function mediaUrlLooksLikeStream(url) {
   if (!/^https?:\/\//i.test(u)) {
     return false;
   }
-  return /\.m3u8|m3u8%2f|format=m3u8|\.mp4|\.webm|\.mkv|\/hls\/|manifest/i.test(u);
+  if (/\.ts(\?|$)/.test(u) && !u.includes('.m3u8')) {
+    return false;
+  }
+  return /\.m3u8|m3u8%2f|format=m3u8|\.mp4|\.webm|\.mkv/i.test(u);
 }
 
 function collectVideoSourceUrls(video) {

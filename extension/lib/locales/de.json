@@ -75,6 +75,7 @@
   "bar.status.videoNotReady": "Video nicht bereit",
   "popup.pendingLabel": "Start: {start}",
   "error.shellPagePhp": "Diese Seite (.php) ist nur über einen erkannten Stream ladbar. Video kurz abspielen, F5, dann Mit Schnitt am Stream — oder unter Erkannte Streams prüfen.",
+  "error.hlsSegmentOnly": "Es wurde nur ein HLS-Segment erkannt, keine Playlist. Video kurz abspielen, F5, dann Mit Schnitt am m3u8-Stream im Popup.",
   "ui.subtitle": "Clips vom Addon — bei Bereit Auto-Speichern (Häkchen) oder Auf PC speichern.",
   "ui.tabWarn": "Mehrere Tabs mit dieser Seite offen — das verursacht mehrfache Speichern-Dialoge. Andere Tabs schließen.",
   "ui.empty": "Noch keine Jobs. Sende einen Clip vom Addon.",

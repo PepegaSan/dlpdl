@@ -10,6 +10,8 @@ const DEBOUNCE_MS = 250;
 export class TabSessionStore {
   /** @type {Record<number, object[]>} */
   streamsByTab = {};
+  /** @type {Record<number, string>} */
+  lastHlsSegmentUrlByTab = {};
   /** @type {Record<number, { clips: object[], pageUrl: string, pageKey: string, ts: number }>} */
   clipsByTab = {};
   #streamTimer = null;
@@ -63,9 +65,19 @@ export class TabSessionStore {
     this.#scheduleStreams();
   }
 
+  rememberHlsSegment(tabId, url) {
+    if (tabId == null || tabId < 0 || !url) return;
+    this.lastHlsSegmentUrlByTab[tabId] = url;
+  }
+
+  lastHlsSegmentUrl(tabId) {
+    return tabId != null ? this.lastHlsSegmentUrlByTab[tabId] : null;
+  }
+
   clearTab(tabId) {
     if (tabId == null || tabId < 0) return;
     delete this.streamsByTab[tabId];
+    delete this.lastHlsSegmentUrlByTab[tabId];
     delete this.clipsByTab[tabId];
     this.#scheduleStreams();
     this.#scheduleClips();

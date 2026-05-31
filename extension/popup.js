@@ -91,6 +91,9 @@ async function sendStream(stream, withClips, button, mergeClips = false) {
     if (mergeClips) setStatus('popup.status.mergeQueued');
     else if (withClips) setStatus('popup.status.cutQueued');
     else setStatus('popup.status.streamQueued');
+  } else if (result?.errorKey) {
+    setStatus('popup.status.error', { error: t(result.errorKey) });
+    button.disabled = false;
   } else {
     setStatus('popup.status.error', { error: result?.error || '?' });
     button.disabled = false;

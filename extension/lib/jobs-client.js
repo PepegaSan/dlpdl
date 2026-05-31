@@ -2,6 +2,8 @@
  * Clip-Direct REST job payloads (clean-room).
  */
 
+import { isHlsPlaylistUrl } from './media-sniffer.js';
+
 export function jobsEndpoint(baseUrl, path = 'api/jobs') {
   const base = baseUrl.replace(/\/+$/, '') + '/';
   return new URL(path.replace(/^\/+/, ''), base).toString();
@@ -49,8 +51,7 @@ function streamOverrides(stream, pageUrl) {
   if (Object.keys(headers).length) {
     overrides.http_headers = headers;
   }
-  const hls =
-    stream.kind === 'hls' || /\.m3u8(\?|$|&)/i.test(stream.url || '');
+  const hls = isHlsPlaylistUrl(stream.url || '');
   if (hls) {
     overrides.hls_use_mpegts = true;
     overrides.external_downloader = { m3u8: 'ffmpeg' };
