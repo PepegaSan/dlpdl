@@ -32,12 +32,10 @@ Output filenames use `clip_MM-SS-MM-SS_` (no `:`) for cross-platform safety.
 - Manual **Auf PC speichern** always works.
 - Keep a **single** tab on `http://localhost:8090/` when using auto-save.
 
-## What MeTube contributed (Variant A — keep current code)
+## HLS implementation (`backend/hls_clipper.py`)
 
-MeTube was **inspiration** and an early source for HLS smart-clip and extension UX patterns. The **working** split today is mostly Clip-Direct logic:
+Branch `clean-room`: HLS clipping is implemented in **`hls_clipper.py`** (clean-room). [`smart_clip.py`](backend/smart_clip.py) only re-exports `is_hls_url` and `smart_clip_hls` for compatibility.
 
-- REST job API and minimal UI are Clip-Direct-only.
-- Single-clip HLS uses the **merge part** path (fix added here).
-- Stream auto-pick for `queueClips` is Clip-Direct-only.
+## Non-iframe video
 
-Direct **non-iframe** video did not depend on MeTube’s queue UI; it uses page URL + yt-dlp like any yt-dlp-based tool.
+Direct **non-iframe** pages use the **page URL** and yt-dlp — no HLS clipper required for typical YouTube-style sites.

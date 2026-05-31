@@ -33,7 +33,7 @@ See [docs/BEHAVIOR.md](docs/BEHAVIOR.md) for details and regression notes.
 ## Quick start (local)
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/PepegaSan/dlpdl.git
 cd clip-direct
 pip install -r requirements.txt
 ```
