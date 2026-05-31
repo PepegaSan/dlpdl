@@ -49,6 +49,8 @@ HLS clipping is implemented in **`hls_clipper.py`** (clean-room). [`smart_clip.p
 
 Legacy filenames (`page-key.js`, `clip-direct-api.js`, `time.js`) are thin re-exports only.
 
+Content script ES modules: imported `lib/*.js` files must be listed under `web_accessible_resources` in `manifest.json`, otherwise the clip bar never loads.
+
 ## Non-iframe video
 
 Direct **non-iframe** pages use the **page URL** and yt-dlp — no HLS clipper required for typical YouTube-style sites.
