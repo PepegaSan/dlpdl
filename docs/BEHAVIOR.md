@@ -26,6 +26,13 @@ Branding: UI strings and DOM ids use `clip-direct-*`, not `metube-*`. Reload hin
 
 Output filenames use `clip_MM-SS-MM-SS_` (no `:`) for cross-platform safety.
 
+### HLS picture glitches at clip start (first seconds blocky)
+
+HLS segments often start with P-frames that need an earlier keyframe. Fix in `hls_clipper.py`:
+
+- Download **one segment before** the clip window (decoder preroll).
+- ffmpeg: `-ss` **before** `-i` (keyframe-aligned cut), `+discardcorrupt`, audio `aresample=async=1`.
+
 ## Web UI (`ui/app.js`)
 
 - Auto-save: claim job id in `localStorage` **before** fetch; `navigator.locks` so only one tab auto-downloads; skip when `document.hidden`.

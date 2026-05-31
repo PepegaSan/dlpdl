@@ -169,6 +169,28 @@ def segments_for_window(
     ]
 
 
+def segments_with_preroll(
+    playlist: ParsedPlaylist,
+    picked: list[MediaSegment],
+) -> list[MediaSegment]:
+    """
+    Prepend one HLS segment before the clip window so the first seconds decode
+    from a keyframe instead of orphaned P-frames (blocky / smeared picture).
+    """
+    if not picked:
+        return picked
+    first = picked[0]
+    prev = None
+    for seg in playlist.segments:
+        if seg.timeline_start + seg.duration <= first.timeline_start + 0.01:
+            prev = seg
+        elif seg.timeline_start >= first.timeline_start:
+            break
+    if prev is None or picked[0].uri == prev.uri:
+        return picked
+    return [prev, *picked]
+
+
 def run_ffmpeg(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True)
 
@@ -189,11 +211,17 @@ def remux_or_encode(raw_ts: str, out_mp4: str, *, seek: float, duration: Optiona
         ]
         proc = run_ffmpeg(encode_args)
     else:
+        # -ss before -i: snap to nearest keyframe (avoids macroblocking at clip start).
         encode_args = [
             'ffmpeg', '-y', '-loglevel', 'error',
-            '-ss', f'{seek:.3f}', '-i', raw_ts, '-t', f'{duration:.3f}',
+            '-fflags', '+genpts+discardcorrupt',
+            '-ss', f'{seek:.3f}',
+            '-i', raw_ts,
+            '-t', f'{duration:.3f}',
+            '-avoid_negative_ts', 'make_zero',
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-            '-c:a', 'aac', '-movflags', '+faststart', out_mp4,
+            '-c:a', 'aac', '-af', 'aresample=async=1:first_pts=0',
+            '-movflags', '+faststart', out_mp4,
         ]
         proc = run_ffmpeg(encode_args)
 
@@ -252,6 +280,8 @@ def clip_hls_to_file(
         return False, 'no segments in time window'
 
     full_span = start_sec <= 0.01 and end_eff >= parsed.duration - 0.5
+    if not full_span:
+        picked = segments_with_preroll(parsed, picked)
     total = len(picked)
     bytes_done = 0
     t0 = time.monotonic()

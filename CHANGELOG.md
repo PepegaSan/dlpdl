@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.3 — HLS clip start quality
+
+- HLS clips: one preroll segment + ffmpeg keyframe-aligned seek (fixes blocky first 3–5s)
+
 ## 1.2.0 — Variant B extension (clean-room modules)
 
 - New extension libs: `tab-session`, `media-sniffer`, `jobs-client`, `page-url`, `format-time`
