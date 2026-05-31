@@ -73,6 +73,8 @@ docker compose up -d --build
 
 Default port: **8090**. Map `downloads` volume as needed (see `deploy/SYNOLOGY.md`).
 
+`docker-compose.yml` mounts `backend/` and `ui/` from your clone so UI/i18n updates apply after **container restart** without a full rebuild.
+
 ## API (summary)
 
 | Method | Path | Purpose |

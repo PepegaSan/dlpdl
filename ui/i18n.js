@@ -19,14 +19,25 @@ export function getUiLocale() {
   return stored === 'de' ? 'de' : DEFAULT_LOCALE;
 }
 
+async function loadLocaleDict(targetLocale) {
+  const res = await fetch(`/locales/${targetLocale}.json`, { cache: 'no-store' });
+  if (!res.ok) {
+    throw new Error(`locale fetch failed: ${targetLocale}`);
+  }
+  return res.json();
+}
+
 export async function initUiI18n(forcedLocale) {
   locale = forcedLocale === 'de' ? 'de' : (forcedLocale === 'en' ? 'en' : getUiLocale());
   localStorage.setItem(LOCALE_KEY, locale);
-  const res = await fetch(`/locales/${locale}.json`);
-  if (!res.ok) {
-    throw new Error(`locale fetch failed: ${locale}`);
+  try {
+    dict = await loadLocaleDict(locale);
+  } catch (err) {
+    console.warn('Clip-Direct UI locale load failed, falling back to English', err);
+    locale = 'en';
+    localStorage.setItem(LOCALE_KEY, locale);
+    dict = await loadLocaleDict('en');
   }
-  dict = await res.json();
   document.documentElement.lang = locale;
   return locale;
 }

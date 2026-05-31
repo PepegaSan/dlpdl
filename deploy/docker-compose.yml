@@ -13,4 +13,5 @@ services:
     volumes:
       - ../downloads:/downloads
       - ../backend:/app/backend:ro
+      - ../ui:/app/ui:ro
     restart: unless-stopped

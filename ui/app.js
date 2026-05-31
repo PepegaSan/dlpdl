@@ -264,12 +264,21 @@ function setupLocaleSelector() {
 }
 
 async function boot() {
-  await initUiI18n();
-  applyUiI18n();
-  setupLocaleSelector();
-  ensureSettingsBar();
-  setupTabWarning();
-  refresh();
+  try {
+    await initUiI18n();
+    applyUiI18n();
+    setupLocaleSelector();
+    ensureSettingsBar();
+    setupTabWarning();
+    refresh();
+  } catch (err) {
+    console.error('Clip-Direct UI failed to start', err);
+    const empty = document.getElementById('empty');
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = 'Could not load UI translations. Restart the server or hard-reload (Ctrl+Shift+R).';
+    }
+  }
 }
 
 boot();
