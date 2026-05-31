@@ -520,7 +520,7 @@ class _DownloadWorker:
             cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', merged_name]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c:v', 'libx264', '-c:a', 'aac', merged_name]
+                cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c:v', 'libx264', '-c:a', 'aac', '-shortest', merged_name]
                 proc = subprocess.run(cmd, capture_output=True, text=True)
                 if proc.returncode != 0:
                     return 1

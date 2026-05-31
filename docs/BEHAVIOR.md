@@ -33,6 +33,10 @@ HLS segments often start with P-frames that need an earlier keyframe. Fix in `hl
 - Download **one segment before** the clip window (decoder preroll).
 - ffmpeg: `-ss` **before** `-i` (keyframe-aligned cut), `+discardcorrupt`, audio `aresample=async=1`.
 
+### Frozen picture at end while audio continues
+
+Some HLS TS muxes have longer audio than video in the downloaded window. ffmpeg uses **`-shortest`** so output ends when the video stream ends (no 30s frozen last frame).
+
 ## Web UI (`ui/app.js`)
 
 - Auto-save: claim job id in `localStorage` **before** fetch; `navigator.locks` so only one tab auto-downloads; skip when `document.hidden`.

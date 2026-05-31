@@ -162,10 +162,11 @@ def segments_for_window(
     end_eff = end if end != float('inf') else playlist.duration
     if end_eff <= start:
         return []
+    # Overlap [start, end_eff); do not add a segment that only starts at/after the cut end.
     return [
         seg
         for seg in playlist.segments
-        if (seg.timeline_start + seg.duration) > start and seg.timeline_start < end_eff
+        if (seg.timeline_start + seg.duration) > start + 0.02 and seg.timeline_start < end_eff - 0.02
     ]
 
 
@@ -205,13 +206,17 @@ def remux_or_encode(raw_ts: str, out_mp4: str, *, seek: float, duration: Optiona
         if proc.returncode == 0 and os.path.isfile(out_mp4) and os.path.getsize(out_mp4) > 0:
             return True, 'ok'
         encode_args = [
-            'ffmpeg', '-y', '-loglevel', 'error', '-i', raw_ts,
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-fflags', '+genpts+discardcorrupt',
+            '-i', raw_ts,
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-            '-c:a', 'aac', '-movflags', '+faststart', out_mp4,
+            '-c:a', 'aac', '-af', 'aresample=async=1:first_pts=0',
+            '-shortest',
+            '-movflags', '+faststart', out_mp4,
         ]
         proc = run_ffmpeg(encode_args)
     else:
-        # -ss before -i: snap to nearest keyframe (avoids macroblocking at clip start).
+        # -ss before -i: keyframe-aligned start; -shortest: stop when video ends (no frozen last frame + long audio).
         encode_args = [
             'ffmpeg', '-y', '-loglevel', 'error',
             '-fflags', '+genpts+discardcorrupt',
@@ -221,6 +226,7 @@ def remux_or_encode(raw_ts: str, out_mp4: str, *, seek: float, duration: Optiona
             '-avoid_negative_ts', 'make_zero',
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
             '-c:a', 'aac', '-af', 'aresample=async=1:first_pts=0',
+            '-shortest',
             '-movflags', '+faststart', out_mp4,
         ]
         proc = run_ffmpeg(encode_args)
