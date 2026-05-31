@@ -1,5 +1,50 @@
-import { formatClockTime } from './lib/format-time.js';
-import { draftKeyForHref, submitUrlForHref } from './lib/page-url.js';
+/* Content script: classic script (no ES imports — Chrome loads this without type: module). */
+
+function formatClockTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const total = Math.floor(seconds);
+  const sec = total % 60;
+  const min = Math.floor(total / 60) % 60;
+  const hr = Math.floor(total / 3600);
+  if (hr > 0) {
+    return `${hr}:${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+  }
+  return `${min}:${String(sec).padStart(2, '0')}`;
+}
+
+function draftKeyForHref(href) {
+  try {
+    const url = new URL(href);
+    const host = url.hostname.replace(/^www\./, '').replace(/^m\./, '');
+    if (host === 'youtu.be') {
+      const id = url.pathname.split('/').filter(Boolean)[0];
+      if (id) return `youtube:${id}`;
+    }
+    if (host === 'youtube.com' || host.endsWith('.youtube.com')) {
+      const id = url.searchParams.get('v');
+      if (id) return `youtube:${id}`;
+    }
+    url.hash = '';
+    return `${url.origin}${url.pathname}${url.search}`;
+  } catch {
+    return href;
+  }
+}
+
+function submitUrlForHref(href) {
+  try {
+    const url = new URL(href);
+    url.hash = '';
+    const host = url.hostname.replace(/^www\./, '').replace(/^m\./, '');
+    if (host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com')) {
+      url.searchParams.delete('t');
+      url.searchParams.delete('start');
+    }
+    return url.toString();
+  } catch {
+    return href;
+  }
+}
 
 const CLIPS_KEY = 'clipDraftByUrl';
 const BAR_HIDDEN_KEY = 'clipDirectBarHidden';

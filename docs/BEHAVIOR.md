@@ -49,7 +49,7 @@ HLS clipping is implemented in **`hls_clipper.py`** (clean-room). [`smart_clip.p
 
 Legacy filenames (`page-key.js`, `clip-direct-api.js`, `time.js`) are thin re-exports only.
 
-Content script ES modules: imported `lib/*.js` files must be listed under `web_accessible_resources` in `manifest.json`, otherwise the clip bar never loads.
+Content script (`content.js`) must **not** use ES `import` — run as a classic script in `manifest.json` (no `type: "module"`). Helpers are inlined at the top of `content.js`.
 
 ## Non-iframe video
 
