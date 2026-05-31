@@ -1,8 +1,10 @@
 import { openClipDirectUi } from './lib/open-ui.js';
+import { applyI18n, initI18n } from './lib/i18n.js';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings } from './lib/storage.js';
 
 const fields = [
   'clipDirectBaseUrl',
+  'uiLocale',
   'saveTarget',
   'folder',
   'downloadType',
@@ -12,6 +14,8 @@ const fields = [
 
 async function init() {
   const s = await loadSettings();
+  await initI18n(s.uiLocale);
+  applyI18n();
   for (const key of fields) {
     const el = document.getElementById(key);
     if (!el) continue;
@@ -36,6 +40,8 @@ document.getElementById('save').addEventListener('click', async () => {
     }
   }
   await saveSettings(patch);
+  await initI18n(patch.uiLocale);
+  applyI18n();
   const saved = document.getElementById('saved');
   saved.hidden = false;
   setTimeout(() => { saved.hidden = true; }, 2000);

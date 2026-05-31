@@ -165,6 +165,17 @@ async def serve_app_js(_request: web.Request) -> web.Response:
     return web.FileResponse(UI_DIR / 'app.js', headers=_NO_CACHE)
 
 
+async def serve_ui_i18n(_request: web.Request) -> web.Response:
+    return web.FileResponse(UI_DIR / 'i18n.js', headers=_NO_CACHE)
+
+
+async def serve_ui_locale(request: web.Request) -> web.Response:
+    name = request.match_info.get('name', '')
+    if name not in ('en.json', 'de.json'):
+        raise web.HTTPNotFound()
+    return web.FileResponse(UI_DIR / 'locales' / name, headers=_NO_CACHE)
+
+
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_post('/api/jobs', api_create_job)
@@ -176,6 +187,8 @@ def create_app() -> web.Application:
     app.router.add_get('/index.html', serve_index)
     app.router.add_get('/style.css', serve_style)
     app.router.add_get('/app.js', serve_app_js)
+    app.router.add_get('/i18n.js', serve_ui_i18n)
+    app.router.add_get('/locales/{name}', serve_ui_locale)
     return app
 
 

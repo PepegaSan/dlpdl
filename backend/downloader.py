@@ -154,7 +154,7 @@ class JobRunner:
                     self._update(
                         job_id,
                         status='ready',
-                        msg=st.get('msg') or 'Fertig',
+                        msg=st.get('msg') or 'Done',
                         filename=os.path.basename(fp),
                         filepath=fp,
                         size=size,
@@ -166,7 +166,7 @@ class JobRunner:
         pump = threading.Thread(target=pump_status, daemon=True)
         pump.start()
 
-        self._update(job_id, status='running', msg='Starte Download…')
+        self._update(job_id, status='running', msg='Starting download…')
         try:
             worker = _DownloadWorker(
                 spec=spec,
@@ -182,9 +182,9 @@ class JobRunner:
                 j = self._jobs.get(job_id)
             if j and j.status == 'running':
                 if code != 0:
-                    self._update(job_id, status='error', error='download failed', msg='Download fehlgeschlagen')
+                    self._update(job_id, status='error', error='download failed', msg='Download failed')
                 else:
-                    self._update(job_id, status='error', error='no output', msg='Keine Ausgabedatei')
+                    self._update(job_id, status='error', error='no output', msg='No output file')
         except Exception as exc:
             log.exception('job %s failed', job_id)
             self._update(job_id, status='error', error=str(exc), msg=str(exc))
@@ -262,7 +262,7 @@ class _DownloadWorker:
         self._ensure_finished(code)
         return code
 
-    def _mark_finished(self, filepath: str, msg: str = 'Fertig') -> None:
+    def _mark_finished(self, filepath: str, msg: str = 'Done') -> None:
         if self._reported_finished or not filepath:
             return
         self._result_file = filepath
@@ -290,7 +290,7 @@ class _DownloadWorker:
             newest = max(candidates, key=os.path.getmtime)
             self._mark_finished(newest)
             return
-        self._put({'status': 'error', 'msg': 'Download beendet, aber keine Ausgabedatei gefunden'})
+        self._put({'status': 'error', 'msg': 'Download finished but no output file was found'})
 
     def _progress_hook(self, d: dict) -> None:
         if self._reported_finished:
@@ -298,7 +298,7 @@ class _DownloadWorker:
         if d.get('status') == 'downloading':
             self._put({
                 'status': 'downloading',
-                'msg': 'Lade…',
+                'msg': 'Downloading…',
                 'downloaded_bytes': d.get('downloaded_bytes') or 0,
                 'total_bytes_estimate': d.get('total_bytes') or d.get('total_bytes_estimate') or 1_000_000,
             })
@@ -338,7 +338,7 @@ class _DownloadWorker:
                 if os.path.exists(final):
                     os.remove(final)
                 shutil.move(produced, final)
-            self._mark_finished(final, msg=f'Fertig ({detail})')
+            self._mark_finished(final, msg=f'Done ({detail})')
             return True
         finally:
             shutil.rmtree(batch_dir, ignore_errors=True)
@@ -347,7 +347,7 @@ class _DownloadWorker:
         raw_ts = os.path.join(self.temp_dir, 'smartclip.ts')
         out_name = self._final_clip_output_path()
 
-        self._put({'status': 'downloading', 'msg': 'Smart-Clip: Playlist laden…', 'downloaded_bytes': 0, 'total_bytes_estimate': 1_000_000})
+        self._put({'status': 'downloading', 'msg': 'Smart-Clip: loading playlist…', 'downloaded_bytes': 0, 'total_bytes_estimate': 1_000_000})
 
         def progress(payload):
             if self._reported_finished:
@@ -369,7 +369,7 @@ class _DownloadWorker:
             except OSError:
                 pass
         if ok:
-            self._mark_finished(out_name, msg=f'Fertig ({msg})')
+            self._mark_finished(out_name, msg=f'Done ({msg})')
             return True
         log.error('smart-clip failed: %s', msg)
         return False
@@ -384,7 +384,7 @@ class _DownloadWorker:
             log.info('single clip HLS: smart_clip (merge path) for %s', self.spec.url[:80])
             if self._clip_hls_like_merge(start, end, ytdl_params):
                 return 0
-            self._put({'status': 'error', 'msg': 'Smart-Clip fehlgeschlagen'})
+            self._put({'status': 'error', 'msg': 'Smart-Clip failed'})
             return 1
 
         if is_clip:
@@ -428,13 +428,13 @@ class _DownloadWorker:
             raw_ts = os.path.join(batch_dir, f'part_{index:03d}_raw.ts')
             self._put(_progress_payload(
                 fraction=part_base,
-                msg=f'Teil {index + 1}/{total_parts}: Smart-Clip…',
+                msg=f'Part {index + 1}/{total_parts}: Smart-Clip…',
             ))
 
             def _part_progress(payload):
                 if self._reported_finished:
                     return
-                self._put({**payload, 'msg': f'Teil {index + 1}/{total_parts}: {payload.get("msg", "")}'})
+                self._put({**payload, 'msg': f'Part {index + 1}/{total_parts}: {payload.get("msg", "")}'})
 
             ok, err = smart_clip_hls(
                 self.spec.url,
@@ -479,7 +479,7 @@ class _DownloadWorker:
     def _merge_clips(self, ytdl_params: dict) -> int:
         ranges = list(self.spec.clip_ranges)
         if not ranges:
-            self._put({'status': 'error', 'msg': 'Keine Clip-Bereiche für Merge'})
+            self._put({'status': 'error', 'msg': 'No clip ranges for merge'})
             return 1
         batch_dir = os.path.join(self.temp_dir, 'merge')
         os.makedirs(batch_dir, exist_ok=True)
@@ -492,15 +492,15 @@ class _DownloadWorker:
                 part_base = i * part_scale
                 self._put(_progress_payload(
                     fraction=part_base,
-                    msg=f'Teil {i + 1}/{total_parts}: starte…',
+                    msg=f'Part {i + 1}/{total_parts}: starting…',
                 ))
                 produced, _detail = self._merge_part(i, start, end, batch_dir, part_base, part_scale, total_parts, ytdl_params)
                 if produced is None:
-                    self._put({'status': 'error', 'msg': f'Teil {i + 1}/{total_parts} fehlgeschlagen'})
+                    self._put({'status': 'error', 'msg': f'Part {i + 1}/{total_parts} failed'})
                     return 1
                 part_paths.append(produced)
 
-            self._put(_progress_payload(fraction=0.92, msg=f'Füge {len(part_paths)} Teile zusammen…', eta=10))
+            self._put(_progress_payload(fraction=0.92, msg=f'Merging {len(part_paths)} parts…', eta=10))
 
             list_path = os.path.join(batch_dir, 'concat.txt')
             with open(list_path, 'w', encoding='utf-8') as fh:
@@ -524,7 +524,7 @@ class _DownloadWorker:
                 proc = subprocess.run(cmd, capture_output=True, text=True)
                 if proc.returncode != 0:
                     return 1
-            self._mark_finished(merged_name, msg=f'Zusammenschnitt: {len(part_paths)} Teile')
+            self._mark_finished(merged_name, msg=f'Merged: {len(part_paths)} parts')
             log.info('merge job %s: %d parts -> %s', self.job_id, len(part_paths), merged_name)
             return 0
         finally:

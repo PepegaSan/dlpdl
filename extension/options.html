@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Clip-Direct – Einstellungen</title>
+  <title>Clip-Direct – Settings</title>
   <style>
     body { font: 14px system-ui, sans-serif; max-width: 520px; margin: 24px auto; padding: 0 16px; }
     label { display: block; margin-top: 12px; font-weight: 600; }
@@ -13,38 +13,37 @@
   </style>
 </head>
 <body>
-  <h1>Clip-Direct Extension</h1>
-  <p class="note">Default: fertige Dateien werden im Web-UI auf deinen <strong>PC</strong> gespeichert (Browser-Download).</p>
-  <label>Clip-Direct Adresse (API + Web-UI)
-    <input type="url" id="clipDirectBaseUrl" placeholder="http://localhost:8090/" />
-  </label>
-  <p class="note">Gleiche URL für Jobs und die Web-Oberfläche — z.&nbsp;B. <code>http://localhost:8085/</code> wenn dein Container auf Port 8085 läuft. Im Popup: Button <strong>Web-UI</strong>.</p>
-  <label>Speicherziel
-    <select id="saveTarget">
-      <option value="browser">PC (Browser-Download)</option>
-      <option value="nas">NAS (Server-Ordner)</option>
-    </select>
-  </label>
-  <label>NAS-Unterordner (nur bei NAS)
-    <input type="text" id="folder" placeholder="" />
-  </label>
-  <label>Download type
-    <select id="downloadType">
-      <option value="video">Video</option>
-      <option value="audio">Audio</option>
-    </select>
-  </label>
-  <label>Format
-    <input type="text" id="format" value="any" />
-  </label>
-  <label>Nach dem Senden Web-UI öffnen (ein Tab, nicht jedes Mal neu)
-    <select id="openUiAfterQueue">
-      <option value="false">Nein (empfohlen)</option>
-      <option value="true">Ja — vorhandenen Tab fokussieren</option>
-    </select>
-  </label>
-  <button type="button" id="save">Speichern</button><span id="saved" class="saved" hidden>Gespeichert</span>
-  <button type="button" id="openUi" style="margin-left:8px">Web-UI öffnen</button>
+  <h1 data-i18n="options.title"></h1>
+  <p class="note" data-i18n="options.noteDefault"></p>
+  <label data-i18n="options.language"></label>
+  <select id="uiLocale">
+    <option value="en" data-i18n="options.lang.en"></option>
+    <option value="de" data-i18n="options.lang.de"></option>
+  </select>
+  <label data-i18n="options.serverUrl"></label>
+  <input type="url" id="clipDirectBaseUrl" placeholder="http://localhost:8090/" />
+  <p class="note" data-i18n="options.serverNote"></p>
+  <label data-i18n="options.saveTarget"></label>
+  <select id="saveTarget">
+    <option value="browser" data-i18n="options.saveBrowser"></option>
+    <option value="nas" data-i18n="options.saveNas"></option>
+  </select>
+  <label data-i18n="options.nasFolder"></label>
+  <input type="text" id="folder" placeholder="" />
+  <label data-i18n="options.downloadType"></label>
+  <select id="downloadType">
+    <option value="video" data-i18n="options.typeVideo"></option>
+    <option value="audio" data-i18n="options.typeAudio"></option>
+  </select>
+  <label data-i18n="options.format"></label>
+  <input type="text" id="format" value="any" />
+  <label data-i18n="options.openUiAfterQueue"></label>
+  <select id="openUiAfterQueue">
+    <option value="false" data-i18n="options.openUiNo"></option>
+    <option value="true" data-i18n="options.openUiYes"></option>
+  </select>
+  <button type="button" id="save" data-i18n="options.save"></button><span id="saved" class="saved" hidden data-i18n="options.saved"></span>
+  <button type="button" id="openUi" style="margin-left:8px" data-i18n="options.openWebUi"></button>
   <script type="module" src="options.js"></script>
 </body>
 </html>

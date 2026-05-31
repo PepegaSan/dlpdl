@@ -12,6 +12,13 @@ function formatClockTime(seconds) {
   return `${min}:${String(sec).padStart(2, '0')}`;
 }
 
+function cdT(key, params) {
+  if (typeof window.clipDirectT === 'function') {
+    return window.clipDirectT(key, params);
+  }
+  return key;
+}
+
 function draftKeyForHref(href) {
   try {
     const url = new URL(href);
@@ -121,7 +128,7 @@ function handleInvalidExtensionContext() {
   if (!document.getElementById(RELOAD_HINT_ID)) {
     const hint = document.createElement('div');
     hint.id = RELOAD_HINT_ID;
-    hint.textContent = 'Clip-Direct Extension wurde aktualisiert — Seite neu laden (F5)';
+    hint.textContent = cdT('bar.reloadHint');
     hint.style.cssText =
       'position:fixed;bottom:12px;right:12px;z-index:2147483647;padding:10px 14px;' +
       'background:#b02a37;color:#fff;border-radius:8px;font:13px system-ui,sans-serif;' +
@@ -411,13 +418,26 @@ function updateOverlayUiNow() {
   const key = storageKey();
   const clipCount = sessionClipsByKey[key]?.length ?? 0;
   if (pendingStart) {
-    statusEl.textContent = `Start ${pendingStart} — spule zum Ende, dann Ende`;
+    statusEl.textContent = cdT('bar.status.pending', { start: pendingStart });
   } else if (clipCount > 0) {
-    statusEl.textContent = `${clipCount} Clip(s) — Extension-Popup senden`;
+    statusEl.textContent = cdT('bar.status.clips', { count: clipCount });
   } else {
     const v = getActiveVideo();
-    statusEl.textContent = v ? `Jetzt: ${formatClockTime(safeVideoTime(v))}` : 'Kein Video';
+    statusEl.textContent = v
+      ? cdT('bar.status.now', { time: formatClockTime(safeVideoTime(v)) })
+      : cdT('bar.status.noVideo');
   }
+}
+
+function applyBarI18n(bar) {
+  const start = bar.querySelector('[data-action="start"]');
+  const end = bar.querySelector('[data-action="end"]');
+  const clear = bar.querySelector('[data-action="clear"]');
+  const hide = bar.querySelector('[data-action="hide"]');
+  if (start) start.textContent = cdT('bar.start');
+  if (end) end.textContent = cdT('bar.end');
+  if (clear) clear.textContent = cdT('bar.cancel');
+  if (hide) hide.title = cdT('bar.hideTitle');
 }
 
 function doMarkStart() {
@@ -574,12 +594,13 @@ function ensureOverlay() {
   const bar = document.createElement('div');
   bar.id = 'clip-direct-clip-bar';
   bar.innerHTML = `
-    <button type="button" class="clip-direct-primary" data-action="start">Start</button>
-    <button type="button" data-action="end" disabled>Ende</button>
-    <button type="button" data-action="clear" hidden>Abbrechen</button>
+    <button type="button" class="clip-direct-primary" data-action="start"></button>
+    <button type="button" data-action="end" disabled></button>
+    <button type="button" data-action="clear" hidden></button>
     <span class="clip-direct-status" data-role="status"></span>
-    <button type="button" class="clip-direct-hide" data-action="hide" title="Leiste ausblenden">✕</button>
+    <button type="button" class="clip-direct-hide" data-action="hide" title="">✕</button>
   `;
+  applyBarI18n(bar);
 
   function bindBarButton(selector, handler) {
     const btn = bar.querySelector(selector);
@@ -636,18 +657,18 @@ function syncOverlayState() {
         btnEnd.disabled = !pending;
         btnClear.hidden = !pending;
         if (pending) {
-          statusEl.textContent = `Start ${pending} — spule zum Ende, dann Ende`;
+          statusEl.textContent = cdT('bar.status.pending', { start: pending });
         } else if (clips.length) {
-          statusEl.textContent = `${clips.length} Clip(s) — Extension-Popup senden`;
+          statusEl.textContent = cdT('bar.status.clips', { count: clips.length });
         } else {
           const v = getActiveVideo();
           statusEl.textContent = v
-            ? `Jetzt: ${formatClockTime(safeVideoTime(v))}`
-            : 'Kein Video';
+            ? cdT('bar.status.now', { time: formatClockTime(safeVideoTime(v)) })
+            : cdT('bar.status.noVideo');
         }
       })
       .catch(() => {
-        if (statusEl) statusEl.textContent = 'Video nicht bereit';
+        if (statusEl) statusEl.textContent = cdT('bar.status.videoNotReady');
       });
   } catch {
     /* ignore — some players break DOM access */
@@ -656,21 +677,28 @@ function syncOverlayState() {
 
 function initBar() {
   if (sessionBarHidden) return;
-  storageLocalGet([BAR_HIDDEN_KEY, 'metubeBarHidden']).then((data) => {
-    if (barHiddenFromStorage(data) || sessionBarHidden) return;
-    if (shouldShowBar()) {
-      ensureOverlay();
-      return;
-    }
-    const obs = new MutationObserver(() => {
+  const start = () => {
+    storageLocalGet([BAR_HIDDEN_KEY, 'metubeBarHidden']).then((data) => {
+      if (barHiddenFromStorage(data) || sessionBarHidden) return;
       if (shouldShowBar()) {
-        obs.disconnect();
         ensureOverlay();
+        return;
       }
+      const obs = new MutationObserver(() => {
+        if (shouldShowBar()) {
+          obs.disconnect();
+          ensureOverlay();
+        }
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+      setTimeout(() => obs.disconnect(), 60000);
     });
-    obs.observe(document.documentElement, { childList: true, subtree: true });
-    setTimeout(() => obs.disconnect(), 60000);
-  });
+  };
+  if (window.clipDirectI18nReady) {
+    window.clipDirectI18nReady.then(start);
+  } else {
+    start();
+  }
 }
 
 let lastHref = location.href;

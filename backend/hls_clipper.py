@@ -493,7 +493,7 @@ def clip_hls_to_file(
     expected_duration = None if full_span else max(end_eff - start_sec, 0.1)
 
     if not full_span:
-        report(0.05, 'HLS: ffmpeg schneidet…', eta=expected_duration * 0.6 if expected_duration else None)
+        report(0.05, 'HLS: cutting with ffmpeg…', eta=expected_duration * 0.6 if expected_duration else None)
         ok, err = clip_hls_ffmpeg_native(
             media_url, headers, start_sec, end_sec, end_eff, output_mp4,
         )

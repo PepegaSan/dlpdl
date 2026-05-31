@@ -1,3 +1,4 @@
+import { applyI18n, initI18n, t } from './lib/i18n.js';
 import { openClipDirectUi } from './lib/open-ui.js';
 import { loadSettings, saveClipDraft } from './lib/storage.js';
 
@@ -37,9 +38,9 @@ btnOpenUi?.addEventListener('click', async () => {
   try {
     const settings = await loadSettings();
     await openClipDirectUi(settings.clipDirectBaseUrl);
-    setStatus('Web-UI geöffnet — Fortschritt & PC-Download dort.');
+    setStatus('popup.status.webUiOpened');
   } catch (err) {
-    setStatus(`Web-UI konnte nicht geöffnet werden: ${err?.message || err}`);
+    setStatus('popup.status.webUiFailed', { error: err?.message || err });
   }
 });
 
@@ -66,18 +67,19 @@ function shortenUrl(url) {
 
 function refererLabel(stream) {
   const ref = stream.referer || stream.origin || '';
-  if (!ref) return 'kein Referer erkannt';
+  if (!ref) return t('popup.referer.none');
   try {
-    return `Referer: ${new URL(ref).origin}`;
+    return t('popup.referer.label', { origin: new URL(ref).origin });
   } catch {
-    return `Referer: ${ref}`;
+    return t('popup.referer.label', { origin: ref });
   }
 }
 
 async function sendStream(stream, withClips, button, mergeClips = false) {
   button.disabled = true;
-  if (mergeClips) setStatus('Sende Stream als Zusammenschnitt…');
-  else setStatus(withClips ? 'Sende Stream mit Schnitt…' : 'Sende Stream…');
+  if (mergeClips) setStatus('popup.status.sendingMerge');
+  else if (withClips) setStatus('popup.status.sendingCut');
+  else setStatus('popup.status.sendingStream');
   const result = await chrome.runtime.sendMessage({
     action: 'queueStream',
     stream,
@@ -86,10 +88,11 @@ async function sendStream(stream, withClips, button, mergeClips = false) {
     mergeClips,
   });
   if (result?.ok) {
-    if (mergeClips) setStatus('Zusammenschnitt wird erstellt…');
-    else setStatus(withClips ? 'Stream + Schnitt gesendet.' : 'Stream gesendet.');
+    if (mergeClips) setStatus('popup.status.mergeQueued');
+    else if (withClips) setStatus('popup.status.cutQueued');
+    else setStatus('popup.status.streamQueued');
   } else {
-    setStatus(`Fehler: ${result?.error || '?'}`);
+    setStatus('popup.status.error', { error: result?.error || '?' });
     button.disabled = false;
   }
 }
@@ -105,7 +108,6 @@ function renderTabClips() {
     const del = document.createElement('button');
     del.type = 'button';
     del.textContent = '×';
-    del.title = 'Abschnitt aus der Auswahl entfernen';
     del.addEventListener('click', () => removeTabClip(index));
     li.appendChild(del);
     streamClipListEl.appendChild(li);
@@ -119,7 +121,7 @@ async function removeTabClip(index) {
     tabClips = Array.isArray(res.clips) ? res.clips : [];
     renderStreams();
   } else {
-    setStatus(`Konnte Abschnitt nicht entfernen: ${res?.error || '?'}`);
+    setStatus('popup.status.error', { error: res?.error || '?' });
   }
 }
 
@@ -158,10 +160,8 @@ function renderStreams() {
       const cut = document.createElement('button');
       cut.type = 'button';
       cut.className = 'stream-send';
-      cut.textContent = `Mit Schnitt (${tabClips.length})`;
-      cut.title = tabClips.length === 1
-        ? 'Einen markierten Abschnitt als Datei (gleicher Pfad wie Zusammenfügen)'
-        : 'Jeden markierten Abschnitt als eigene Datei';
+      cut.textContent = t('popup.stream.cutOne', { count: tabClips.length });
+      cut.title = t('popup.stream.cutOneTitle');
       cut.addEventListener('click', () => sendStream(stream, true, cut, false));
       btnGroup.appendChild(cut);
 
@@ -169,8 +169,8 @@ function renderStreams() {
         const merge = document.createElement('button');
         merge.type = 'button';
         merge.className = 'stream-merge';
-        merge.textContent = `Zusammenfügen (${tabClips.length})`;
-        merge.title = 'Alle markierten Abschnitte zu einer Datei zusammenfügen';
+        merge.textContent = t('popup.stream.merge', { count: tabClips.length });
+        merge.title = t('popup.stream.mergeTitle');
         merge.addEventListener('click', () => sendStream(stream, true, merge, true));
         btnGroup.appendChild(merge);
       }
@@ -178,14 +178,15 @@ function renderStreams() {
       const full = document.createElement('button');
       full.type = 'button';
       full.className = 'stream-full';
-      full.textContent = 'Ganzes';
+      full.textContent = t('popup.stream.full');
+      full.title = t('popup.stream.fullTitle');
       full.addEventListener('click', () => sendStream(stream, false, full));
       btnGroup.appendChild(full);
     } else {
       const send = document.createElement('button');
       send.type = 'button';
       send.className = 'stream-send';
-      send.textContent = 'Senden';
+      send.textContent = t('popup.stream.send');
       send.addEventListener('click', () => sendStream(stream, false, send));
       btnGroup.appendChild(send);
     }
@@ -212,8 +213,12 @@ btnClearStreams?.addEventListener('click', async () => {
   renderStreams();
 });
 
-function setStatus(text) {
-  statusEl.textContent = text;
+function setStatus(keyOrText, params) {
+  if (keyOrText.includes('.')) {
+    statusEl.textContent = t(keyOrText, params);
+  } else {
+    statusEl.textContent = keyOrText;
+  }
 }
 
 function renderClips() {
@@ -244,7 +249,7 @@ function updateButtons() {
     btnCancelPending.disabled = !pendingStart;
   }
   if (btnEnd) btnEnd.disabled = !pendingStart;
-  pendingEl.textContent = pendingStart ? `Start: ${pendingStart}` : '';
+  pendingEl.textContent = pendingStart ? t('popup.pendingLabel', { start: pendingStart }) : '';
 }
 
 function applyFromState(state) {
@@ -263,7 +268,7 @@ async function refresh() {
   const state = await sendBg('getVideoState');
 
   if (state?.error === 'context_invalidated' || state?.hint === 'reload_tab') {
-    setStatus('Clip-Direct wurde aktualisiert — diese Seite einmal neu laden (F5).');
+    setStatus('popup.status.reloadExtension');
     btnStart.disabled = true;
     btnEnd.disabled = true;
     return;
@@ -272,16 +277,16 @@ async function refresh() {
   applyFromState(state);
 
   if (state?.ok) {
-    setStatus(`Aktuell: ${state.formatted} — oder Leiste auf der Seite`);
+    setStatus('popup.status.current', { time: state.formatted });
     btnStart.disabled = false;
   } else if (pendingStart) {
-    setStatus('Start gespeichert — Ende auf der Seiten-Leiste oder hier');
+    setStatus('popup.status.pending');
     btnStart.disabled = false;
   } else if (clips.length) {
-    setStatus(`${clips.length} Clip(s) — unten senden`);
+    setStatus('popup.status.clipsReady', { count: clips.length });
     btnStart.disabled = false;
   } else {
-    setStatus(state?.error === 'no_video' ? 'Kein Video — Seite neu laden' : 'Verbinde…');
+    setStatus(state?.error === 'no_video' ? 'popup.status.noVideo' : 'popup.status.connecting');
     btnStart.disabled = !state?.pageUrl;
   }
 
@@ -293,7 +298,7 @@ btnStart?.addEventListener('mousedown', (e) => {
   e.preventDefault();
   sendBg('markStart').then((res) => {
     if (res?.ok) applyFromState(res);
-    else setStatus('Start fehlgeschlagen — Leiste unten rechts auf der Seite nutzen');
+    else setStatus('popup.status.startFailed');
     updateButtons();
   });
 });
@@ -321,7 +326,7 @@ btnCancelPending?.addEventListener('mousedown', (e) => {
 });
 
 btnShowBar?.addEventListener('click', () => {
-  sendBg('showBar').then(() => setStatus('Leiste auf der Seite sollte sichtbar sein'));
+  sendBg('showBar').then(() => setStatus('popup.status.barShown'));
 });
 
 btnQueueEach.addEventListener('click', () => sendQueue(false));
@@ -334,22 +339,35 @@ async function sendQueue(mergeClips) {
     clips = [...state.clips];
   }
   if (!pageUrl || !clips.length) {
-    setStatus('Keine Clips — zuerst Start/Ende setzen');
+    setStatus('popup.status.noClips');
     return;
   }
-  setStatus('Sende…');
+  setStatus('popup.status.sending');
   const result = await chrome.runtime.sendMessage({
     action: 'queueClips',
     pageUrl,
     clips,
     mergeClips,
   });
-  setStatus(result?.ok ? 'Gesendet — im Web-UI Fortschritt/Download.' : `Fehler: ${result?.error || '?'}`);
+  if (result?.ok) {
+    setStatus('popup.status.sent');
+  } else if (result?.errorKey) {
+    setStatus('popup.status.error', { error: t(result.errorKey) });
+  } else {
+    setStatus('popup.status.error', { error: result?.error || '?' });
+  }
 }
 
-refresh();
-refreshStreams();
-streamTimer = setInterval(refreshStreams, 1500);
+async function boot() {
+  await initI18n();
+  applyI18n();
+  await refresh();
+  refreshStreams();
+  streamTimer = setInterval(refreshStreams, 1500);
+}
+
+boot();
+
 window.addEventListener('unload', () => {
   if (streamTimer) clearInterval(streamTimer);
 });

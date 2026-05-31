@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -10,35 +10,35 @@
   <header>
     <h1>Clip-Direct</h1>
     <div class="header-actions">
-      <button type="button" id="btnOpenUi" class="btn-open-ui" title="Web-UI öffnen (Adresse in den Einstellungen)">Web-UI</button>
-      <a href="#" id="optionsLink" title="Einstellungen">⚙</a>
+      <button type="button" id="btnOpenUi" class="btn-open-ui" data-i18n="popup.openUiTitle" data-i18n-attr="title">Web-UI</button>
+      <a href="#" id="optionsLink" data-i18n="popup.optionsTitle" data-i18n-attr="title">⚙</a>
     </div>
   </header>
   <p id="status" class="status">…</p>
-  <p class="hint-top"><strong>Empfohlen:</strong> dunkle Leiste <strong>unten rechts auf der Videoseite</strong> (Start / Ende). Popup schließt beim Klick ins Video.</p>
-  <button type="button" id="btnShowBar" class="btn-show-bar">Leiste auf Seite einblenden</button>
+  <p class="hint-top" data-i18n="popup.hintTop"></p>
+  <button type="button" id="btnShowBar" class="btn-show-bar" data-i18n="popup.showBar"></button>
   <p id="pageUrl" class="url" hidden></p>
   <div class="markers">
-    <button type="button" id="btnStart" disabled>Start setzen</button>
-    <button type="button" id="btnEnd" disabled>Ende setzen</button>
-    <button type="button" id="btnCancelPending" hidden>Start verwerfen</button>
+    <button type="button" id="btnStart" disabled data-i18n="popup.btnStart"></button>
+    <button type="button" id="btnEnd" disabled data-i18n="popup.btnEnd"></button>
+    <button type="button" id="btnCancelPending" hidden data-i18n="popup.btnCancelPending"></button>
   </div>
   <p id="pending" class="pending"></p>
   <ul id="clipList" class="clips"></ul>
   <div class="actions">
-    <button type="button" id="btnQueueEach" class="primary" disabled>In Queue (einzeln)</button>
-    <button type="button" id="btnQueueMerge" disabled>In Queue (merged)</button>
+    <button type="button" id="btnQueueEach" class="primary" disabled data-i18n="popup.queueEach"></button>
+    <button type="button" id="btnQueueMerge" disabled data-i18n="popup.queueMerge"></button>
   </div>
   <section id="streamSection" class="streams" hidden>
     <div class="streams-head">
-      <h2>Erkannte Streams</h2>
-      <button type="button" id="btnClearStreams" title="Liste leeren">leeren</button>
+      <h2 data-i18n="popup.streamsTitle"></h2>
+      <button type="button" id="btnClearStreams" data-i18n="popup.clearStreams" data-i18n-attr="title"></button>
     </div>
-    <p class="streams-hint">Auf .php-Seiten: <strong>Mit Schnitt</strong> am Stream. Auf YouTube &amp; Co.: „In Queue“ nutzt die Seiten-URL (wie MeTube).</p>
+    <p class="streams-hint" data-i18n="popup.streamsHint"></p>
     <ul id="streamClipList" class="clips stream-clips"></ul>
     <ul id="streamList" class="streams-list"></ul>
   </section>
-  <p class="hint">Clips vom Plugin — Download standardmäßig auf den PC über das Clip-Direct Web-UI.</p>
+  <p class="hint" data-i18n="popup.hintFooter"></p>
   <script type="module" src="popup.js"></script>
 </body>
 </html>

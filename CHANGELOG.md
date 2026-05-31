@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — English UI + optional German
+
+- Extension popup, options, and on-page clip bar: **English by default**, Deutsch in settings (`uiLocale`)
+- Web UI: English default, language selector, i18n via `/locales/{en,de}.json`
+- Backend job status messages in English
+- README: Responsible use section
+
 ## 1.2.5 — License
 
 - Project license changed from AGPL-3.0 to **GPL-3.0-or-later** (aligned with yt-dlp; see LICENSE and COPYRIGHT)

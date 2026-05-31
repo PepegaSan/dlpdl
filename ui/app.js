@@ -1,3 +1,5 @@
+import { applyUiI18n, getUiLocale, initUiI18n, t } from './i18n.js';
+
 const AUTO_DOWNLOAD_KEY = 'clipDirectAutoDownload';
 const AUTO_CLAIMED_KEY = 'clipDirectAutoClaimed';
 
@@ -21,7 +23,6 @@ function saveIdSet(key, set) {
   localStorage.setItem(key, JSON.stringify([...set]));
 }
 
-/** Sofort in localStorage — wichtig bei mehreren Tabs. */
 function tryClaimAutoDownload(jobId) {
   const claimed = loadIdSet(AUTO_CLAIMED_KEY);
   if (claimed.has(jobId)) return false;
@@ -73,9 +74,6 @@ async function triggerPcDownload(job) {
   }
 }
 
-/**
- * Auto-Speichern nur in einem Tab (Web Locks) und nur wenn dieser Tab sichtbar ist.
- */
 async function autoDownloadReadyJobs(jobs) {
   if (!autoDownloadEnabled() || document.hidden) return;
 
@@ -105,6 +103,14 @@ async function autoDownloadReadyJobs(jobs) {
   }
 }
 
+function statusLabelFor(job) {
+  if (job.status === 'running') return t('ui.status.running');
+  if (job.status === 'ready') return t('ui.status.ready');
+  if (job.status === 'error') return t('ui.status.error');
+  if (job.status === 'pending') return t('ui.status.pending');
+  return job.status || '';
+}
+
 function renderJob(job) {
   const pct = Math.round((job.progress || 0) * 100);
   const isReady = job.status === 'ready';
@@ -115,14 +121,9 @@ function renderJob(job) {
   div.className = 'job' + (isError ? ' error' : '') + (isReady ? ' ready' : '');
   div.dataset.id = job.id;
 
-  let statusLabel = job.status;
-  if (job.status === 'running') statusLabel = 'Läuft…';
-  if (job.status === 'ready') statusLabel = 'Bereit';
-  if (job.status === 'error') statusLabel = 'Fehler';
-
   div.innerHTML = `
     <div class="url">${escapeHtml(job.url || '')}</div>
-    <div class="status">${escapeHtml(statusLabel)}</div>
+    <div class="status">${escapeHtml(statusLabelFor(job))}</div>
     <div class="msg">${escapeHtml(job.msg || job.error || '')}</div>
     ${isRunning ? `<div class="bar"><span style="width:${pct}%"></span></div>` : ''}
     <div class="actions"></div>
@@ -131,7 +132,7 @@ function renderJob(job) {
   const actions = div.querySelector('.actions');
   if (isReady) {
     const dl = document.createElement('button');
-    dl.textContent = 'Auf PC speichern';
+    dl.textContent = t('ui.saveToPc');
     dl.addEventListener('click', () => {
       void triggerPcDownload(job);
     });
@@ -140,7 +141,7 @@ function renderJob(job) {
   if (isReady || isError) {
     const rm = document.createElement('button');
     rm.className = 'secondary';
-    rm.textContent = 'Entfernen';
+    rm.textContent = t('ui.remove');
     rm.addEventListener('click', async () => {
       await fetch(`/api/jobs/${job.id}`, { method: 'DELETE' });
       const claimed = loadIdSet(AUTO_CLAIMED_KEY);
@@ -195,7 +196,6 @@ function schedulePoll(ms) {
   pollTimer = setTimeout(() => refresh(), ms);
 }
 
-/** Warnt, wenn mehrere Tabs dieselbe Origin offen haben. */
 function setupTabWarning() {
   const el = document.getElementById('tabWarn');
   if (!el || !('BroadcastChannel' in window)) return;
@@ -238,18 +238,38 @@ function ensureSettingsBar() {
   cb.checked = autoDownloadEnabled();
   cb.addEventListener('change', () => setAutoDownload(cb.checked));
   label.appendChild(cb);
-  label.appendChild(document.createTextNode('Bei „Bereit“ automatisch Speichern-Dialog (einmal pro Clip)'));
+  const autoText = document.createElement('span');
+  autoText.setAttribute('data-i18n', 'ui.autoSave');
+  label.appendChild(autoText);
   bar.appendChild(label);
   const hint = document.createElement('p');
   hint.style.color = '#9aa0a6';
   hint.style.fontSize = '0.8rem';
   hint.style.margin = '8px 0 0';
-  hint.textContent =
-    'Nur ein Tab mit dieser Seite offen. Auto-Speichern läuft nur im sichtbaren Tab.';
+  hint.setAttribute('data-i18n', 'ui.autoSaveHint');
   bar.appendChild(hint);
   document.querySelector('header').after(bar);
+  applyUiI18n(bar);
 }
 
-ensureSettingsBar();
-setupTabWarning();
-refresh();
+function setupLocaleSelector() {
+  const select = document.getElementById('uiLocaleSelect');
+  if (!select) return;
+  select.value = getUiLocale();
+  select.addEventListener('change', async () => {
+    await initUiI18n(select.value);
+    applyUiI18n();
+    refresh();
+  });
+}
+
+async function boot() {
+  await initUiI18n();
+  applyUiI18n();
+  setupLocaleSelector();
+  ensureSettingsBar();
+  setupTabWarning();
+  refresh();
+}
+
+boot();

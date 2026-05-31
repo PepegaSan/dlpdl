@@ -62,6 +62,8 @@ Open **http://localhost:8090/** for the web UI.
 
 Reload the extension after updates; refresh video tabs once (F5).
 
+**Language:** Extension and web UI default to **English**. Choose **Deutsch** in extension settings or the language dropdown on the web UI (`http://localhost:8090/`).
+
 ## Docker
 
 ```bash
@@ -96,6 +98,18 @@ git push -u origin main
 ```
 
 Do **not** push into the MeTube repo unless you are intentionally contributing upstream.
+
+## Responsible use
+
+Clip-Direct is a technical tool for marking time ranges and saving media you choose to process on your own server.
+
+**You are responsible** for complying with applicable laws, copyright, and the terms of service of any site or content provider.
+
+Use it only for content you have the right to access and copy (your own work, explicit permission, or licenses that allow downloading and clipping).
+
+The authors do not encourage or support copyright infringement, unauthorized redistribution, or circumventing technical protection measures.
+
+This section is not legal advice; if unsure, check the rules that apply to you.
 
 ## License
 

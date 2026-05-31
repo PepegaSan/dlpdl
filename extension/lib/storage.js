@@ -10,10 +10,12 @@ import { draftKeyForHref } from './page-url.js';
  * @property {string} folder
  * @property {string} customNamePrefix
  * @property {boolean} openUiAfterQueue
+ * @property {string} uiLocale en | de
  */
 
 export const DEFAULT_SETTINGS = {
   clipDirectBaseUrl: 'http://localhost:8090/',
+  uiLocale: 'en',
   saveTarget: 'browser',
   downloadType: 'video',
   codec: 'auto',

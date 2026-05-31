@@ -296,11 +296,7 @@ async function queueClips(pageUrl, clips, mergeClips) {
     return queueStream(stream, pageUrl, clips, mergeClips);
   }
 
-  return {
-    ok: false,
-    error:
-      'Diese Seite (.php) ist nur über einen erkannten Stream ladbar. Video kurz abspielen, F5, dann „Mit Schnitt“ am Stream — oder prüfen ob unter „Erkannte Streams“ etwas steht.',
-  };
+  return { ok: false, errorKey: 'error.shellPagePhp' };
 }
 
 async function forwardToTab(tabId, payload) {

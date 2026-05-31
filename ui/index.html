@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -9,11 +9,18 @@
 <body>
   <header>
     <h1>Clip-Direct</h1>
-    <p class="sub">Clips vom Addon — bei „Bereit“ Auto-Speichern (Häkchen) oder Button „Auf PC speichern“.</p>
-    <p id="tabWarn" class="tab-warn" hidden>Mehrere Tabs mit dieser Seite offen — das verursacht mehrfache Speichern-Dialoge. Andere Tabs schließen.</p>
+    <p class="sub" data-i18n="ui.subtitle"></p>
+    <p id="tabWarn" class="tab-warn" hidden data-i18n="ui.tabWarn"></p>
+    <div class="lang-row">
+      <label for="uiLocaleSelect" data-i18n="ui.language"></label>
+      <select id="uiLocaleSelect" aria-label="Language">
+        <option value="en" data-i18n="ui.lang.en"></option>
+        <option value="de" data-i18n="ui.lang.de"></option>
+      </select>
+    </div>
   </header>
   <main id="jobs"></main>
-  <p id="empty" class="empty">Noch keine Jobs. Sende einen Clip vom Addon.</p>
-  <script src="/app.js?v=9"></script>
+  <p id="empty" class="empty" data-i18n="ui.empty"></p>
+  <script type="module" src="/app.js?v=10"></script>
 </body>
 </html>
