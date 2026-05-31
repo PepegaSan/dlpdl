@@ -99,9 +99,9 @@ Do **not** push into the MeTube repo unless you are intentionally contributing u
 
 ## License
 
-This project is released under **[AGPL-3.0](LICENSE)**. See [NOTICES.md](NOTICES.md) for yt-dlp and ffmpeg. When you distribute or run it as a network service, comply with AGPL source-offer requirements.
+This project is released under the **[GNU General Public License v3.0 or later](LICENSE)** (GPL-3.0-or-later). See [NOTICES.md](NOTICES.md) for yt-dlp (GPL) and ffmpeg. [COPYRIGHT](COPYRIGHT) lists the project copyright holder.
 
-**This is not legal advice.**
+When you distribute Clip-Direct (including Docker images), provide source code under the same license. **This is not legal advice.**
 
 ## Synology / NAS
 

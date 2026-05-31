@@ -1,10 +1,14 @@
 # Third-party notices
 
+## Clip-Direct
+
+- License: GNU General Public License v3.0 or later (see [LICENSE](LICENSE), [COPYRIGHT](COPYRIGHT))
+
 ## yt-dlp
 
 Clip-Direct uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) as a Python dependency (`yt-dlp[default]` in `requirements.txt`).
 
-- License: GNU General Public License v3 (or later)
+- License: GNU General Public License v3.0 or later (compatible with Clip-Direct’s GPL-3.0-or-later)
 - Source: https://github.com/yt-dlp/yt-dlp
 
 ## ffmpeg

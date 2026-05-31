@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.5 — License
+
+- Project license changed from AGPL-3.0 to **GPL-3.0-or-later** (aligned with yt-dlp; see LICENSE and COPYRIGHT)
+
 ## 1.2.3 — HLS clip start quality
 
 - HLS clips: one preroll segment + ffmpeg keyframe-aligned seek (fixes blocky first 3–5s)
