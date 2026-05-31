@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <title>Clip-Direct – Einstellungen</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; max-width: 520px; margin: 24px auto; padding: 0 16px; }
+    label { display: block; margin-top: 12px; font-weight: 600; }
+    input, select { width: 100%; margin-top: 4px; padding: 8px; box-sizing: border-box; }
+    button { margin-top: 20px; padding: 10px 16px; }
+    .saved { color: green; margin-left: 8px; }
+    p.note { color: #555; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Clip-Direct Extension</h1>
+  <p class="note">Default: fertige Dateien werden im Web-UI auf deinen <strong>PC</strong> gespeichert (Browser-Download).</p>
+  <label>Clip-Direct Adresse (API + Web-UI)
+    <input type="url" id="clipDirectBaseUrl" placeholder="http://localhost:8090/" />
+  </label>
+  <p class="note">Gleiche URL für Jobs und die Web-Oberfläche — z.&nbsp;B. <code>http://localhost:8085/</code> wenn dein Container auf Port 8085 läuft. Im Popup: Button <strong>Web-UI</strong>.</p>
+  <label>Speicherziel
+    <select id="saveTarget">
+      <option value="browser">PC (Browser-Download)</option>
+      <option value="nas">NAS (Server-Ordner)</option>
+    </select>
+  </label>
+  <label>NAS-Unterordner (nur bei NAS)
+    <input type="text" id="folder" placeholder="" />
+  </label>
+  <label>Download type
+    <select id="downloadType">
+      <option value="video">Video</option>
+      <option value="audio">Audio</option>
+    </select>
+  </label>
+  <label>Format
+    <input type="text" id="format" value="any" />
+  </label>
+  <label>Nach dem Senden Web-UI öffnen (ein Tab, nicht jedes Mal neu)
+    <select id="openUiAfterQueue">
+      <option value="false">Nein (empfohlen)</option>
+      <option value="true">Ja — vorhandenen Tab fokussieren</option>
+    </select>
+  </label>
+  <button type="button" id="save">Speichern</button><span id="saved" class="saved" hidden>Gespeichert</span>
+  <button type="button" id="openUi" style="margin-left:8px">Web-UI öffnen</button>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

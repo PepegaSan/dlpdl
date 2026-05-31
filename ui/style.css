@@ -1,0 +1,60 @@
+* { box-sizing: border-box; }
+body {
+  font: 15px/1.45 system-ui, sans-serif;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 16px 20px 40px;
+  background: #0f1115;
+  color: #e8eaed;
+}
+header h1 { margin: 0 0 4px; font-size: 1.35rem; }
+.sub { color: #9aa0a6; margin: 0 0 8px; font-size: 0.9rem; }
+.tab-warn {
+  color: #fbbf24;
+  background: #422006;
+  border: 1px solid #854d0e;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 0 0 16px;
+  font-size: 0.9rem;
+}
+.empty { color: #9aa0a6; }
+.empty[hidden] { display: none; }
+.job {
+  background: #1a1d24;
+  border: 1px solid #2d323c;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+.job .url { font-size: 0.8rem; color: #9aa0a6; word-break: break-all; margin-bottom: 8px; }
+.job .status { font-weight: 600; }
+.job .msg { color: #9aa0a6; font-size: 0.85rem; margin-top: 4px; }
+.job .bar {
+  height: 6px;
+  background: #2d323c;
+  border-radius: 3px;
+  margin: 10px 0;
+  overflow: hidden;
+}
+.job .bar > span {
+  display: block;
+  height: 100%;
+  background: #3b82f6;
+  width: 0%;
+  transition: width 0.2s;
+}
+.job .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+button, .btn {
+  cursor: pointer;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 0.9rem;
+  background: #3b82f6;
+  color: #fff;
+}
+button.secondary { background: #3d4450; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.job.error .status { color: #f87171; }
+.job.ready .status { color: #4ade80; }

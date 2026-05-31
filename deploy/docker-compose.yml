@@ -1,0 +1,15 @@
+services:
+  clip-direct:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: clip-direct
+    ports:
+      - "8090:8090"
+    environment:
+      DOWNLOAD_DIR: /downloads
+      TEMP_DIR: /downloads/.tmp
+      PORT: "8090"
+    volumes:
+      - ../downloads:/downloads
+    restart: unless-stopped
