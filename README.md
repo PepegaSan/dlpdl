@@ -2,6 +2,8 @@
 
 Browser-extension-driven video clips: mark start/end on a page, send a detected stream URL to a small server, and save the finished file to your PC (or to a folder on your NAS).
 
+> **Dependencies:** You do **not** need to download [yt-dlp](https://github.com/yt-dlp/yt-dlp) separately for the usual setup — it is installed automatically via `pip install -r requirements.txt` (Python package `yt-dlp[default]`) or is already included in the **Docker** image. For a **local** install (without Docker), you **must** install [ffmpeg](https://ffmpeg.org/) yourself and have it on your `PATH`. To update yt-dlp later: `pip install -U yt-dlp` or rebuild the Docker image.
+
 ## Acknowledgments
 
 Inspired by [MeTube](https://github.com/alexta69/metube) — thanks for the idea of combining a browser helper with yt-dlp. Clip-Direct is an independent project (different API, UI, and goals).
@@ -27,7 +29,8 @@ See [docs/BEHAVIOR.md](docs/BEHAVIOR.md) for details and regression notes.
 ## Requirements
 
 - Python 3.11+
-- [ffmpeg](https://ffmpeg.org/) on `PATH`
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — via `pip install -r requirements.txt` (no separate download)
+- [ffmpeg](https://ffmpeg.org/) on `PATH` — install separately (not bundled with pip)
 - Chrome / Chromium for the extension
 
 ## Quick start (local)
