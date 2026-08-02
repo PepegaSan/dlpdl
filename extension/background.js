@@ -8,13 +8,22 @@ import {
   guessPlaylistUrlFromSegment,
   isHlsPlaylistUrl,
   isHlsSegmentUrl,
+  isDirectMediaStreamUrl,
+  isEmbedShellUrl,
+  isHlsEmbedPageUrl,
+  isProgressiveCdnUrl,
+  isSignedMediaUrl,
   isLikelyPageShellUrl,
   isUsableStreamUrl,
+  needsSniffedStreamForPage,
   preferBestStream,
   requestHeadersMap,
   usableStreams,
 } from './lib/media-sniffer.js';
+import { loadClipClipboard, saveClipClipboard } from './lib/clip-clipboard.js';
 import { openClipDirectUi } from './lib/open-ui.js';
+import { collectStreamCookies, mergeCookieHeader } from './lib/browser-cookies.js';
+import { enrichStreamForQueue } from './lib/stream-headers.js';
 import { loadSettings } from './lib/storage.js';
 import { TabSessionStore } from './lib/tab-session.js';
 
@@ -38,7 +47,10 @@ function updateBadge(tabId) {
 }
 
 function recordDetectedUrl(tabId, url, meta) {
-  const kind = classifyMediaUrl(url);
+  let kind = classifyMediaUrl(url);
+  if (!kind && isHlsSegmentUrl(url)) {
+    kind = 'hls-segment';
+  }
   if (!kind) return;
   if (kind === 'hls-segment') {
     session.rememberHlsSegment(tabId, url);
@@ -48,15 +60,29 @@ function recordDetectedUrl(tabId, url, meta) {
   updateBadge(tabId);
 }
 
+function rememberTabCookies(tabId, url, cookieHeader) {
+  if (!cookieHeader || tabId == null || tabId < 0) return;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (/turboviplay|turbosplayer|emturbovid|cloudatacdn|dood\.video|doodstream/.test(host)) {
+      session.rememberRequestCookies(tabId, cookieHeader);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 function onBeforeSendHeaders(details) {
   const { tabId, url, requestHeaders, type } = details;
   if (tabId == null || tabId < 0) return;
   const headers = requestHeadersMap(requestHeaders);
+  rememberTabCookies(tabId, url, headers.cookie || '');
   recordDetectedUrl(tabId, url, {
     type: type || '',
     referer: headers.referer || headers.origin || '',
     origin: headers.origin || '',
     userAgent: headers['user-agent'] || '',
+    cookie: headers.cookie || '',
     ts: Date.now(),
   });
 }
@@ -86,6 +112,9 @@ function normalizeStreamForQueue(stream) {
   if (!stream?.url) return stream;
   if (isHlsPlaylistUrl(stream.url)) {
     return { ...stream, kind: 'hls' };
+  }
+  if (isProgressiveCdnUrl(stream.url) || isSignedMediaUrl(stream.url)) {
+    return { ...stream, kind: 'file' };
   }
   if (isHlsSegmentUrl(stream.url)) {
     const guessed = guessPlaylistUrlFromSegment(stream.url);
@@ -161,12 +190,29 @@ async function activeTabId() {
   return tab?.id;
 }
 
-async function postJob(settings, body) {
+async function jobBodyWithTabMeta(body, tabId) {
+  const enriched = { ...body };
+  const id = tabId ?? (await activeTabId());
+  if (id != null) {
+    try {
+      const tab = await chrome.tabs.get(id);
+      if (tab?.title) {
+        enriched.page_title = tab.title;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return enriched;
+}
+
+async function postJob(settings, body, tabId) {
   const url = jobsEndpoint(settings.clipDirectBaseUrl);
+  const payload = await jobBodyWithTabMeta(body, tabId);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
   const text = await res.text();
   if (!res.ok) {
@@ -192,22 +238,39 @@ async function queueStream(stream, pageUrl, clips, mergeClips) {
   if (!stream?.url) {
     return { ok: false, error: 'no_stream' };
   }
-  const enriched = normalizeStreamForQueue({ ...stream });
-  if (!isUsableStreamUrl(enriched.url) && !isHlsPlaylistUrl(enriched.url)) {
-    return { ok: false, errorKey: 'error.hlsSegmentOnly' };
-  }
-  if (!enriched.referer) {
-    const tabId = await activeTabId();
-    if (tabId != null) {
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        enriched.referer = tab.url || pageUrl || '';
-      } catch {
-        enriched.referer = pageUrl || '';
-      }
-    } else {
-      enriched.referer = pageUrl || '';
+  const tabId = await activeTabId();
+  let tabUrl = pageUrl || '';
+  if (tabId != null) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      tabUrl = tab.url || tabUrl;
+    } catch {
+      /* ignore */
     }
+  }
+  const tabCookies = tabId != null ? session.cookieHeader(tabId) : '';
+  let mergedCookies = mergeCookieHeader(stream.cookie, tabCookies);
+  try {
+    const apiCookies = await collectStreamCookies(stream.url, pageUrl, tabUrl);
+    mergedCookies = mergeCookieHeader(stream.cookie, tabCookies, apiCookies);
+  } catch (err) {
+    console.warn('Clip-Direct: cookie collection failed, sending without API cookies', err);
+  }
+  if (mergedCookies && tabId != null) {
+    session.rememberRequestCookies(tabId, mergedCookies);
+  }
+  const enriched = normalizeStreamForQueue(
+    enrichStreamForQueue(
+      { ...stream, cookie: mergedCookies },
+      pageUrl,
+      tabUrl,
+    ),
+  );
+  if (!isDirectMediaStreamUrl(enriched.url)) {
+    return {
+      ok: false,
+      errorKey: isEmbedShellUrl(enriched.url) ? 'error.embedShellNotStream' : 'error.hlsSegmentOnly',
+    };
   }
   const settings = await loadSettings();
   const body = buildStreamJobPayload(
@@ -216,8 +279,10 @@ async function queueStream(stream, pageUrl, clips, mergeClips) {
     pageUrl,
     Array.isArray(clips) ? clips : [],
     !!mergeClips,
+    tabUrl,
+    mergedCookies,
   );
-  const result = await postJob(settings, body);
+  const result = await postJob(settings, body, tabId);
   if (result.ok) await maybeOpenUi(settings);
   return result;
 }
@@ -245,7 +310,7 @@ async function streamFromActiveVideo(tabId, pageUrl) {
     return null;
   }
 
-  const pickUrl = (url) => (url && isUsableStreamUrl(url) ? url : null);
+  const pickUrl = (url) => (url && isDirectMediaStreamUrl(url) ? url : null);
 
   const res = await forwardToTab(tabId, { action: 'getVideoMediaUrl' });
   const fromMessage = pickUrl(res?.ok ? res.url : null);
@@ -270,9 +335,34 @@ async function streamFromActiveVideo(tabId, pageUrl) {
           return urls.filter((u) => !u.startsWith('blob:') && !u.startsWith('data:'));
         }
         function looksLikeMedia(u) {
+          if (!u || typeof u !== 'string') return false;
+          try {
+            const host = new URL(u).hostname.toLowerCase();
+            if (/dood\.video|doodstream|emturbovid|turboviplay/.test(host)) return false;
+          } catch { return false; }
           const l = u.toLowerCase();
-          if (/\.ts(\?|$)/.test(l) && !l.includes('.m3u8')) return false;
-          return /\.m3u8|m3u8%2f|\.mp4|\.webm/.test(l);
+          if (l.startsWith('blob:') || l.startsWith('data:')) return false;
+          if (/\.(ts|m4s)(\?|$)/.test(l) && !l.includes('.m3u8')) return false;
+          if (/\.m3u8|m3u8%2f|\.mp4|\.webm|cloudatacdn\.com/.test(l)) return true;
+          try {
+            const parsed = new URL(u);
+            // Skip script/control endpoints (e.g. remote_control.php): the real
+            // media is a separate request whose path ends in a media extension.
+            if (parsed.pathname.toLowerCase().endsWith('.php')) return false;
+            const q = parsed.searchParams;
+            if (q.has('token') && (q.has('expiry') || q.has('expires'))) return true;
+          } catch { /* ignore */ }
+          return false;
+        }
+        function findM3u8InPage() {
+          const found = [];
+          const re = /https?:\/\/[^\s"'<>\\]+\.m3u8(?:\?[^\s"'<>\\]*)?/gi;
+          const html = document.documentElement?.innerHTML || '';
+          let m;
+          while ((m = re.exec(html)) !== null) {
+            found.push(m[0].replace(/\\/g, ''));
+          }
+          return found.find(looksLikeMedia) || null;
         }
         const videos = Array.from(document.querySelectorAll('video'));
         let best = null;
@@ -286,13 +376,13 @@ async function streamFromActiveVideo(tabId, pageUrl) {
           }
           if (area < bestArea) continue;
           const urls = candidateUrls(video);
-          const media = urls.find(looksLikeMedia) || urls.find((u) => /^https?:/i.test(u));
+          const media = urls.find(looksLikeMedia);
           if (media) {
             best = media;
             bestArea = area;
           }
         }
-        return best;
+        return best || findM3u8InPage();
       },
     });
     for (const row of results || []) {
@@ -309,7 +399,15 @@ async function streamFromActiveVideo(tabId, pageUrl) {
 }
 
 async function pickStreamForShellPage(tabId, pageUrl) {
+  const fromVideo = await streamFromActiveVideo(tabId, pageUrl);
+  if (fromVideo?.url && isDirectMediaStreamUrl(fromVideo.url)) {
+    return normalizeStreamForQueue(fromVideo);
+  }
+
   let sniffed = preferBestStream(session.streams(tabId));
+  if (sniffed?.url && !isDirectMediaStreamUrl(sniffed.url)) {
+    sniffed = null;
+  }
   if (!sniffed?.url) {
     const seg = session.lastHlsSegmentUrl(tabId);
     const guessed = seg ? guessPlaylistUrlFromSegment(seg) : null;
@@ -326,8 +424,10 @@ async function pickStreamForShellPage(tabId, pageUrl) {
   if (sniffed?.url) {
     return normalizeStreamForQueue(sniffed);
   }
-  const fromVideo = await streamFromActiveVideo(tabId, pageUrl);
-  return fromVideo ? normalizeStreamForQueue(fromVideo) : null;
+  if (fromVideo?.url && isDirectMediaStreamUrl(fromVideo.url)) {
+    return normalizeStreamForQueue(fromVideo);
+  }
+  return null;
 }
 
 async function queueClips(pageUrl, clips, mergeClips) {
@@ -337,21 +437,24 @@ async function queueClips(pageUrl, clips, mergeClips) {
   const settings = await loadSettings();
   const tabId = await activeTabId();
 
-  // MeTube behaviour: "In Queue" sends the page URL so yt-dlp can use site extractors
-  // (YouTube, Vimeo, …). Do not replace that with a sniffed .php CDN URL.
-  if (!isLikelyPageShellUrl(pageUrl)) {
+  // MeTube behaviour: page URL for sites with yt-dlp extractors (YouTube, Vimeo, …).
+  // Shell .php pages and HLS-only embeds (turboviplay, emturbovid) need a sniffed stream.
+  if (!needsSniffedStreamForPage(pageUrl)) {
     const body = buildPageJobPayload(settings, pageUrl, clips, !!mergeClips);
-    const result = await postJob(settings, body);
+    const result = await postJob(settings, body, tabId);
     if (result.ok) await maybeOpenUi(settings);
     return result;
   }
 
   const stream = await pickStreamForShellPage(tabId, pageUrl);
-  if (stream?.url && isUsableStreamUrl(stream.url)) {
+  if (stream?.url && isDirectMediaStreamUrl(stream.url)) {
     return queueStream(stream, pageUrl, clips, mergeClips);
   }
 
-  return { ok: false, errorKey: 'error.shellPagePhp' };
+  return {
+    ok: false,
+    errorKey: isHlsEmbedPageUrl(pageUrl) ? 'error.hlsEmbedNoStream' : 'error.shellPagePhp',
+  };
 }
 
 async function forwardToTab(tabId, payload) {
@@ -385,6 +488,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = sender?.tab?.id;
     if (tabId != null && tabId >= 0) {
       const clips = Array.isArray(msg.clips) ? msg.clips : [];
+      const existing = session.clipEntry(tabId);
+      if (!clips.length) {
+        if (
+          existing?.clips?.length
+          && existing.pageKey
+          && msg.pageKey
+          && msg.pageKey !== existing.pageKey
+        ) {
+          sendResponse({ ok: true });
+          return true;
+        }
+        if (!existing?.clips?.length) {
+          sendResponse({ ok: true });
+          return true;
+        }
+        if (existing.pageKey && msg.pageKey && existing.pageKey !== msg.pageKey) {
+          sendResponse({ ok: true });
+          return true;
+        }
+      }
       session.setClips(tabId, clips, msg.pageUrl, msg.pageKey);
     }
     sendResponse({ ok: true });
@@ -402,17 +525,167 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.action === 'removeTabClip') {
     (async () => {
       const tabId = msg.tabId ?? (await activeTabId());
-      const result = session.removeClipAt(tabId, Number(msg.index));
-      if (result.ok && tabId != null) {
+      const entry = session.clipEntry(tabId);
+      const pageKey = msg.pageKey || entry?.pageKey || '';
+      let result = { ok: false, error: 'no_clips', clips: [] };
+
+      if (tabId != null) {
         try {
-          chrome.tabs.sendMessage(tabId, {
+          result = await chrome.tabs.sendMessage(tabId, {
             action: 'removeClip',
-            pageKey: result.pageKey,
-            index: msg.index,
+            pageKey: pageKey || undefined,
+            index: Number(msg.index),
           });
         } catch {
-          /* ignore */
+          result = { ok: false, error: 'no_content_script' };
         }
+      }
+
+      if (!result?.ok && tabId != null) {
+        const fallback = session.removeClipAt(tabId, Number(msg.index));
+        if (fallback.ok) {
+          try {
+            await chrome.tabs.sendMessage(tabId, {
+              action: 'replaceClips',
+              pageKey: fallback.pageKey || pageKey || undefined,
+              clips: fallback.clips,
+            });
+          } catch {
+            /* storage sync best-effort */
+          }
+          result = fallback;
+        }
+      }
+
+      if (result?.ok && tabId != null) {
+        session.setClips(
+          tabId,
+          result.clips,
+          entry?.pageUrl || '',
+          result.pageKey || pageKey,
+        );
+      }
+      sendResponse(result);
+    })();
+    return true;
+  }
+
+  if (msg?.action === 'setClipMergeIncluded') {
+    (async () => {
+      const tabId = msg.tabId ?? (await activeTabId());
+      if (!tabId) {
+        sendResponse({ ok: false, error: 'no_tab' });
+        return;
+      }
+      let result = { ok: false, error: 'no_owner' };
+      try {
+        result = await chrome.tabs.sendMessage(tabId, {
+          action: 'setClipMergeIncluded',
+          pageKey: msg.pageKey,
+          index: msg.index,
+          includeInMerge: msg.includeInMerge,
+        });
+      } catch (err) {
+        result = { ok: false, error: String(err?.message || err) };
+      }
+      if (result?.ok && Array.isArray(result.clips)) {
+        const entry = session.clipEntry(tabId);
+        session.setClips(
+          tabId,
+          result.clips,
+          entry?.pageUrl || '',
+          result.pageKey || entry?.pageKey || '',
+        );
+      }
+      sendResponse(result);
+    })();
+    return true;
+  }
+
+  if (msg?.action === 'updateTabClipTimes') {
+    (async () => {
+      const tabId = msg.tabId ?? (await activeTabId());
+      if (!tabId) {
+        sendResponse({ ok: false, error: 'no_tab' });
+        return;
+      }
+      let result = { ok: false, error: 'no_owner' };
+      try {
+        result = await chrome.tabs.sendMessage(tabId, {
+          action: 'updateClipTimes',
+          pageKey: msg.pageKey,
+          index: msg.index,
+          start: msg.start,
+          end: msg.end,
+        });
+      } catch (err) {
+        result = { ok: false, error: String(err?.message || err) };
+      }
+      if (result?.ok && Array.isArray(result.clips)) {
+        const entry = session.clipEntry(tabId);
+        session.setClips(
+          tabId,
+          result.clips,
+          entry?.pageUrl || '',
+          result.pageKey || entry?.pageKey || '',
+        );
+      }
+      sendResponse(result);
+    })();
+    return true;
+  }
+
+  if (msg?.action === 'getClipClipboard') {
+    (async () => {
+      const clipboard = await loadClipClipboard();
+      sendResponse({ ok: true, clipboard });
+    })();
+    return true;
+  }
+
+  if (msg?.action === 'copyClipsToClipboard') {
+    (async () => {
+      const clips = Array.isArray(msg.clips) ? msg.clips : [];
+      if (!clips.length) {
+        sendResponse({ ok: false, error: 'no_clips' });
+        return;
+      }
+      const clipboard = await saveClipClipboard(clips, msg.meta || {});
+      sendResponse({ ok: true, clipboard });
+    })();
+    return true;
+  }
+
+  if (msg?.action === 'importTabClips') {
+    (async () => {
+      const tabId = msg.tabId ?? (await activeTabId());
+      const clips = Array.isArray(msg.clips) ? msg.clips : [];
+      if (!tabId) {
+        sendResponse({ ok: false, error: 'no_tab' });
+        return;
+      }
+      if (!clips.length) {
+        sendResponse({ ok: false, error: 'no_clips' });
+        return;
+      }
+      let result = { ok: false, error: 'no_video_frame' };
+      try {
+        result = await chrome.tabs.sendMessage(tabId, {
+          action: 'replaceClips',
+          clips,
+          force: true,
+        });
+      } catch (err) {
+        result = { ok: false, error: String(err?.message || err) };
+      }
+      if (result?.ok && Array.isArray(result.clips)) {
+        const entry = session.clipEntry(tabId);
+        session.setClips(
+          tabId,
+          result.clips,
+          entry?.pageUrl || '',
+          result.pageKey || entry?.pageKey || '',
+        );
       }
       sendResponse(result);
     })();

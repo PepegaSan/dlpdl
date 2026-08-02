@@ -1,7 +1,8 @@
 import { applyI18n, initI18n, t } from './lib/i18n.js';
+import { clipsForMerge, selectedClips } from './lib/jobs-client.js';
 import { openClipDirectUi } from './lib/open-ui.js';
+import { normalizeClockTime } from './lib/format-time.js';
 import { loadSettings, saveClipDraft } from './lib/storage.js';
-
 const statusEl = document.getElementById('status');
 const pageUrlEl = document.getElementById('pageUrl');
 const pendingEl = document.getElementById('pending');
@@ -18,6 +19,10 @@ const streamListEl = document.getElementById('streamList');
 const streamClipListEl = document.getElementById('streamClipList');
 const btnClearStreams = document.getElementById('btnClearStreams');
 const btnOpenUi = document.getElementById('btnOpenUi');
+const btnCopyClips = document.getElementById('btnCopyClips');
+const btnPasteClips = document.getElementById('btnPasteClips');
+const clipClipboardHint = document.getElementById('clipClipboardHint');
+const streamPasteHint = document.getElementById('streamPasteHint');
 
 let pageUrl = null;
 let pageKey = null;
@@ -27,6 +32,7 @@ let activeTabId = null;
 let streams = [];
 let streamTimer = null;
 let tabClips = [];
+let tabPageKey = null;
 
 optionsLink.href = chrome.runtime.getURL('options.html');
 optionsLink.addEventListener('click', (e) => {
@@ -44,10 +50,271 @@ btnOpenUi?.addEventListener('click', async () => {
   }
 });
 
-function sendBg(action) {
-  return chrome.runtime.sendMessage({ action });
+function sendBg(action, extra = {}) {
+  return chrome.runtime.sendMessage({ action, ...extra });
 }
 
+function activeClipSource() {
+  if (clips.length) return clips;
+  if (tabClips.length) return tabClips;
+  return [];
+}
+
+function hostLabelFromUrl(url) {
+  if (!url) return '';
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function updateClipboardUi(clipboard) {
+  const count = clipboard?.clips?.length || 0;
+  if (btnPasteClips) {
+    btnPasteClips.disabled = count === 0;
+  }
+  if (clipClipboardHint) {
+    if (count > 0) {
+      clipClipboardHint.hidden = false;
+      clipClipboardHint.textContent = t('popup.clip.clipboardReady', {
+        count,
+        host: clipboard.fromHost || t('popup.clip.clipboardUnknownHost'),
+      });
+    } else {
+      clipClipboardHint.hidden = true;
+      clipClipboardHint.textContent = '';
+    }
+  }
+  updateStreamPasteHint(clipboard);
+}
+
+function updateStreamPasteHint(clipboard) {
+  if (!streamPasteHint) return;
+  const cbCount = clipboard?.clips?.length || 0;
+  const hasStreams = streams.length > 0;
+  const hasLocalClips = activeClipSource().length > 0;
+  if (hasStreams && !hasLocalClips && cbCount > 0) {
+    streamPasteHint.hidden = false;
+    streamPasteHint.textContent = t('popup.clip.pasteForStream', { count: cbCount });
+  } else {
+    streamPasteHint.hidden = true;
+    streamPasteHint.textContent = '';
+  }
+}
+
+async function refreshClipboardUi() {
+  const res = await sendBg('getClipClipboard');
+  updateClipboardUi(res?.clipboard || null);
+}
+
+async function copyClipsToClipboard() {
+  const source = activeClipSource();
+  if (!source.length) {
+    setStatus('popup.status.noClips');
+    return;
+  }
+  const host = hostLabelFromUrl(pageUrl) || hostLabelFromUrl(tabPageKey);
+  const res = await sendBg('copyClipsToClipboard', {
+    clips: source,
+    meta: { fromHost: host, fromPage: pageUrl || '' },
+  });
+  if (res?.ok) {
+    updateClipboardUi(res.clipboard);
+    setStatus('popup.status.clipsCopied', { count: source.length });
+  } else {
+    setStatus('popup.status.error', { error: res?.error || '?' });
+  }
+}
+
+async function pasteClipsFromClipboard() {
+  const cbRes = await sendBg('getClipClipboard');
+  const clipboard = cbRes?.clipboard;
+  if (!clipboard?.clips?.length) {
+    setStatus('popup.status.clipboardEmpty');
+    return;
+  }
+  const tabId = await getActiveTabId();
+  const res = await sendBg('importTabClips', {
+    tabId,
+    clips: clipboard.clips,
+  });
+  if (res?.ok) {
+    syncClipsFromResult(res);
+    renderClips();
+    renderStreams();
+    updateButtons();
+    setStatus('popup.status.clipsPasted', { count: res.clips.length });
+  } else {
+    setStatus('popup.status.error', { error: res?.error || 'paste_failed' });
+  }
+}
+
+btnCopyClips?.addEventListener('click', () => {
+  void copyClipsToClipboard();
+});
+
+btnPasteClips?.addEventListener('click', () => {
+  void pasteClipsFromClipboard();
+});
+
+function syncClipsFromResult(res) {
+  if (!res?.ok || !Array.isArray(res.clips)) return;
+  clips = [...res.clips];
+  tabClips = [...res.clips];
+  const pk = res.pageKey || tabPageKey || pageKey;
+  if (pk) {
+    if (res.pageKey) tabPageKey = res.pageKey;
+    saveClipDraft(pk, clips);
+  }
+}
+
+function clipTimeErrorMessage(error) {
+  if (error === 'invalid_time') return t('popup.clip.invalidTime');
+  if (error === 'end_before_start') return t('popup.clip.endBeforeStart');
+  return error || '?';
+}
+
+function buildClipRow(clip, index, { onToggleMerge, onRemove, onUpdateTimes }) {
+  const li = document.createElement('li');
+  if (clip.includeInMerge === false) {
+    li.classList.add('clip-merge-off');
+  }
+
+  const row = document.createElement('div');
+  row.className = 'clip-row';
+
+  const mergeCb = document.createElement('input');
+  mergeCb.type = 'checkbox';
+  mergeCb.className = 'clip-merge-cb';
+  mergeCb.checked = clip.includeInMerge !== false;
+  mergeCb.title = t('popup.clip.includeMergeTitle');
+  mergeCb.addEventListener('change', () => onToggleMerge(index, mergeCb.checked));
+
+  const times = document.createElement('div');
+  times.className = 'clip-times';
+
+  const startInput = document.createElement('input');
+  startInput.type = 'text';
+  startInput.className = 'clip-time-input';
+  startInput.value = clip.start || '';
+  startInput.title = t('popup.clip.startTitle');
+  startInput.setAttribute('aria-label', t('popup.clip.startTitle'));
+  startInput.spellcheck = false;
+
+  const sep = document.createElement('span');
+  sep.className = 'clip-time-sep';
+  sep.textContent = '→';
+
+  const endInput = document.createElement('input');
+  endInput.type = 'text';
+  endInput.className = 'clip-time-input';
+  endInput.value = clip.end || '';
+  endInput.title = t('popup.clip.endTitle');
+  endInput.setAttribute('aria-label', t('popup.clip.endTitle'));
+  endInput.spellcheck = false;
+
+  function resetInputs() {
+    startInput.value = clip.start || '';
+    endInput.value = clip.end || '';
+    startInput.classList.remove('clip-time-invalid');
+    endInput.classList.remove('clip-time-invalid');
+  }
+
+  async function commitTimes() {
+    const res = await onUpdateTimes(index, startInput.value, endInput.value);
+    if (res?.ok) {
+      clip.start = res.clips[index]?.start ?? startInput.value;
+      clip.end = res.clips[index]?.end ?? endInput.value;
+      resetInputs();
+      return;
+    }
+    startInput.classList.add('clip-time-invalid');
+    endInput.classList.add('clip-time-invalid');
+    setStatus('popup.status.error', { error: clipTimeErrorMessage(res?.error) });
+  }
+
+  function bindTimeInput(input) {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        input.blur();
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        resetInputs();
+        input.blur();
+      }
+    });
+    input.addEventListener('blur', () => {
+      const normStart = normalizeClockTime(startInput.value);
+      const normEnd = normalizeClockTime(endInput.value);
+      if (normStart === clip.start && normEnd === clip.end) {
+        resetInputs();
+        return;
+      }
+      void commitTimes();
+    });
+  }
+
+  bindTimeInput(startInput);
+  bindTimeInput(endInput);
+
+  times.appendChild(startInput);
+  times.appendChild(sep);
+  times.appendChild(endInput);
+
+  row.appendChild(mergeCb);
+  row.appendChild(times);
+  li.appendChild(row);
+
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.textContent = '×';
+  del.addEventListener('click', () => onRemove(index));
+  li.appendChild(del);
+  return li;
+}
+
+async function updateTabClipTimes(index, start, end) {
+  const tabId = await getActiveTabId();
+  const res = await chrome.runtime.sendMessage({
+    action: 'updateTabClipTimes',
+    tabId,
+    pageKey: tabPageKey || pageKey,
+    index,
+    start,
+    end,
+  });
+  if (res?.ok) {
+    syncClipsFromResult(res);
+    renderClips();
+    renderStreams();
+    updateButtons();
+  } else {
+    setStatus('popup.status.error', { error: clipTimeErrorMessage(res?.error) });
+  }
+  return res;
+}
+
+async function setClipMergeIncluded(index, includeInMerge) {
+  const tabId = await getActiveTabId();
+  const res = await chrome.runtime.sendMessage({
+    action: 'setClipMergeIncluded',
+    tabId,
+    pageKey: tabPageKey || pageKey,
+    index,
+    includeInMerge,
+  });
+  if (res?.ok) {
+    syncClipsFromResult(res);
+    renderClips();
+    renderStreams();
+    updateButtons();
+  } else {
+    setStatus('popup.status.error', { error: res?.error || '?' });
+  }
+}
 async function getActiveTabId() {
   if (activeTabId != null) return activeTabId;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -80,22 +347,41 @@ async function sendStream(stream, withClips, button, mergeClips = false) {
   if (mergeClips) setStatus('popup.status.sendingMerge');
   else if (withClips) setStatus('popup.status.sendingCut');
   else setStatus('popup.status.sendingStream');
-  const result = await chrome.runtime.sendMessage({
-    action: 'queueStream',
-    stream,
-    pageUrl,
-    clips: withClips ? tabClips : [],
-    mergeClips,
-  });
-  if (result?.ok) {
-    if (mergeClips) setStatus('popup.status.mergeQueued');
-    else if (withClips) setStatus('popup.status.cutQueued');
-    else setStatus('popup.status.streamQueued');
-  } else if (result?.errorKey) {
-    setStatus('popup.status.error', { error: t(result.errorKey) });
-    button.disabled = false;
-  } else {
-    setStatus('popup.status.error', { error: result?.error || '?' });
+
+  let clipPayload = [];
+  if (withClips) {
+    const source = activeClipSource();
+    clipPayload = mergeClips ? clipsForMerge(source) : selectedClips(source);
+    if (mergeClips && clipPayload.length < 2) {
+      setStatus('popup.status.mergeNeedTwo');
+      button.disabled = false;
+      return;
+    }
+    if (!clipPayload.length) {
+      setStatus('popup.status.noClips');
+      button.disabled = false;
+      return;
+    }
+  }
+
+  try {
+    const result = await chrome.runtime.sendMessage({
+      action: 'queueStream',
+      stream,
+      pageUrl,
+      clips: clipPayload,
+      mergeClips,
+    });
+    if (result?.ok) {
+      if (mergeClips) setStatus('popup.status.mergeQueued');
+      else if (withClips) setStatus('popup.status.cutQueued');
+      else setStatus('popup.status.streamQueued');
+    } else if (result?.errorKey) {
+      setStatus('popup.status.error', { error: t(result.errorKey) });
+    } else {
+      setStatus('popup.status.error', { error: result?.error || '?' });
+    }
+  } finally {
     button.disabled = false;
   }
 }
@@ -104,30 +390,31 @@ function renderTabClips() {
   if (!streamClipListEl) return;
   streamClipListEl.innerHTML = '';
   tabClips.forEach((clip, index) => {
-    const li = document.createElement('li');
-    const label = document.createElement('span');
-    label.textContent = `${clip.start} → ${clip.end}`;
-    li.appendChild(label);
-    const del = document.createElement('button');
-    del.type = 'button';
-    del.textContent = '×';
-    del.addEventListener('click', () => removeTabClip(index));
-    li.appendChild(del);
-    streamClipListEl.appendChild(li);
+    streamClipListEl.appendChild(buildClipRow(clip, index, {
+      onToggleMerge: (i, checked) => setClipMergeIncluded(i, checked),
+      onRemove: (i) => removeTabClip(i),
+      onUpdateTimes: (i, start, end) => updateTabClipTimes(i, start, end),
+    }));
   });
 }
 
 async function removeTabClip(index) {
   const tabId = await getActiveTabId();
-  const res = await chrome.runtime.sendMessage({ action: 'removeTabClip', tabId, index });
+  const res = await chrome.runtime.sendMessage({
+    action: 'removeTabClip',
+    tabId,
+    pageKey: tabPageKey || pageKey,
+    index,
+  });
   if (res?.ok) {
-    tabClips = Array.isArray(res.clips) ? res.clips : [];
+    syncClipsFromResult(res);
+    renderClips();
     renderStreams();
+    updateButtons();
   } else {
     setStatus('popup.status.error', { error: res?.error || '?' });
   }
 }
-
 function renderStreams() {
   renderTabClips();
   streamListEl.innerHTML = '';
@@ -137,6 +424,7 @@ function renderStreams() {
   }
   streamSection.hidden = false;
   const hasCuts = tabClips.length > 0;
+  const mergeCount = clipsForMerge(tabClips).length;
   streams.forEach((stream) => {
     const li = document.createElement('li');
 
@@ -168,11 +456,11 @@ function renderStreams() {
       cut.addEventListener('click', () => sendStream(stream, true, cut, false));
       btnGroup.appendChild(cut);
 
-      if (tabClips.length >= 2) {
+      if (mergeCount >= 2) {
         const merge = document.createElement('button');
         merge.type = 'button';
         merge.className = 'stream-merge';
-        merge.textContent = t('popup.stream.merge', { count: tabClips.length });
+        merge.textContent = t('popup.stream.merge', { count: mergeCount });
         merge.title = t('popup.stream.mergeTitle');
         merge.addEventListener('click', () => sendStream(stream, true, merge, true));
         btnGroup.appendChild(merge);
@@ -206,7 +494,14 @@ async function refreshStreams() {
   ]);
   streams = Array.isArray(streamRes?.streams) ? streamRes.streams : [];
   tabClips = Array.isArray(clipsRes?.tabClips?.clips) ? clipsRes.tabClips.clips : [];
+  tabPageKey = clipsRes?.tabClips?.pageKey || null;
+  if (tabClips.length) {
+    clips = [...tabClips];
+  }
+  const cbRes = await sendBg('getClipClipboard');
+  updateClipboardUi(cbRes?.clipboard || null);
   renderStreams();
+  updateButtons();
 }
 
 btnClearStreams?.addEventListener('click', async () => {
@@ -227,28 +522,25 @@ function setStatus(keyOrText, params) {
 function renderClips() {
   clipListEl.innerHTML = '';
   clips.forEach((clip, index) => {
-    const li = document.createElement('li');
-    li.innerHTML = `<span>${clip.start} → ${clip.end}</span>`;
-    const del = document.createElement('button');
-    del.type = 'button';
-    del.textContent = '×';
-    del.addEventListener('click', async () => {
-      clips.splice(index, 1);
-      if (pageKey) await saveClipDraft(pageKey, clips);
-      renderClips();
-      updateButtons();
-    });
-    li.appendChild(del);
-    clipListEl.appendChild(li);
+    clipListEl.appendChild(buildClipRow(clip, index, {
+      onToggleMerge: (i, checked) => setClipMergeIncluded(i, checked),
+      onRemove: (i) => removeTabClip(i),
+      onUpdateTimes: (i, start, end) => updateTabClipTimes(i, start, end),
+    }));
   });
 }
 
 function updateButtons() {
   const hasClips = clips.length > 0;
+  const hasAnyClips = activeClipSource().length > 0;
+  const mergeCount = clipsForMerge(clips).length;
   btnQueueEach.disabled = !pageUrl || !hasClips;
-  btnQueueMerge.disabled = !pageUrl || clips.length < 2;
+  btnQueueMerge.disabled = !pageUrl || mergeCount < 2;
+  if (btnCopyClips) {
+    btnCopyClips.disabled = !hasAnyClips;
+  }
   if (btnCancelPending) {
-    btnCancelPending.hidden = !pendingStart;
+    btnCancelPending.classList.toggle('is-visible', !!pendingStart);
     btnCancelPending.disabled = !pendingStart;
   }
   if (btnEnd) btnEnd.disabled = !pendingStart;
@@ -336,23 +628,34 @@ btnQueueEach.addEventListener('click', () => sendQueue(false));
 btnQueueMerge.addEventListener('click', () => sendQueue(true));
 
 async function sendQueue(mergeClips) {
-  const state = await sendBg('getVideoState');
-  if (state?.pageUrl) pageUrl = state.pageUrl;
-  if (Array.isArray(state?.clips) && state.clips.length) {
+  const tabId = await getActiveTabId();
+  const [clipsRes, state] = await Promise.all([
+    chrome.runtime.sendMessage({ action: 'getTabClips', tabId }),
+    sendBg('getVideoState'),
+  ]);
+  if (clipsRes?.tabClips?.clips?.length) {
+    tabClips = [...clipsRes.tabClips.clips];
+    clips = [...tabClips];
+  } else if (Array.isArray(state?.clips) && state.clips.length) {
     clips = [...state.clips];
   }
-  if (!pageUrl || !clips.length) {
+  if (state?.pageUrl) pageUrl = state.pageUrl;
+  const payload = mergeClips ? clipsForMerge(activeClipSource()) : selectedClips(activeClipSource());
+  if (!pageUrl || !payload.length) {
     setStatus('popup.status.noClips');
+    return;
+  }
+  if (mergeClips && payload.length < 2) {
+    setStatus('popup.status.mergeNeedTwo');
     return;
   }
   setStatus('popup.status.sending');
   const result = await chrome.runtime.sendMessage({
     action: 'queueClips',
     pageUrl,
-    clips,
+    clips: payload,
     mergeClips,
-  });
-  if (result?.ok) {
+  });  if (result?.ok) {
     setStatus('popup.status.sent');
   } else if (result?.errorKey) {
     setStatus('popup.status.error', { error: t(result.errorKey) });
@@ -364,8 +667,9 @@ async function sendQueue(mergeClips) {
 async function boot() {
   await initI18n();
   applyI18n();
+  await refreshClipboardUi();
   await refresh();
-  refreshStreams();
+  await refreshStreams();
   streamTimer = setInterval(refreshStreams, 1500);
 }
 

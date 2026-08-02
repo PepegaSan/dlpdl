@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.2 — Forensic preserve mode + merge clip toggle
+
+- **Clip encoding** (extension settings): `preserve` (default) uses HLS **stream copy** (`-c copy`, job message `ok (copy-ffmpeg)`) with segment-copy fallback (`ok (copy-segments)`). `exact` re-encodes with libx264 (`ok (ffmpeg-hls)`).
+- Backend: `clip_encode_mode` on jobs; finished job `msg` includes mode for verification.
+- Extension: checkbox per clip **Include in merge**.
+- Merge: trim container tail when duration exceeds clip window (fixes frozen first frame at end).
+
+## 1.3.1 — HLS playlist vs .ts segment queue
+
+- Sniffer prefers `.m3u8` over single `seg-*.ts` URLs (phncdn-style CDNs).
+
 ## 1.3.0 — English UI + optional German
 
 - Extension popup, options, and on-page clip bar: **English by default**, Deutsch in settings (`uiLocale`)

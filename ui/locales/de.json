@@ -73,6 +73,7 @@
   "error.shellPagePhp": "Diese Seite (.php) ist nur über einen erkannten Stream ladbar. Video kurz abspielen, F5, dann Mit Schnitt am Stream — oder unter Erkannte Streams prüfen.",
   "ui.subtitle": "Clips vom Addon — bei Bereit Auto-Speichern (Häkchen) oder Auf PC speichern.",
   "ui.tabWarn": "Mehrere Tabs mit dieser Seite offen — das verursacht mehrfache Speichern-Dialoge. Andere Tabs schließen.",
+  "ui.apiError": "Verbindung zum Server fehlgeschlagen: {error} — Docker läuft? Seite mit Strg+Shift+R neu laden.",
   "ui.empty": "Noch keine Jobs. Sende einen Clip vom Addon.",
   "ui.language": "Sprache",
   "ui.lang.en": "English",
@@ -83,6 +84,9 @@
   "ui.status.running": "Läuft…",
   "ui.status.ready": "Bereit",
   "ui.status.error": "Fehler",
+  "ui.status.errorUnknown": "Unbekannter Fehler — Docker neu starten; bei turboviplay: Video im Tab abspielen, dann erneut senden",
   "ui.saveToPc": "Auf PC speichern",
+  "ui.downloadFailed": "Download fehlgeschlagen ({code}). Seite neu laden; bei großen HLS-Dateien kurz warten bis „Bereit“.",
+  "ui.fileMissing": "Datei auf dem Server nicht gefunden — Job erneut senden oder Docker prüfen.",
   "ui.remove": "Entfernen"
 }

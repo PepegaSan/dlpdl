@@ -7,6 +7,8 @@ import { draftKeyForHref } from './page-url.js';
  * @property {string} codec
  * @property {string} quality
  * @property {string} format
+ * @property {string} clipEncodeMode preserve | exact
+ * @property {boolean} postRender re-encode after download (keyframe fix)
  * @property {string} folder
  * @property {string} customNamePrefix
  * @property {boolean} openUiAfterQueue
@@ -21,6 +23,8 @@ export const DEFAULT_SETTINGS = {
   codec: 'auto',
   quality: 'best',
   format: 'any',
+  clipEncodeMode: 'preserve',
+  postRender: false,
   folder: '',
   customNamePrefix: '',
   openUiAfterQueue: false,
@@ -51,7 +55,11 @@ export async function loadAllClipDrafts() {
 
 export async function saveClipDraft(pageKey, clips) {
   const all = await loadAllClipDrafts();
-  all[pageKey] = clips;
+  if (clips?.length) {
+    all[pageKey] = clips;
+  } else {
+    delete all[pageKey];
+  }
   await chrome.storage.local.set({ [CLIPS_KEY]: all });
 }
 

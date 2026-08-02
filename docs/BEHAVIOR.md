@@ -13,6 +13,8 @@ This document records flows that were fixed during development so they are not a
 
 Sniffer: `onBeforeSendHeaders` (primary) + `onCompleted` (fallback). Do not clear stream list on every `tabs.onUpdated` navigation — that broke detection.
 
+**Merge clip list:** each clip has an **Include in merge** checkbox (default on). Unchecked clips remain in the list but are omitted from **Queue (merged)** and stream **Merge** only; **Queue (each)** still sends all clips.
+
 Branding: UI strings and DOM ids use `clip-direct-*`, not `metube-*`. Reload hint says **Clip-Direct Extension**.
 
 ## Backend
@@ -25,17 +27,37 @@ Branding: UI strings and DOM ids use `clip-direct-*`, not `metube-*`. Reload hin
 | **Non-HLS clip** | yt-dlp `download_ranges`, then smart_clip fallback if HLS | Direct video sites keep using yt-dlp |
 | **Job status** | Status pump ignores `running` after `ready` | Prevents UI flicker and duplicate auto-downloads |
 
-Output filenames use `clip_MM-SS-MM-SS_` (no `:`) for cross-platform safety.
+Output filenames are built from the **browser tab title** (sanitized, max ~60 chars), plus optional scene/merge tags:
+
+| Case | Pattern |
+| --- | --- |
+| Single clip (only one on page) | `{Title}.mp4` |
+| One of several clips | `{Title}_scene{N}of{M}.mp4` |
+| Merge | `{Title}_merge{N}parts_{start}-{end}.mp4` |
+| Full stream (no cut) | `{Title}.mp4` |
+
+Times in merge names use `M-SS` or `H-MM-SS` (no colons). If a file already exists, `-2`, `-3`, … is appended. Extension sends `page_title`, `clip_index`, and `clip_count` with each job.
 
 ### HLS clipping (`hls_clipper.py`)
 
-**Primary:** ffmpeg reads the **`.m3u8` URL** directly (`-ss` / `-to` on the playlist timeline). Job status may show `HLS: ffmpeg schneidet…`; finished message includes **`ok (ffmpeg-hls)`** when this path succeeded.
+**Encode modes** (`clip_encode_mode` from extension / API):
 
-**Fallback:** download TS segments → **ffmpeg concat demuxer** (not raw byte concat) → `-ss` / `-t` on the merged timeline. Message: **`ok (segments)`**.
+| Mode | HLS path | Use when |
+| --- | --- | --- |
+| **`preserve`** (default) | Download whole TS segments → concat demuxer → **`-c copy`** only; window snaps to segment boundaries | Pixel comparison / forensic (Oxco) |
+| **`exact`** | ffmpeg reads `.m3u8` with libx264 CRF 20 (+ segment fallback with trim) | Frame-accurate in/out at marked times |
 
-**Start quality:** native path uses ~10s decode preroll (`-ss` before + after `-i`). Fallback prepends **two** HLS segments and uses `trim`/`atrim` on the concat demuxer.
+**Exact mode — primary:** ffmpeg reads the **`.m3u8` URL** directly (`-ss` / `-to` on the playlist timeline). Finished message includes **`ok (ffmpeg-hls)`** when this path succeeded.
 
-**Duration check:** if native ffmpeg output is much longer than `end − start`, fallback runs automatically.
+**Exact mode — fallback:** download TS segments → **ffmpeg concat demuxer** → trim/`atrim` or re-encode. Message: **`ok (segments)`**.
+
+**Preserve mode:** finished message **`ok (copy)`**. Clip may start/end slightly earlier/later than markers (whole HLS segments only).
+
+**Post-render (`post_render`, optional, orthogonal to encode mode):** when enabled, after the clip/merge is written the MP4 is re-encoded once via `rerender_for_editing()` (`hls_clipper.py`): constant frame rate (`-vsync cfr` at the source `r_frame_rate`), PTS reset to 0 (`setpts=PTS-STARTPTS`), audio re-synced (`aresample=async=1:first_pts=0`), libx264 CRF 18 + `+faststart`. This replaces the stream-copy faststart remux for that file. Fixes editors/ML pipelines that freeze the last frame for ~2s or choke on open-GOP / non-keyframe starts. Finished message gets **`+ rerender cfr`** appended. On failure it falls back to the normal faststart remux. Runs on every completion path (single, clip, merge, progressive) because it lives in `_mark_finished`.
+
+**Start quality (exact):** native path uses ~10s decode preroll (`-ss` before + after `-i`). Fallback prepends **two** HLS segments and uses `trim`/`atrim` on the concat demuxer.
+
+**Duration check (exact):** if native ffmpeg output is much longer than `end − start`, fallback runs automatically.
 
 Docker dev: `deploy/docker-compose.yml` mounts `../backend` into the container so rebuild is not required for Python-only changes (restart container after edits).
 

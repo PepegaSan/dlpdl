@@ -12,6 +12,34 @@ function formatClockTime(seconds) {
   return `${min}:${String(sec).padStart(2, '0')}`;
 }
 
+function parseClockTime(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value >= 0 ? value : NaN;
+  }
+  const s = String(value ?? '').trim();
+  if (!s) return NaN;
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const compact = s.toLowerCase().match(/^(\d+)([hms])?$/);
+  if (compact) {
+    const n = parseInt(compact[1], 10);
+    const unit = compact[2] || 's';
+    if (unit === 'h') return n * 3600;
+    if (unit === 'm') return n * 60;
+    return n;
+  }
+  const parts = s.split(':').map((p) => parseFloat(p));
+  if (parts.some((p) => !Number.isFinite(p))) return NaN;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return NaN;
+}
+
+function normalizeClockTime(value) {
+  const sec = parseClockTime(value);
+  if (!Number.isFinite(sec) || sec < 0) return null;
+  return formatClockTime(sec);
+}
+
 function cdT(key, params) {
   if (typeof window.clipDirectT === 'function') {
     return window.clipDirectT(key, params);
@@ -239,6 +267,9 @@ function videoArea(v) {
 }
 
 function mediaUrlLooksLikeStream(url) {
+  if (window.ClipDirectStreamUrl?.mediaUrlLooksLikeStream) {
+    return window.ClipDirectStreamUrl.mediaUrlLooksLikeStream(url);
+  }
   if (!url || typeof url !== 'string') {
     return false;
   }
@@ -249,10 +280,56 @@ function mediaUrlLooksLikeStream(url) {
   if (!/^https?:\/\//i.test(u)) {
     return false;
   }
-  if (/\.ts(\?|$)/.test(u) && !u.includes('.m3u8')) {
+  if (/\.(ts|m4s)(\?|$)/.test(u) && !u.includes('.m3u8')) {
     return false;
   }
-  return /\.m3u8|m3u8%2f|format=m3u8|\.mp4|\.webm|\.mkv/i.test(u);
+  return /\.m3u8|m3u8%2f|format=m3u8|\.mp4|\.webm|\.mkv|cloudatacdn\.com/i.test(u);
+}
+
+function getVideoMediaUrlFromPage() {
+  const video = getActiveVideo();
+  if (video) {
+    const urls = collectVideoSourceUrls(video);
+    const fromVideo = urls.find(mediaUrlLooksLikeStream);
+    if (fromVideo) {
+      return Promise.resolve({ ok: true, url: fromVideo });
+    }
+  }
+  const pageM3u8 = findM3u8UrlsInPage();
+  if (pageM3u8.length) {
+    return Promise.resolve({ ok: true, url: pageM3u8[0] });
+  }
+  if (!video) {
+    return Promise.resolve({ ok: false, error: 'no_video' });
+  }
+  const urls = collectVideoSourceUrls(video);
+  const url = urls.find(mediaUrlLooksLikeStream);
+  if (!url) {
+    return Promise.resolve({ ok: false, error: 'no_media_url' });
+  }
+  return Promise.resolve({ ok: true, url });
+}
+
+function findM3u8UrlsInPage() {
+  const found = new Set();
+  const re = /https?:\/\/[^\s"'<>\\]+\.m3u8(?:\?[^\s"'<>\\]*)?/gi;
+  const scan = (text) => {
+    if (!text) return;
+    re.lastIndex = 0;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+      found.add(match[0].replace(/\\/g, ''));
+    }
+  };
+  try {
+    scan(document.documentElement?.innerHTML || '');
+    for (const script of document.querySelectorAll('script')) {
+      scan(script.textContent || script.innerHTML || '');
+    }
+  } catch {
+    /* ignore */
+  }
+  return [...found].filter(mediaUrlLooksLikeStream);
 }
 
 function collectVideoSourceUrls(video) {
@@ -270,20 +347,6 @@ function collectVideoSourceUrls(video) {
   push(video.getAttribute('data-src'));
   push(video.getAttribute('data-url'));
   return urls.filter((u) => !u.startsWith('blob:') && !u.startsWith('data:'));
-}
-
-function getVideoMediaUrlFromPage() {
-  const video = getActiveVideo();
-  if (!video) {
-    return Promise.resolve({ ok: false, error: 'no_video' });
-  }
-  const urls = collectVideoSourceUrls(video);
-  const stream = urls.find(mediaUrlLooksLikeStream);
-  const url = stream || urls.find((u) => /^https?:\/\//i.test(u));
-  if (!url) {
-    return Promise.resolve({ ok: false, error: 'no_media_url' });
-  }
-  return Promise.resolve({ ok: true, url });
 }
 
 function getActiveVideo() {
@@ -356,6 +419,18 @@ function ensurePendingLoaded() {
   });
 }
 
+async function persistClipsForKey(key, list) {
+  sessionClipsByKey[key] = list;
+  const data = await storageLocalGet(CLIPS_KEY);
+  const all = data[CLIPS_KEY] || {};
+  if (list.length) {
+    all[key] = list;
+  } else {
+    delete all[key];
+  }
+  await storageLocalSet({ [CLIPS_KEY]: all });
+}
+
 async function loadClipsForPage() {
   const key = storageKey();
   if (sessionClipsByKey[key]?.length) {
@@ -365,23 +440,66 @@ async function loadClipsForPage() {
   const all = data[CLIPS_KEY] || {};
   const list = all[key] ? [...all[key]] : [];
   sessionClipsByKey[key] = list;
-  if (list.length) {
+  return list;
+}
+
+async function reportStoredClipsOnce() {
+  const key = storageKey();
+  await loadClipsForPage();
+  if (sessionClipsByKey[key]?.length) {
     reportClipsToBackground();
   }
-  return list;
 }
 
 async function appendClip(clip) {
   const key = storageKey();
   const list = sessionClipsByKey[key] ? [...sessionClipsByKey[key]] : [];
   list.push(clip);
-  sessionClipsByKey[key] = list;
-  const data = await storageLocalGet(CLIPS_KEY);
-  const all = data[CLIPS_KEY] || {};
-  all[key] = list;
-  await storageLocalSet({ [CLIPS_KEY]: all });
+  await persistClipsForKey(key, list);
   reportClipsToBackground();
   return list;
+}
+
+async function updateClipTimesAt(index, startRaw, endRaw) {
+  const key = storageKey();
+  if (!sessionClipsByKey[key]?.length) {
+    await loadClipsForPage();
+  }
+  const current = sessionClipsByKey[key] ? [...sessionClipsByKey[key]] : [];
+  if (!Number.isInteger(index) || index < 0 || index >= current.length) {
+    return { ok: false, error: 'bad_index', clips: current, pageKey: key };
+  }
+  const start = normalizeClockTime(startRaw);
+  const end = normalizeClockTime(endRaw);
+  if (!start || !end) {
+    return { ok: false, error: 'invalid_time', clips: current, pageKey: key };
+  }
+  const startSec = parseClockTime(start);
+  const endSec = parseClockTime(end);
+  if (endSec <= startSec) {
+    return { ok: false, error: 'end_before_start', clips: current, pageKey: key };
+  }
+  current[index] = { ...current[index], start, end };
+  await persistClipsForKey(key, current);
+  reportClipsToBackground();
+  updateOverlayUiNow();
+  return { ok: true, clips: current, pageKey: key };
+}
+
+async function setClipMergeIncludedAt(index, includeInMerge) {
+  const key = storageKey();
+  const list = sessionClipsByKey[key] ? [...sessionClipsByKey[key]] : [];
+  if (!list.length) {
+    await loadClipsForPage();
+  }
+  const current = sessionClipsByKey[key] ? [...sessionClipsByKey[key]] : [];
+  if (!Number.isInteger(index) || index < 0 || index >= current.length) {
+    return { ok: false, error: 'bad_index', clips: current, pageKey: key };
+  }
+  current[index] = { ...current[index], includeInMerge: !!includeInMerge };
+  await persistClipsForKey(key, current);
+  reportClipsToBackground();
+  return { ok: true, clips: current, pageKey: key };
 }
 
 /**
@@ -392,22 +510,25 @@ async function appendClip(clip) {
  */
 async function removeClipAt(index) {
   const key = storageKey();
+  await loadClipsForPage();
   const list = sessionClipsByKey[key] ? [...sessionClipsByKey[key]] : [];
-  if (index >= 0 && index < list.length) {
-    list.splice(index, 1);
+  if (!Number.isInteger(index) || index < 0 || index >= list.length) {
+    return { ok: false, error: 'bad_index', clips: list, pageKey: key };
   }
-  sessionClipsByKey[key] = list;
-  const data = await storageLocalGet(CLIPS_KEY);
-  const all = data[CLIPS_KEY] || {};
-  if (list.length) {
-    all[key] = list;
-  } else {
-    delete all[key];
-  }
-  await storageLocalSet({ [CLIPS_KEY]: all });
+  list.splice(index, 1);
+  await persistClipsForKey(key, list);
   reportClipsToBackground();
   updateOverlayUiNow();
-  return { ok: true, clips: list };
+  return { ok: true, clips: list, pageKey: key };
+}
+
+async function replaceClipsForPage(clips) {
+  const key = storageKey();
+  const list = Array.isArray(clips) ? clips.map((c) => ({ ...c })) : [];
+  await persistClipsForKey(key, list);
+  reportClipsToBackground();
+  updateOverlayUiNow();
+  return { ok: true, clips: list, pageKey: key };
 }
 
 function updateOverlayUiNow() {
@@ -472,7 +593,7 @@ function doMarkEnd() {
       return { ok: false, error: 'no_pending_start' };
     }
     const end = formatClockTime(safeVideoTime(video));
-    const clip = { start, end };
+    const clip = { start, end, includeInMerge: true };
     pendingStart = null;
     updateOverlayUiNow();
     return savePendingToStorage(null)
@@ -496,7 +617,6 @@ function doClearPending() {
   updateOverlayUiNow();
   return savePendingToStorage(null).then(() => {
     updateOverlayUiNow();
-    reportClipsToBackground();
     return { ok: true };
   });
 }
@@ -537,15 +657,17 @@ function injectOverlayStyles() {
   style.textContent = `
     #clip-direct-clip-bar {
       position: fixed;
-      right: 12px;
-      bottom: 72px;
+      left: 12px;
+      top: 12px;
       z-index: 2147483647;
       isolation: isolate;
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       gap: 6px;
-      max-width: min(420px, calc(100vw - 24px));
+      width: 248px;
+      max-width: min(248px, calc(100vw - 24px));
+      box-sizing: border-box;
       padding: 8px 10px;
       border-radius: 10px;
       background: rgba(20, 20, 24, 0.92);
@@ -580,8 +702,16 @@ function injectOverlayStyles() {
     }
     #clip-direct-clip-bar .clip-direct-status {
       flex: 1 1 100%;
+      width: 100%;
       color: #9ecbff;
       min-height: 1.2em;
+      max-height: 2.4em;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      line-height: 1.2;
     }
     #clip-direct-clip-bar .clip-direct-hide {
       padding: 4px 8px;
@@ -727,13 +857,52 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return true;
     }
     if (msg.pageKey && msg.pageKey !== storageKey()) {
-      return false; // another frame owns these clips
+      return false;
     }
     removeClipAt(Number(msg.index)).then(sendResponse);
     return true;
   }
 
-  // Popup RPC is answered only by the top frame, so cross-origin iframes
+  if (msg?.action === 'replaceClips') {
+    if (handleInvalidExtensionContext()) {
+      sendResponse({ ok: false, error: 'context_invalidated', hint: 'reload_tab' });
+      return true;
+    }
+    if (msg.pageKey && msg.pageKey !== storageKey() && !msg.force) {
+      return false;
+    }
+    if (msg.force && !getActiveVideo()) {
+      return false;
+    }
+    replaceClipsForPage(msg.clips).then(sendResponse);
+    return true;
+  }
+
+  if (msg?.action === 'setClipMergeIncluded') {
+    if (handleInvalidExtensionContext()) {
+      sendResponse({ ok: false, error: 'context_invalidated', hint: 'reload_tab' });
+      return true;
+    }
+    if (msg.pageKey && msg.pageKey !== storageKey()) {
+      return false;
+    }
+    setClipMergeIncludedAt(Number(msg.index), msg.includeInMerge).then(sendResponse);
+    return true;
+  }
+
+  if (msg?.action === 'updateClipTimes') {
+    if (handleInvalidExtensionContext()) {
+      sendResponse({ ok: false, error: 'context_invalidated', hint: 'reload_tab' });
+      return true;
+    }
+    if (msg.pageKey && msg.pageKey !== storageKey()) {
+      return false;
+    }
+    updateClipTimesAt(Number(msg.index), msg.start, msg.end).then(sendResponse);
+    return true;
+  }
+
+  // Popup RPC is answered only by the top frame
   // (which now also run this script via all_frames) never clobber the
   // response on normal sites. Iframes still show their own clip bar and
   // report clips to the background.
@@ -776,6 +945,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 if (!handleInvalidExtensionContext()) {
   initBar();
+  void reportStoredClipsOnce();
 }
 syncIntervalId = setInterval(() => {
   if (handleInvalidExtensionContext()) {

@@ -14,6 +14,8 @@ export class TabSessionStore {
   lastHlsSegmentUrlByTab = {};
   /** @type {Record<number, { clips: object[], pageUrl: string, pageKey: string, ts: number }>} */
   clipsByTab = {};
+  /** @type {Record<number, Record<string, string>>} */
+  cookieJarByTab = {};
   #streamTimer = null;
   #clipTimer = null;
 
@@ -53,8 +55,21 @@ export class TabSessionStore {
   addStream(tabId, entry) {
     if (tabId == null || tabId < 0) return;
     const list = this.streamsByTab[tabId] ? [...this.streamsByTab[tabId]] : [];
-    if (list.some((e) => e.url === entry.url)) return;
-    list.unshift(entry);
+    const idx = list.findIndex((e) => e.url === entry.url);
+    if (idx >= 0) {
+      const prev = list[idx];
+      list[idx] = {
+        ...prev,
+        ...entry,
+        referer: entry.referer || prev.referer,
+        origin: entry.origin || prev.origin,
+        userAgent: entry.userAgent || prev.userAgent,
+        cookie: entry.cookie || prev.cookie,
+        ts: Math.max(entry.ts || 0, prev.ts || 0),
+      };
+    } else {
+      list.unshift(entry);
+    }
     this.streamsByTab[tabId] = list.slice(0, MAX_STREAMS);
     this.#scheduleStreams();
   }
@@ -74,11 +89,31 @@ export class TabSessionStore {
     return tabId != null ? this.lastHlsSegmentUrlByTab[tabId] : null;
   }
 
+  rememberRequestCookies(tabId, cookieHeader) {
+    if (tabId == null || tabId < 0 || !cookieHeader) return;
+    const jar = { ...(this.cookieJarByTab[tabId] || {}) };
+    for (const part of cookieHeader.split(';')) {
+      const piece = part.trim();
+      if (!piece) continue;
+      const eq = piece.indexOf('=');
+      if (eq <= 0) continue;
+      jar[piece.slice(0, eq).trim()] = piece.slice(eq + 1).trim();
+    }
+    this.cookieJarByTab[tabId] = jar;
+  }
+
+  cookieHeader(tabId) {
+    const jar = this.cookieJarByTab[tabId];
+    if (!jar) return '';
+    return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+  }
+
   clearTab(tabId) {
     if (tabId == null || tabId < 0) return;
     delete this.streamsByTab[tabId];
     delete this.lastHlsSegmentUrlByTab[tabId];
     delete this.clipsByTab[tabId];
+    delete this.cookieJarByTab[tabId];
     this.#scheduleStreams();
     this.#scheduleClips();
   }

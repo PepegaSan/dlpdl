@@ -8,6 +8,27 @@ class ClipParseError(ValueError):
     pass
 
 
+_EMBED_SHELL_SUFFIXES = (
+    'dood.video',
+    'doodstream.com',
+    'dood.watch',
+    'emturbovid.com',
+    'turboviplay.com',
+)
+
+
+def validate_job_media_url(url: str) -> None:
+    """Reject embed player pages mistaken for direct media URLs."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower().replace('www.', '')
+    for suffix in _EMBED_SHELL_SUFFIXES:
+        if host == suffix or host.endswith(f'.{suffix}'):
+            raise ClipParseError(
+                'Embed-Seiten-URL statt Videostream — Video abspielen, '
+                'dann cloudatacdn.com unter Erkannte Streams senden',
+            )
+
+
 def _parse_clock_timestamp(s: str) -> float:
     parts = s.strip().split(':')
     nums = [float(p) for p in parts]

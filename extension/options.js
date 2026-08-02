@@ -9,8 +9,12 @@ const fields = [
   'folder',
   'downloadType',
   'format',
+  'clipEncodeMode',
+  'postRender',
   'openUiAfterQueue',
 ];
+
+const boolFields = new Set(['openUiAfterQueue', 'postRender']);
 
 async function init() {
   const s = await loadSettings();
@@ -33,7 +37,7 @@ document.getElementById('save').addEventListener('click', async () => {
   for (const key of fields) {
     const el = document.getElementById(key);
     if (!el) continue;
-    if (key === 'openUiAfterQueue') {
+    if (boolFields.has(key)) {
       patch[key] = el.value === 'true';
     } else {
       patch[key] = el.value;

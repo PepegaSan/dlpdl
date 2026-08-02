@@ -1,9 +1,13 @@
 body {
   width: 320px;
+  min-width: 320px;
+  max-width: 320px;
+  box-sizing: border-box;
   margin: 0;
   padding: 12px;
   font: 13px/1.4 system-ui, sans-serif;
   color: #1a1a1a;
+  overflow-x: hidden;
 }
 header {
   display: flex;
@@ -45,11 +49,36 @@ h1 {
   margin: 0 0 8px;
 }
 .markers {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 6px;
-  align-items: center;
+  align-items: stretch;
   margin-bottom: 8px;
+}
+#btnStart,
+#btnEnd {
+  width: 100%;
+  min-width: 0;
+}
+#btnCancelPending {
+  grid-column: 1 / -1;
+  visibility: hidden;
+  height: 0;
+  min-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  margin: 0;
+  border-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+}
+#btnCancelPending.is-visible {
+  visibility: visible;
+  height: auto;
+  min-height: unset;
+  padding: 6px 10px;
+  border-width: 1px;
+  margin-top: 0;
 }
 button {
   cursor: pointer;
@@ -88,9 +117,57 @@ button.primary {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 6px;
   padding: 4px 0;
   border-bottom: 1px solid #eee;
   font-size: 12px;
+}
+.clips li.clip-merge-off .clip-times {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+.clip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.clip-times {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.clip-time-input {
+  width: 4.6em;
+  min-width: 0;
+  padding: 2px 4px;
+  font: inherit;
+  font-size: 11px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.clip-time-input:focus {
+  outline: none;
+  border-color: #0d6efd;
+  box-shadow: 0 0 0 1px rgba(13, 110, 253, 0.25);
+}
+.clip-time-input.clip-time-invalid {
+  border-color: #dc3545;
+  background: #fff5f5;
+}
+.clip-time-sep {
+  flex-shrink: 0;
+  color: #666;
+  font-size: 11px;
+}
+.clip-merge-cb {
+  flex-shrink: 0;
+  margin: 0;
+  cursor: pointer;
 }
 .clips button {
   padding: 2px 6px;
@@ -100,6 +177,34 @@ button.primary {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.clip-transfer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin: 0 0 10px;
+}
+.clip-transfer-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  padding: 5px 8px;
+}
+.clip-transfer-hint,
+.streams-paste-hint {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 11px;
+  color: #0d6efd;
+}
+.streams-paste-hint {
+  color: #166534;
+  background: #ecfdf3;
+  border: 1px solid #86efac;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
 }
 .hint-top {
   font-size: 11px;

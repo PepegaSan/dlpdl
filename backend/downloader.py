@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -21,10 +22,24 @@ from typing import Any, Callable, Optional
 
 import yt_dlp
 
-from .clip_parse import clip_autoname_prefix
+from .filename import allocate_unique_stem, build_output_stem
+from .hls_clipper import (
+    DEFAULT_USER_AGENT,
+    ffmpeg_header_args,
+    ffmpeg_http_input_extras,
+    finalize_mp4_for_editor,
+    normalize_http_headers,
+    probe_progressive_media_url,
+    rerender_for_editing,
+    run_ffmpeg_with_progress,
+    trim_media_to_duration,
+)
 from .smart_clip import is_hls_url, smart_clip_hls
 
 log = logging.getLogger('clip_direct')
+
+# Media extension in a URL path, incl. trailing-slash form: `.../x_720p.mp4/?rnd=..`
+_MEDIA_FILE_EXT_RE = re.compile(r'\.(mp4|webm|mkv|mov|m4v)(?:$|/)', re.IGNORECASE)
 
 
 def _progress_payload(*, fraction: float, msg: str, eta: Optional[float] = None) -> dict:
@@ -48,8 +63,13 @@ class JobSpec:
     custom_name_prefix: str = ''
     folder: str = ''
     format: str = 'bestvideo*+bestaudio/best'
+    clip_encode_mode: str = 'preserve'
+    post_render: bool = False
     ytdl_opts: dict = field(default_factory=dict)
     title: str = ''
+    page_title: str = ''
+    clip_index: Optional[int] = None
+    clip_count: Optional[int] = None
 
 
 @dataclass
@@ -83,7 +103,18 @@ class JobRunner:
             j = self._jobs.get(job_id)
             return self._job_dict(j) if j else None
 
+    def effective_filepath(self, j: JobState) -> Optional[str]:
+        """Resolve on-disk path (fixes legacy jobs that stored basename only)."""
+        if j.filepath and os.path.isfile(j.filepath):
+            return j.filepath
+        if j.filename:
+            cand = os.path.join(self.download_dir, j.filename)
+            if os.path.isfile(cand):
+                return cand
+        return None
+
     def _job_dict(self, j: JobState) -> dict:
+        file_path = self.effective_filepath(j)
         return {
             'id': j.id,
             'url': j.spec.url,
@@ -93,8 +124,13 @@ class JobRunner:
             'size': j.size,
             'error': j.error,
             'progress': j.progress,
+            'clip_start': j.spec.clip_start,
+            'clip_end': j.spec.clip_end,
             'clip_ranges': j.spec.clip_ranges,
             'merge_clips': j.spec.merge_clips,
+            'clip_encode_mode': j.spec.clip_encode_mode,
+            'post_render': j.spec.post_render,
+            'downloadable': bool(j.status == 'ready' and file_path),
         }
 
     def create_job(self, spec: JobSpec) -> str:
@@ -148,8 +184,8 @@ class JobRunner:
                     done = st.get('downloaded_bytes') or 0
                     prog = done / total
                     self._update(job_id, status='running', msg=msg, progress=prog)
-                elif st.get('status') == 'finished' and st.get('filename'):
-                    fp = st['filename']
+                elif st.get('status') == 'finished' and (st.get('filepath') or st.get('filename')):
+                    fp = st.get('filepath') or st['filename']
                     size = os.path.getsize(fp) if os.path.exists(fp) else None
                     self._update(
                         job_id,
@@ -161,12 +197,23 @@ class JobRunner:
                         progress=1.0,
                     )
                 elif st.get('status') == 'error':
-                    self._update(job_id, status='error', error=st.get('msg', 'error'), msg=msg)
+                    detail = (st.get('msg') or st.get('error') or '').strip()
+                    if not detail or detail.lower() == 'error':
+                        detail = 'Download fehlgeschlagen (keine Details)'
+                    self._update(job_id, status='error', error=detail, msg=detail)
 
         pump = threading.Thread(target=pump_status, daemon=True)
         pump.start()
 
-        self._update(job_id, status='running', msg='Starting download…')
+        def on_progress(msg: str, progress: float) -> None:
+            self._update(
+                job_id,
+                status='running',
+                msg=msg,
+                progress=max(0.0, min(1.0, progress)),
+            )
+
+        self._update(job_id, status='running', msg='Starting download…', progress=0.0)
         try:
             worker = _DownloadWorker(
                 spec=spec,
@@ -174,17 +221,27 @@ class JobRunner:
                 download_dir=self.download_dir,
                 temp_dir=os.path.join(self.temp_dir, job_id),
                 status_queue=status_q,
+                progress_callback=on_progress,
             )
             code = worker.run()
+            last_error = getattr(worker, '_last_error', '')
             status_q.put(None)
             pump.join(timeout=600)
             with self._lock:
                 j = self._jobs.get(job_id)
             if j and j.status == 'running':
                 if code != 0:
-                    self._update(job_id, status='error', error='download failed', msg='Download failed')
+                    detail = (last_error or j.msg or j.error or '').strip()
+                    if not detail or detail.lower() == 'error':
+                        detail = 'Download fehlgeschlagen'
+                    self._update(job_id, status='error', error=detail, msg=detail)
                 else:
-                    self._update(job_id, status='error', error='no output', msg='No output file')
+                    self._update(
+                        job_id,
+                        status='error',
+                        error='Keine Ausgabedatei erzeugt',
+                        msg='Keine Ausgabedatei erzeugt',
+                    )
         except Exception as exc:
             log.exception('job %s failed', job_id)
             self._update(job_id, status='error', error=str(exc), msg=str(exc))
@@ -192,38 +249,216 @@ class JobRunner:
 
 
 class _DownloadWorker:
-    def __init__(self, spec: JobSpec, job_id: str, download_dir: str, temp_dir: str, status_queue: queue.Queue):
+    def __init__(
+        self,
+        spec: JobSpec,
+        job_id: str,
+        download_dir: str,
+        temp_dir: str,
+        status_queue: queue.Queue,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ):
         self.spec = spec
         self.job_id = job_id
         self.download_dir = download_dir
         self.temp_dir = temp_dir
         self.status_queue = status_queue
+        self._progress_callback = progress_callback
         os.makedirs(temp_dir, exist_ok=True)
-
-        prefix = spec.custom_name_prefix or ''
-        if spec.clip_ranges and spec.merge_clips:
-            prefix = prefix or 'clipbatch_merged_'
-        elif spec.clip_ranges and len(spec.clip_ranges) == 1:
-            s, e = spec.clip_ranges[0]
-            prefix = (prefix or '') + clip_autoname_prefix(s, e)
-        elif spec.clip_start is not None or spec.clip_end is not None:
-            prefix = (prefix or '') + clip_autoname_prefix(spec.clip_start, spec.clip_end)
 
         base = download_dir
         if spec.folder:
             base = os.path.join(download_dir, spec.folder.strip().strip('/\\'))
             os.makedirs(base, exist_ok=True)
+        self._output_base = base
+        stem = build_output_stem(spec)
+        self._file_stem = allocate_unique_stem(base, stem)
         self.output_template = os.path.join(
             base,
-            f'{prefix}%(title).200B-%(id)s.%(ext)s',
+            f'{self._file_stem}.%(ext)s',
         )
         self._result_file: Optional[str] = None
         self._reported_finished = False
         self._last_progress_put = 0.0
+        self._last_progress_msg = ''
+        self._last_error = ''
 
-    def _headers(self) -> Optional[dict]:
-        h = self.spec.ytdl_opts.get('http_headers')
-        return dict(h) if isinstance(h, dict) else None
+    def _notify_progress(self, msg: str, fraction: float) -> None:
+        fraction = max(0.0, min(1.0, fraction))
+        if self._progress_callback:
+            self._progress_callback(msg, fraction)
+
+    def _fail(self, message: str) -> int:
+        text = (message or 'Download fehlgeschlagen').strip()
+        self._last_error = text
+        self._put({'status': 'error', 'msg': text, 'error': text})
+        return 1
+
+    def _headers(self) -> dict:
+        h = dict(self.spec.ytdl_opts.get('http_headers') or {})
+        h.setdefault('User-Agent', DEFAULT_USER_AGENT)
+        url_low = (self.spec.url or '').lower()
+        if any(host in url_low for host in ('turboviplay.com', 'turbosplayer.com')):
+            h.setdefault('Referer', 'https://emturbovid.com/')
+            try:
+                h.setdefault('Origin', 'https://emturbovid.com')
+            except OSError:
+                pass
+            if not any(k.lower() == 'cookie' and str(v or '').strip() for k, v in h.items()):
+                log.warning(
+                    'job %s: turboviplay without Cookie header — CDN will return dummy playlist',
+                    self.job_id,
+                )
+        if 'cloudatacdn.com' in url_low or 'cloudatacdn.net' in url_low:
+            if not h.get('Referer'):
+                log.warning(
+                    'job %s: cloudatacdn without Referer — send from page with playing video',
+                    self.job_id,
+                )
+        return h
+
+    def _normalized_headers(self) -> dict:
+        return normalize_http_headers(self._headers())
+
+    def _is_progressive_cdn_url(self) -> bool:
+        url_low = (self.spec.url or '').lower()
+        return 'cloudatacdn.com' in url_low or 'cloudatacdn.net' in url_low
+
+    def _direct_media_ext(self) -> Optional[str]:
+        """Media extension in the URL *path* (e.g. `.../x_720p.mp4/?rnd=..`)."""
+        url = self.spec.url or ''
+        path = url.split('?', 1)[0].split('#', 1)[0]
+        m = _MEDIA_FILE_EXT_RE.search(path)
+        if not m:
+            return None
+        ext = m.group(1).lower()
+        return 'mp4' if ext == 'm4v' else ext
+
+    def _is_direct_media_file_url(self) -> bool:
+        """A plain progressive media file (not HLS) — download via ffmpeg, not yt-dlp."""
+        if self._treat_as_hls():
+            return False
+        if self._is_progressive_cdn_url():
+            return True
+        return self._direct_media_ext() is not None
+
+    def _ffmpeg_full_download(self, output_path: str) -> tuple[bool, str]:
+        """Copy a full progressive media file via ffmpeg (headers + redirects)."""
+        headers = self._normalized_headers()
+        if self._is_progressive_cdn_url():
+            ok_probe, probe_err = probe_progressive_media_url(self.spec.url, headers)
+            if not ok_probe:
+                return False, probe_err
+
+        def report(local_frac: float, detail: str) -> None:
+            self._put(_progress_payload(
+                fraction=0.05 + 0.88 * max(0.0, min(local_frac, 1.0)),
+                msg=f'Direkt-Download: ffmpeg… ({detail})',
+            ))
+
+        report(0.0, 'start')
+        args = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+            *ffmpeg_header_args(headers),
+            *ffmpeg_http_input_extras(),
+            '-i', self.spec.url,
+            '-map', '0:v:0?', '-map', '0:a:0?',
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            output_path,
+        ]
+        try:
+            proc = run_ffmpeg_with_progress(
+                args,
+                duration_sec=0.0,
+                on_progress=report,
+                timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            return False, 'ffmpeg timeout (>30 min)'
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or '').strip()[:400]
+            return False, err or 'ffmpeg direct download failed'
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            return False, 'ffmpeg direct download produced no output'
+        return True, 'ffmpeg-direct'
+
+    def _ffmpeg_clip_range(
+        self,
+        start: float,
+        end: float,
+        output_path: str,
+        *,
+        progress_label: str = 'Progressive CDN',
+        progress_base: float = 0.05,
+        progress_scale: float = 0.9,
+    ) -> tuple[bool, str]:
+        # end=inf means "to EOF" — never pass -t inf to ffmpeg.
+        has_end = end is not None and end != float('inf') and end > start
+        duration = max(end - start, 0.1) if has_end else 0.0
+        headers = self._normalized_headers()
+
+        def report(local_frac: float, detail: str) -> None:
+            fraction = progress_base + progress_scale * max(0.0, min(local_frac, 1.0))
+            self._put(_progress_payload(
+                fraction=fraction,
+                msg=f'{progress_label}: ffmpeg clip… ({detail})',
+            ))
+
+        report(0.0, 'start')
+        if self._is_progressive_cdn_url():
+            ok_probe, probe_err = probe_progressive_media_url(self.spec.url, headers)
+            if not ok_probe:
+                return False, probe_err
+
+        args = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+            *ffmpeg_header_args(headers),
+            *ffmpeg_http_input_extras(),
+            '-ss', f'{start:.3f}',
+            '-i', self.spec.url,
+        ]
+        if has_end:
+            args.extend(['-t', f'{duration:.3f}'])
+        args.extend(['-map', '0:v:0?', '-map', '0:a:0?'])
+        if self.spec.clip_encode_mode == 'preserve':
+            args.extend([
+                '-c', 'copy',
+                '-avoid_negative_ts', 'make_zero',
+                '-movflags', '+faststart',
+                output_path,
+            ])
+        else:
+            args.extend([
+                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+                '-c:a', 'aac',
+                '-movflags', '+faststart',
+                output_path,
+            ])
+        try:
+            proc = run_ffmpeg_with_progress(
+                args,
+                duration_sec=duration,
+                on_progress=report,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            return False, 'ffmpeg timeout (>15 min) — kürzeren Clip versuchen'
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or '').strip()[:400]
+            if 'dood.video' in err.lower():
+                return False, (
+                    'CDN/ffmpeg verweist auf dood.video — Video abspielen, '
+                    'sofort erneut senden (Token abgelaufen?)'
+                )
+            return False, err or 'ffmpeg progressive clip failed'
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            return False, 'ffmpeg progressive clip produced no output'
+        if output_path.lower().endswith('.mp4'):
+            finalize_mp4_for_editor(output_path)
+        return True, 'ffmpeg-progressive'
 
     def _treat_as_hls(self) -> bool:
         if is_hls_url(self.spec.url):
@@ -234,11 +469,16 @@ class _DownloadWorker:
     def _put(self, payload: dict) -> None:
         if self._reported_finished and payload.get('status') == 'downloading':
             return
+        msg = (payload.get('msg') or '').strip()
         if payload.get('status') == 'downloading':
             now = time.monotonic()
-            if now - self._last_progress_put < 0.35:
+            if msg == self._last_progress_msg and now - self._last_progress_put < 0.35:
                 return
             self._last_progress_put = now
+            self._last_progress_msg = msg
+            total = payload.get('total_bytes_estimate') or 1
+            done = payload.get('downloaded_bytes') or 0
+            self._notify_progress(msg or 'Downloading…', done / total)
         self.status_queue.put(payload)
 
     def run(self) -> int:
@@ -254,6 +494,17 @@ class _DownloadWorker:
             'postprocessor_hooks': [self._pp_hook],
             **self.spec.ytdl_opts,
         }
+        if self.spec.clip_encode_mode == 'preserve':
+            ytdl_params.setdefault('postprocessor_args', {'ffmpeg': ['-c', 'copy']})
+
+        log.info(
+            'job %s encode_mode=%s post_render=%s url=%s merge=%s',
+            self.job_id,
+            self.spec.clip_encode_mode,
+            self.spec.post_render,
+            self.spec.url[:80],
+            self.spec.merge_clips,
+        )
 
         if self.spec.merge_clips and self.spec.clip_ranges:
             code = self._merge_clips(ytdl_params)
@@ -265,9 +516,36 @@ class _DownloadWorker:
     def _mark_finished(self, filepath: str, msg: str = 'Done') -> None:
         if self._reported_finished or not filepath:
             return
+        if self.spec.post_render:
+            def _rerender_progress(frac: float, detail: str) -> None:
+                self._put(_progress_payload(
+                    fraction=0.93 + 0.06 * max(0.0, min(frac, 1.0)),
+                    msg=f'Neu rendern (Keyframe-Fix)… ({detail})',
+                ))
+
+            self._put(_progress_payload(fraction=0.93, msg='Neu rendern (Keyframe-Fix)…'))
+            ok, detail, new_path = rerender_for_editing(filepath, on_progress=_rerender_progress)
+            if ok:
+                filepath = new_path
+                msg = f'{msg} + {detail}'
+            else:
+                log.warning('job %s rerender failed: %s', self.job_id, detail)
+                if filepath.lower().endswith('.mp4'):
+                    ok2, detail2 = finalize_mp4_for_editor(filepath)
+                    if not ok2:
+                        log.warning('job %s: %s', self.job_id, detail2)
+        elif filepath.lower().endswith('.mp4'):
+            ok, detail = finalize_mp4_for_editor(filepath)
+            if not ok:
+                log.warning('job %s: %s', self.job_id, detail)
         self._result_file = filepath
         self._reported_finished = True
-        self._put({'status': 'finished', 'filename': filepath, 'msg': msg})
+        self._put({
+            'status': 'finished',
+            'filename': os.path.basename(filepath),
+            'filepath': filepath,
+            'msg': msg,
+        })
 
     def _ensure_finished(self, code: int) -> None:
         if self._reported_finished:
@@ -278,19 +556,25 @@ class _DownloadWorker:
             self._mark_finished(self._result_file)
             return
         base = os.path.dirname(self.output_template) or self.download_dir
-        prefix = os.path.basename(self.output_template).split('%', 1)[0]
+        stem = self._file_stem
         candidates = []
         for name in os.listdir(base):
-            if prefix and not name.startswith(prefix):
+            if not name.startswith(stem + '.'):
                 continue
             path = os.path.join(base, name)
             if os.path.isfile(path) and name.lower().endswith(('.mp4', '.mkv', '.webm', '.m4a', '.mp3')):
                 candidates.append(path)
-        if candidates:
-            newest = max(candidates, key=os.path.getmtime)
-            self._mark_finished(newest)
+        if len(candidates) == 1:
+            self._mark_finished(candidates[0])
             return
-        self._put({'status': 'error', 'msg': 'Download finished but no output file was found'})
+        if candidates:
+            log.error(
+                'job %s: ambiguous output files for stem %s (%d matches)',
+                self.job_id,
+                stem,
+                len(candidates),
+            )
+        self._put({'status': 'error', 'msg': 'Download abgeschlossen, aber keine Ausgabedatei gefunden', 'error': 'Download abgeschlossen, aber keine Ausgabedatei gefunden'})
 
     def _progress_hook(self, d: dict) -> None:
         if self._reported_finished:
@@ -312,18 +596,13 @@ class _DownloadWorker:
             if filepath:
                 self._mark_finished(filepath)
 
-    def _final_clip_output_path(self) -> str:
-        name_info = {'title': 'clip', 'id': self.job_id, 'ext': 'mp4'}
-        out_name = yt_dlp.YoutubeDL({
-            'quiet': True,
-            'paths': {'home': self.download_dir},
-        }).prepare_filename(name_info, outtmpl=self.output_template)
-        if not os.path.isabs(out_name):
-            out_name = os.path.join(self.download_dir, out_name)
-        os.makedirs(os.path.dirname(out_name) or self.download_dir, exist_ok=True)
-        return out_name
+    def _final_clip_output_path(self, ext: str = 'mp4') -> str:
+        base = os.path.dirname(self.output_template) or self._output_base or self.download_dir
+        os.makedirs(base, exist_ok=True)
+        ext = ext.lstrip('.') or 'mp4'
+        return os.path.join(base, f'{self._file_stem}.{ext}')
 
-    def _clip_hls_like_merge(self, start: float, end: float, ytdl_params: dict) -> bool:
+    def _clip_hls_like_merge(self, start: float, end: float, ytdl_params: dict) -> tuple[bool, str]:
         """Same smart_clip path as merge parts — avoids yt-dlp hangs on clipped HLS."""
         batch_dir = os.path.join(self.temp_dir, 'clip')
         os.makedirs(batch_dir, exist_ok=True)
@@ -332,18 +611,18 @@ class _DownloadWorker:
                 0, start, end, batch_dir, 0.0, 0.94, 1, ytdl_params,
             )
             if not produced or not os.path.isfile(produced):
-                return False
+                return False, detail or 'Smart-Clip failed'
             final = self._final_clip_output_path()
             if os.path.abspath(produced) != os.path.abspath(final):
                 if os.path.exists(final):
                     os.remove(final)
                 shutil.move(produced, final)
-            self._mark_finished(final, msg=f'Done ({detail})')
-            return True
+            self._mark_finished(final, msg=f'Done ({detail}, {self.spec.clip_encode_mode})')
+            return True, detail
         finally:
             shutil.rmtree(batch_dir, ignore_errors=True)
 
-    def _smart_fallback(self, start: float, end: float) -> bool:
+    def _smart_fallback(self, start: float, end: float) -> tuple[bool, str]:
         raw_ts = os.path.join(self.temp_dir, 'smartclip.ts')
         out_name = self._final_clip_output_path()
 
@@ -362,6 +641,7 @@ class _DownloadWorker:
             raw_ts,
             out_name,
             progress=progress,
+            encode_mode=self.spec.clip_encode_mode,
         )
         if raw_ts and os.path.exists(raw_ts):
             try:
@@ -369,28 +649,53 @@ class _DownloadWorker:
             except OSError:
                 pass
         if ok:
-            self._mark_finished(out_name, msg=f'Done ({msg})')
-            return True
+            self._mark_finished(out_name, msg=f'Done ({msg}, {self.spec.clip_encode_mode})')
+            return True, msg
         log.error('smart-clip failed: %s', msg)
-        return False
+        return False, msg
 
     def _single_or_clip(self, ytdl_params: dict) -> int:
         is_clip = self.spec.clip_start is not None or self.spec.clip_end is not None
         start = float(self.spec.clip_start) if self.spec.clip_start is not None else 0.0
         end = float(self.spec.clip_end) if self.spec.clip_end is not None else float('inf')
 
-        # Clipped HLS: same path as merge parts (yt-dlp often hangs on clipped HLS).
-        if is_clip and self._treat_as_hls():
-            log.info('single clip HLS: smart_clip (merge path) for %s', self.spec.url[:80])
-            if self._clip_hls_like_merge(start, end, ytdl_params):
+        if self._treat_as_hls():
+            log.info('HLS: smart_clip for %s', self.spec.url[:80])
+            if is_clip:
+                ok, err = self._clip_hls_like_merge(start, end, ytdl_params)
+            else:
+                ok, err = self._smart_fallback(start, end)
+            if ok:
                 return 0
-            self._put({'status': 'error', 'msg': 'Smart-Clip failed'})
-            return 1
+            detail = err or 'Smart-Clip fehlgeschlagen'
+            return self._fail(detail)
 
         if is_clip:
             ytdl_params['download_ranges'] = yt_dlp.utils.download_range_func(
                 None, [(start, end)],
             )
+
+        if is_clip and self._is_direct_media_file_url():
+            ext = self._direct_media_ext() or 'mp4'
+            out = self._final_clip_output_path(ext)
+            ok, err = self._ffmpeg_clip_range(
+                start, end, out,
+                progress_base=0.05,
+                progress_scale=0.9,
+            )
+            if ok:
+                self._mark_finished(out, msg=f'Done ({err})')
+                return 0
+            return self._fail(err or 'progressive clip failed')
+
+        if not is_clip and self._is_direct_media_file_url():
+            ext = self._direct_media_ext() or 'mp4'
+            out = self._final_clip_output_path(ext)
+            ok, err = self._ffmpeg_full_download(out)
+            if ok:
+                self._mark_finished(out, msg=f'Done ({err})')
+                return 0
+            return self._fail(err or 'direct download failed')
 
         ytdl_params['progress_hooks'] = []
         ytdl_params['postprocessor_hooks'] = [self._pp_hook]
@@ -402,13 +707,8 @@ class _DownloadWorker:
             ret = 1
             clip_dl_error = exc
 
-        if ret != 0 and self._treat_as_hls():
-            fb_start = start if is_clip else 0.0
-            fb_end = end if is_clip else float('inf')
-            if self._smart_fallback(fb_start, fb_end):
-                return 0
         if ret != 0 and clip_dl_error:
-            self._put({'status': 'error', 'msg': str(clip_dl_error)})
+            return self._fail(str(clip_dl_error))
         return ret
 
     def _merge_part(
@@ -423,7 +723,8 @@ class _DownloadWorker:
         ytdl_params: dict,
     ) -> tuple[Optional[str], str]:
         """Download one merge segment. HLS uses smart_clip directly (yt-dlp often hangs on clipped HLS)."""
-        part_out = os.path.join(batch_dir, f'part_{index:03d}.mp4')
+        part_ext = (self._direct_media_ext() if self._is_direct_media_file_url() else None) or 'mp4'
+        part_out = os.path.join(batch_dir, f'part_{index:03d}.{part_ext}')
         if self._treat_as_hls():
             raw_ts = os.path.join(batch_dir, f'part_{index:03d}_raw.ts')
             self._put(_progress_payload(
@@ -446,6 +747,7 @@ class _DownloadWorker:
                 progress=_part_progress,
                 progress_base=part_base,
                 progress_scale=part_scale,
+                encode_mode=self.spec.clip_encode_mode,
             )
             if os.path.exists(raw_ts):
                 try:
@@ -457,6 +759,17 @@ class _DownloadWorker:
             log.error('merge part %s smart-clip failed: %s', index, err)
             return None, err
 
+        if self._is_direct_media_file_url():
+            ok, err = self._ffmpeg_clip_range(
+                float(start), float(end), part_out,
+                progress_label=f'Part {index + 1}/{total_parts}',
+                progress_base=part_base,
+                progress_scale=part_scale,
+            )
+            if ok and os.path.isfile(part_out):
+                return part_out, err
+            return None, err or 'progressive clip failed'
+
         part_tmpl = os.path.join(batch_dir, f'part_{index:03d}.%(ext)s')
         part_params = {
             **ytdl_params,
@@ -466,21 +779,24 @@ class _DownloadWorker:
             'postprocessor_hooks': [],
         }
         produced = None
+        ytdl_err = ''
         try:
             code = yt_dlp.YoutubeDL(params=part_params).download([self.spec.url])
         except yt_dlp.utils.YoutubeDLError as exc:
             code = 1
+            ytdl_err = str(exc).strip()[:300]
             log.warning('merge part %s yt-dlp: %s', index, exc)
         if code == 0:
             matches = sorted(glob.glob(os.path.join(batch_dir, f'part_{index:03d}.*')))
             produced = matches[0] if matches else None
-        return produced, 'yt-dlp'
+        if produced and os.path.isfile(produced):
+            return produced, 'yt-dlp'
+        return None, ytdl_err or 'yt-dlp produced no output'
 
     def _merge_clips(self, ytdl_params: dict) -> int:
         ranges = list(self.spec.clip_ranges)
         if not ranges:
-            self._put({'status': 'error', 'msg': 'No clip ranges for merge'})
-            return 1
+            return self._fail('Keine Clip-Bereiche für Zusammenschnitt')
         batch_dir = os.path.join(self.temp_dir, 'merge')
         os.makedirs(batch_dir, exist_ok=True)
         part_paths = []
@@ -492,13 +808,15 @@ class _DownloadWorker:
                 part_base = i * part_scale
                 self._put(_progress_payload(
                     fraction=part_base,
-                    msg=f'Part {i + 1}/{total_parts}: starting…',
+                    msg=f'Part {i + 1}/{total_parts}: start…',
                 ))
-                produced, _detail = self._merge_part(i, start, end, batch_dir, part_base, part_scale, total_parts, ytdl_params)
+                produced, detail = self._merge_part(i, start, end, batch_dir, part_base, part_scale, total_parts, ytdl_params)
                 if produced is None:
-                    self._put({'status': 'error', 'msg': f'Part {i + 1}/{total_parts} failed'})
-                    return 1
+                    part_msg = detail or 'unbekannt'
+                    return self._fail(f'Teil {i + 1}/{total_parts} fehlgeschlagen: {part_msg}')
                 part_paths.append(produced)
+                if hls and i + 1 < total_parts:
+                    time.sleep(2.0)
 
             self._put(_progress_payload(fraction=0.92, msg=f'Merging {len(part_paths)} parts…', eta=10))
 
@@ -509,22 +827,52 @@ class _DownloadWorker:
                     fh.write(f"file '{escaped}'\n")
 
             ext = os.path.splitext(part_paths[0])[1] or '.mp4'
-            name_info = {'title': 'merged', 'id': self.job_id, 'ext': ext.lstrip('.') or 'mp4'}
-            merged_name = yt_dlp.YoutubeDL({'quiet': True, 'paths': {'home': self.download_dir}}).prepare_filename(
-                name_info, outtmpl=self.output_template,
-            )
-            if not os.path.isabs(merged_name):
-                merged_name = os.path.join(self.download_dir, merged_name)
+            merged_name = self._final_clip_output_path(ext.lstrip('.') or 'mp4')
             os.makedirs(os.path.dirname(merged_name) or self.download_dir, exist_ok=True)
 
-            cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', merged_name]
+            expected_total = sum(
+                max(float(end) - float(start), 0.1) for start, end in ranges
+            )
+
+            cmd = [
+                'ffmpeg', '-y', '-loglevel', 'error',
+                '-f', 'concat', '-safe', '0', '-i', list_path,
+                '-c', 'copy', '-shortest',
+                '-avoid_negative_ts', 'make_zero',
+                '-movflags', '+faststart',
+                merged_name,
+            ]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c:v', 'libx264', '-c:a', 'aac', '-shortest', merged_name]
+                err = (proc.stderr or '').strip()[:400]
+                if self.spec.clip_encode_mode != 'exact':
+                    log.error('merge copy failed in preserve mode: %s', err[:200])
+                    return self._fail(err or 'ffmpeg concat (copy) failed')
+                cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-f', 'concat', '-safe', '0', '-i', list_path,
+                    '-c:v', 'libx264', '-c:a', 'aac', '-shortest',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-movflags', '+faststart',
+                    merged_name,
+                ]
                 proc = subprocess.run(cmd, capture_output=True, text=True)
                 if proc.returncode != 0:
-                    return 1
-            self._mark_finished(merged_name, msg=f'Merged: {len(part_paths)} parts')
+                    err2 = (proc.stderr or '').strip()[:400]
+                    return self._fail(err2 or 'ffmpeg concat (re-encode) failed')
+
+            trim_ok, trim_detail = trim_media_to_duration(
+                merged_name,
+                expected_total,
+                encode_mode=self.spec.clip_encode_mode,
+            )
+            if not trim_ok:
+                log.warning('merge tail trim: %s', trim_detail)
+
+            self._mark_finished(
+                merged_name,
+                msg=f'Merged: {len(part_paths)} parts ({self.spec.clip_encode_mode})',
+            )
             log.info('merge job %s: %d parts -> %s', self.job_id, len(part_paths), merged_name)
             return 0
         finally:

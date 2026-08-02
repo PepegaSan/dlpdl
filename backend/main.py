@@ -7,8 +7,9 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .clip_parse import ClipParseError, optional_clip_field, parse_clips_list
+from .clip_parse import ClipParseError, optional_clip_field, parse_clips_list, validate_job_media_url
 from .downloader import JobRunner, JobSpec, parse_ytdl_overrides
+from .filename import sanitize_title
 from .smart_clip import is_hls_url
 
 log = logging.getLogger('clip_direct')
@@ -45,10 +46,33 @@ async def cors_middleware(request, handler):
     return resp
 
 
+def _as_bool(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    if isinstance(raw, str):
+        return raw.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(raw)
+
+
+def _optional_positive_int(raw, field_name: str) -> int | None:
+    if raw is None or raw == '':
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ClipParseError(f'{field_name} must be a positive integer') from exc
+    if value < 1:
+        raise ClipParseError(f'{field_name} must be a positive integer')
+    return value
+
+
 def _job_spec_from_post(post: dict) -> JobSpec:
     url = (post.get('url') or '').strip()
     if not url:
         raise ClipParseError('url is required')
+    validate_job_media_url(url)
 
     merge_clips = bool(post.get('merge_clips', False))
     clips_raw = post.get('clips')
@@ -83,6 +107,18 @@ def _job_spec_from_post(post: dict) -> JobSpec:
     save_target = (post.get('save_target') or 'browser').strip().lower()
     folder = (post.get('folder') or '').strip() if save_target == 'nas' else ''
 
+    encode_mode = (post.get('clip_encode_mode') or 'preserve').strip().lower()
+    if encode_mode not in ('preserve', 'exact'):
+        encode_mode = 'preserve'
+
+    post_render = _as_bool(post.get('post_render', False))
+
+    page_title = sanitize_title((post.get('page_title') or '').strip())
+    clip_index = _optional_positive_int(post.get('clip_index'), 'clip_index')
+    clip_count = _optional_positive_int(post.get('clip_count'), 'clip_count')
+    if merge_clips and clip_ranges and clip_count is None:
+        clip_count = len(clip_ranges)
+
     return JobSpec(
         url=url,
         clip_start=clip_start,
@@ -92,8 +128,13 @@ def _job_spec_from_post(post: dict) -> JobSpec:
         custom_name_prefix=prefix,
         folder=folder,
         format=fmt,
+        clip_encode_mode=encode_mode,
+        post_render=post_render,
         ytdl_opts=overrides,
-        title=url[:120],
+        title=page_title or url[:120],
+        page_title=page_title,
+        clip_index=clip_index,
+        clip_count=clip_count,
     )
 
 
@@ -111,8 +152,18 @@ async def api_create_job(request: web.Request) -> web.Response:
     merge_clips = bool(post.get('merge_clips', False))
     if clips_raw and not merge_clips and len(parse_clips_list(clips_raw)) > 1:
         ids = []
-        for start, end in parse_clips_list(clips_raw):
-            single = {**post, 'clips': None, 'merge_clips': False, 'clip_start': start, 'clip_end': end}
+        ranges = parse_clips_list(clips_raw)
+        total = len(ranges)
+        for index, (start, end) in enumerate(ranges, start=1):
+            single = {
+                **post,
+                'clips': None,
+                'merge_clips': False,
+                'clip_start': start,
+                'clip_end': end,
+                'clip_index': index,
+                'clip_count': total,
+            }
             ids.append(runner.create_job(_job_spec_from_post(single)))
         return web.json_response({'ids': ids, 'status': 'pending'})
 
@@ -141,12 +192,16 @@ async def api_download_file(request: web.Request) -> web.Response:
     job_id = request.match_info['id']
     with runner._lock:
         state = runner._jobs.get(job_id)
-    if not state or state.status != 'ready' or not state.filepath or not os.path.isfile(state.filepath):
+    file_path = runner.effective_filepath(state) if state else None
+    if not state or state.status != 'ready' or not file_path:
         raise web.HTTPNotFound(reason='file not ready')
-    name = state.filename or os.path.basename(state.filepath)
+    name = state.filename or os.path.basename(file_path)
     return web.FileResponse(
-        state.filepath,
-        headers={'Content-Disposition': f'attachment; filename="{name}"'},
+        file_path,
+        headers={
+            'Content-Disposition': f'attachment; filename="{name}"',
+            'Cache-Control': 'no-store, must-revalidate',
+        },
     )
 
 

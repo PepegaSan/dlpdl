@@ -73,6 +73,7 @@
   "error.shellPagePhp": "This page (.php) can only be downloaded via a detected stream. Play the video, reload (F5), then use Cut on a stream — or check Detected streams in the popup.",
   "ui.subtitle": "Clips from the extension — when Ready, auto-save (checkbox) or Save to PC.",
   "ui.tabWarn": "Multiple tabs with this page open cause duplicate save dialogs. Close the other tabs.",
+  "ui.apiError": "Server connection failed: {error} — is Docker running? Hard-reload with Ctrl+Shift+R.",
   "ui.empty": "No jobs yet. Send a clip from the extension.",
   "ui.language": "Language",
   "ui.lang.en": "English",
@@ -83,6 +84,9 @@
   "ui.status.running": "Running…",
   "ui.status.ready": "Ready",
   "ui.status.error": "Error",
+  "ui.status.errorUnknown": "Unknown error — restart Docker; for turboviplay: play video in tab, then send again",
   "ui.saveToPc": "Save to PC",
+  "ui.downloadFailed": "Download failed ({code}). Reload the page; for large HLS files wait until Ready.",
+  "ui.fileMissing": "File missing on server — re-queue the job or check Docker.",
   "ui.remove": "Remove"
 }
