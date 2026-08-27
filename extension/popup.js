@@ -489,6 +489,10 @@ function renderStreams() {
   });
 }
 
+function isEditingClipTime() {
+  return document.activeElement?.classList?.contains('clip-time-input');
+}
+
 async function refreshStreams() {
   const tabId = await getActiveTabId();
   const [streamRes, clipsRes] = await Promise.all([
@@ -496,13 +500,17 @@ async function refreshStreams() {
     chrome.runtime.sendMessage({ action: 'getTabClips', tabId }),
   ]);
   streams = Array.isArray(streamRes?.streams) ? streamRes.streams : [];
-  tabClips = Array.isArray(clipsRes?.tabClips?.clips) ? clipsRes.tabClips.clips : [];
+  const nextClips = Array.isArray(clipsRes?.tabClips?.clips) ? clipsRes.tabClips.clips : [];
   tabPageKey = clipsRes?.tabClips?.pageKey || null;
+  const cbRes = await sendBg('getClipClipboard');
+  updateClipboardUi(cbRes?.clipboard || null);
+  if (isEditingClipTime()) {
+    return;
+  }
+  tabClips = nextClips;
   if (tabClips.length) {
     clips = [...tabClips];
   }
-  const cbRes = await sendBg('getClipClipboard');
-  updateClipboardUi(cbRes?.clipboard || null);
   renderClips();
   renderStreams();
   updateButtons();
