@@ -457,6 +457,40 @@ async function queueClips(pageUrl, clips, mergeClips) {
   };
 }
 
+async function sendToAllFrames(tabId, payload) {
+  let frameIds = [0];
+  try {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => true,
+    });
+    const ids = (injected || []).map((row) => row.frameId).filter((id) => id != null);
+    if (ids.length) frameIds = ids;
+  } catch {
+    /* chrome:// or no scripting — fall back to top frame */
+  }
+  const results = await Promise.all(frameIds.map(async (frameId) => {
+    try {
+      return await chrome.tabs.sendMessage(tabId, payload, { frameId });
+    } catch {
+      return null;
+    }
+  }));
+  return results.find((r) => r?.ok) || null;
+}
+
+function keepIncludeFlags(incoming, existing) {
+  if (!Array.isArray(incoming) || !existing?.length) return incoming;
+  return incoming.map((clip, index) => {
+    const prev = existing.find((p) => p.start === clip.start && p.end === clip.end)
+      || existing[index];
+    if (!prev || prev.start !== clip.start || prev.end !== clip.end) {
+      return clip;
+    }
+    return { ...clip, includeInMerge: prev.includeInMerge !== false };
+  });
+}
+
 async function forwardToTab(tabId, payload) {
   try {
     return await chrome.tabs.sendMessage(tabId, payload);
@@ -508,7 +542,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return true;
         }
       }
-      session.setClips(tabId, clips, msg.pageUrl, msg.pageKey);
+      const merged = keepIncludeFlags(clips, existing?.clips);
+      session.setClips(tabId, merged, msg.pageUrl, msg.pageKey);
     }
     sendResponse({ ok: true });
     return true;
@@ -573,31 +608,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.action === 'setClipMergeIncluded') {
     (async () => {
       const tabId = msg.tabId ?? (await activeTabId());
-      if (!tabId) {
+      if (tabId == null || tabId < 0) {
         sendResponse({ ok: false, error: 'no_tab' });
         return;
       }
-      let result = { ok: false, error: 'no_owner' };
+      const fromSession = session.setClipMergeIncluded(
+        tabId,
+        Number(msg.index),
+        msg.includeInMerge,
+      );
       try {
-        result = await chrome.tabs.sendMessage(tabId, {
+        await sendToAllFrames(tabId, {
           action: 'setClipMergeIncluded',
-          pageKey: msg.pageKey,
-          index: msg.index,
+          pageKey: msg.pageKey || fromSession.pageKey || undefined,
+          index: Number(msg.index),
           includeInMerge: msg.includeInMerge,
         });
-      } catch (err) {
-        result = { ok: false, error: String(err?.message || err) };
+      } catch {
+        /* session is source of truth */
       }
-      if (result?.ok && Array.isArray(result.clips)) {
-        const entry = session.clipEntry(tabId);
-        session.setClips(
-          tabId,
-          result.clips,
-          entry?.pageUrl || '',
-          result.pageKey || entry?.pageKey || '',
-        );
-      }
-      sendResponse(result);
+      const latest = session.clipEntry(tabId);
+      sendResponse({
+        ok: fromSession.ok || Boolean(latest?.clips?.length),
+        clips: latest?.clips || fromSession.clips || [],
+        pageKey: latest?.pageKey || fromSession.pageKey || '',
+        error: fromSession.ok ? undefined : fromSession.error,
+      });
     })();
     return true;
   }

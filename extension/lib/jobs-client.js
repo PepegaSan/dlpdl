@@ -64,7 +64,7 @@ function clipFields(clips, mergeClips) {
 
 /** @param {import('./storage.js').ExtensionSettings} settings */
 export function buildPageJobPayload(settings, pageUrl, clips, mergeClips) {
-  const valid = clips.filter(clipHasTimes);
+  const valid = mergeClips ? clipsForMerge(clips) : selectedClips(clips);
   return {
     url: pageUrl,
     ytdl_options_overrides: '',
@@ -94,7 +94,7 @@ export function buildStreamJobPayload(
   tabUrl = '',
   tabCookies = '',
 ) {
-  const valid = clips.filter(clipHasTimes);
+  const valid = mergeClips ? clipsForMerge(clips) : selectedClips(clips);
   const overrides = streamOverrides(stream, pageUrl, tabUrl, tabCookies);
   const body = {
     url: stream.url,

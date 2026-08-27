@@ -156,4 +156,21 @@ export class TabSessionStore {
     this.#scheduleClips();
     return { ok: true, clips, pageKey: entry.pageKey || '' };
   }
+
+  setClipMergeIncluded(tabId, index, includeInMerge) {
+    const entry = this.clipEntry(tabId);
+    if (!entry?.clips) {
+      return { ok: false, error: 'no_clips', clips: [] };
+    }
+    if (!Number.isInteger(index) || index < 0 || index >= entry.clips.length) {
+      return { ok: false, error: 'bad_index', clips: entry.clips };
+    }
+    const clips = entry.clips.map((c, i) => (
+      i === index ? { ...c, includeInMerge: !!includeInMerge } : c
+    ));
+    entry.clips = clips;
+    entry.ts = Date.now();
+    this.#scheduleClips();
+    return { ok: true, clips, pageKey: entry.pageKey || '' };
+  }
 }

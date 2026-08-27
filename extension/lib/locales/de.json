@@ -34,7 +34,7 @@
   "popup.status.sent": "Gesendet — im Web-UI Fortschritt/Download.",
   "popup.status.barShown": "Leiste auf der Seite sollte sichtbar sein",
   "popup.stream.cutOne": "Mit Schnitt ({count})",
-  "popup.stream.cutOneTitle": "Einen markierten Abschnitt als Datei",
+  "popup.stream.cutOneTitle": "Nur angehakte Clips, jeder als eigene Datei",
   "popup.stream.merge": "Zusammenfügen ({count})",
   "popup.stream.mergeTitle": "Alle markierten Abschnitte zu einer Datei zusammenfügen",
   "popup.stream.send": "Senden",

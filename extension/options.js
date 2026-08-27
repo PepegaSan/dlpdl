@@ -43,6 +43,9 @@ document.getElementById('save').addEventListener('click', async () => {
       patch[key] = el.value;
     }
   }
+  let base = String(patch.clipDirectBaseUrl || '').trim();
+  if (base && !base.endsWith('/')) base += '/';
+  if (base) patch.clipDirectBaseUrl = base;
   await saveSettings(patch);
   await initI18n(patch.uiLocale);
   applyI18n();

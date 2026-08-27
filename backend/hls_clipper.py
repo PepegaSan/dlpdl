@@ -8,10 +8,12 @@ Spec: docs/BEHAVIOR.md
 
 from __future__ import annotations
 
+import http.client
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -39,6 +41,8 @@ M3U8_RE = re.compile(r'\.m3u8(\?|$)', re.IGNORECASE)
 SEGMENT_FETCH_DELAY_SEC = 0.5
 SEGMENT_FETCH_RETRY_MAX = 6
 SEGMENT_FETCH_RETRY_BASE_SEC = 2.5
+SEGMENT_READ_CHUNK = 64 * 1024
+MIN_USABLE_SEGMENT_BYTES = 24 * 1024
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,33 @@ def url_looks_like_hls(url: Optional[str]) -> bool:
 def is_hls_url(url: Optional[str]) -> bool:
     """Public alias used by downloader."""
     return url_looks_like_hls(url)
+
+
+def _is_retryable_network_error(exc: BaseException) -> bool:
+    """CDN drops / truncated bodies (IncompleteRead) are transient, not a bad clip."""
+    if isinstance(exc, http.client.IncompleteRead):
+        return True
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError, BrokenPipeError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, 'reason', None)
+        if isinstance(reason, BaseException) and _is_retryable_network_error(reason):
+            return True
+        msg = str(exc).lower()
+        return any(
+            token in msg
+            for token in (
+                'timed out',
+                'timeout',
+                'incomplete',
+                'connection reset',
+                'broken pipe',
+                'temporarily unavailable',
+                'eof occurred',
+                'remote end closed',
+            )
+        )
+    return False
 
 
 def build_progress_event(
@@ -115,28 +146,104 @@ class HttpFetcher:
         if elapsed < self._segment_delay:
             time.sleep(self._segment_delay - elapsed)
 
-    def _retry_wait(self, attempt: int, exc: urllib.error.HTTPError) -> float:
-        retry_after = exc.headers.get('Retry-After') if exc.headers else None
-        if retry_after:
-            try:
-                return min(max(float(retry_after), 1.0), 60.0)
-            except ValueError:
-                pass
+    def _retry_wait(self, attempt: int, exc: Optional[urllib.error.HTTPError] = None) -> float:
+        if exc is not None:
+            retry_after = exc.headers.get('Retry-After') if exc.headers else None
+            if retry_after:
+                try:
+                    return min(max(float(retry_after), 1.0), 60.0)
+                except ValueError:
+                    pass
         return min(SEGMENT_FETCH_RETRY_BASE_SEC * (2 ** attempt), 45.0)
+
+    def _open(self, url: str, extra_headers: Optional[dict] = None):
+        headers = dict(self._headers)
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(url, headers=headers)
+        return urllib.request.urlopen(req, timeout=self._timeout)
+
+    def _read_body(self, resp) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = resp.read(SEGMENT_READ_CHUNK)
+            except http.client.IncompleteRead as inc:
+                if inc.partial:
+                    chunks.append(inc.partial)
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks)
+
+    def _resume_range(self, url: str, got: bytes, declared: Optional[int]) -> bytes:
+        """Append remaining bytes after a dropped connection. No-op if CDN ignores Range."""
+        data = got
+        for _ in range(3):
+            if declared is not None and len(data) >= declared:
+                return data
+            if not data:
+                return data
+            self._throttle()
+            try:
+                with self._open(url, {'Range': f'bytes={len(data)}-'}) as resp:
+                    extra = self._read_body(resp)
+                    status = getattr(resp, 'status', None) or resp.getcode()
+            except urllib.error.HTTPError as exc:
+                if exc.code in (416, 200):
+                    return data
+                raise
+            self._last_fetch_at = time.monotonic()
+            if not extra:
+                return data
+            if status == 206:
+                data += extra
+                continue
+            if len(extra) > len(data):
+                return extra
+            return data
+        return data
 
     def get_bytes(self, url: str) -> bytes:
         last_exc: Optional[BaseException] = None
+        best = b''
         for attempt in range(SEGMENT_FETCH_RETRY_MAX):
             self._throttle()
             try:
-                req = urllib.request.Request(url, headers=self._headers)
-                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                    data = resp.read()
+                with self._open(url) as resp:
+                    declared = None
+                    raw_len = resp.headers.get('Content-Length')
+                    if raw_len:
+                        try:
+                            declared = int(raw_len)
+                        except ValueError:
+                            declared = None
+                    data = self._read_body(resp)
                 self._last_fetch_at = time.monotonic()
-                return data
+                if declared is not None and 0 < len(data) < declared:
+                    try:
+                        data = self._resume_range(url, data, declared)
+                    except Exception as resume_exc:
+                        log.warning('range resume failed for %s: %s', url[:96], resume_exc)
+                if data and (declared is None or len(data) >= declared or _segment_payload_usable(data)):
+                    if declared is not None and len(data) < declared:
+                        log.warning(
+                            'CDN Content-Length lie (%d/%d) — keeping body for %s',
+                            len(data),
+                            declared,
+                            url[:96],
+                        )
+                    return data
+                if len(data) > len(best):
+                    best = data
+                last_exc = RuntimeError(
+                    f'IncompleteRead({len(data)} bytes read, '
+                    f'{(declared or 0) - len(data)} more expected)'
+                )
             except urllib.error.HTTPError as exc:
                 last_exc = exc
-                if exc.code not in (429, 502, 503) or attempt >= SEGMENT_FETCH_RETRY_MAX - 1:
+                if exc.code not in (429, 500, 502, 503, 504) or attempt >= SEGMENT_FETCH_RETRY_MAX - 1:
                     if exc.code == 429:
                         raise RuntimeError(
                             'CDN limitiert Anfragen (429) — 1–2 Minuten warten, '
@@ -153,12 +260,61 @@ class HttpFetcher:
                     SEGMENT_FETCH_RETRY_MAX,
                 )
                 time.sleep(wait)
+                continue
             except Exception as exc:
                 last_exc = exc
-                raise
+                partial = _incomplete_partial(exc)
+                if len(partial) > len(best):
+                    best = partial
+                if not _is_retryable_network_error(exc) or attempt >= SEGMENT_FETCH_RETRY_MAX - 1:
+                    if _segment_payload_usable(best):
+                        log.warning(
+                            'using truncated segment (%d bytes) for %s after %s',
+                            len(best),
+                            url[:96],
+                            exc,
+                        )
+                        return best
+                    raise
+            wait = self._retry_wait(attempt)
+            log.warning(
+                'truncated/dropped segment %s — retry in %.1fs (%d/%d): %s',
+                url[:96],
+                wait,
+                attempt + 1,
+                SEGMENT_FETCH_RETRY_MAX,
+                last_exc,
+            )
+            time.sleep(wait)
+        if _segment_payload_usable(best):
+            log.warning('using truncated segment (%d bytes) for %s', len(best), url[:96])
+            return best
         if last_exc:
             raise last_exc
         raise RuntimeError('segment fetch failed')
+
+
+def _incomplete_partial(exc: BaseException) -> bytes:
+    cur: Optional[BaseException] = exc
+    for _ in range(6):
+        if cur is None:
+            break
+        if isinstance(cur, http.client.IncompleteRead):
+            return bytes(cur.partial or b'')
+        partial = getattr(cur, 'partial', None)
+        if isinstance(partial, (bytes, bytearray)) and partial:
+            return bytes(partial)
+        nxt = getattr(cur, 'reason', None)
+        cur = nxt if isinstance(nxt, BaseException) else None
+    return b''
+
+
+def _segment_payload_usable(data: bytes) -> bool:
+    if not data or len(data) < MIN_USABLE_SEGMENT_BYTES:
+        return False
+    if b'ftyp' in data[:64] or b'moof' in data[:256]:
+        return True
+    return b'\x47' in data[:PREFIX_SCAN_BYTES]
 
 
 def align_transport_stream(payload: bytes) -> bytes:
@@ -177,6 +333,34 @@ def align_transport_stream(payload: bytes) -> bytes:
     return payload
 
 
+def resolve_hls_uri(base_url: str, ref: str) -> str:
+    """
+    Resolve a playlist/segment reference against the parent playlist URL.
+
+    Signed CDNs (e.g. Softvelum `.urlset/master.m3u8?t=…&s=…`) put the auth
+    query on the playlist. Relative child URIs rarely repeat it — plain
+    urljoin drops the query and subsequent fetches only get the first
+    cached segment (~6–10s) before 403s. Inherit the parent query when the
+    child has none (same-host only for absolute refs).
+    """
+    ref = (ref or '').strip()
+    if not ref:
+        return base_url
+    joined = urllib.parse.urljoin(base_url, ref)
+    base = urllib.parse.urlsplit(base_url)
+    ref_p = urllib.parse.urlsplit(ref)
+    out = urllib.parse.urlsplit(joined)
+    if not base.query:
+        return joined
+    if ref_p.query or out.query:
+        return joined
+    if ref_p.scheme and ref_p.netloc and ref_p.netloc.lower() != (base.netloc or '').lower():
+        return joined
+    return urllib.parse.urlunsplit(
+        (out.scheme, out.netloc, out.path, base.query, out.fragment),
+    )
+
+
 def resolve_master_playlist(text: str, base_url: str) -> Optional[str]:
     best_uri: Optional[str] = None
     best_bw = -1
@@ -189,7 +373,7 @@ def resolve_master_playlist(text: str, base_url: str) -> Optional[str]:
         elif stripped and not stripped.startswith('#'):
             if pending_bw is not None and pending_bw > best_bw:
                 best_bw = pending_bw
-                best_uri = urllib.parse.urljoin(base_url, stripped)
+                best_uri = resolve_hls_uri(base_url, stripped)
             pending_bw = None
     return best_uri
 
@@ -215,7 +399,7 @@ def parse_media_playlist(text: str, base_url: str) -> ParsedPlaylist:
                 MediaSegment(
                     timeline_start=timeline,
                     duration=duration,
-                    uri=urllib.parse.urljoin(base_url, stripped),
+                    uri=resolve_hls_uri(base_url, stripped),
                 ),
             )
             timeline += duration
@@ -456,6 +640,33 @@ def run_ffmpeg_with_progress(
     stderr = proc.stderr.read() if proc.stderr else ''
     proc.wait(timeout=5)
     return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, '', stderr)
+
+
+# libx264 + concat remux: one at a time so N jobs don't all freeze at "Encoding 83%".
+_FFMPEG_ENCODE_SLOTS = threading.Semaphore(1)
+
+
+def run_ffmpeg_serialized(
+    args: list[str],
+    *,
+    duration_sec: float,
+    on_progress: Optional[Callable[[float, str], None]] = None,
+    timeout: float = 1800,
+) -> subprocess.CompletedProcess:
+    acquired = _FFMPEG_ENCODE_SLOTS.acquire(blocking=False)
+    if not acquired:
+        if on_progress:
+            on_progress(0.0, 'wartet auf freien Encoder…')
+        _FFMPEG_ENCODE_SLOTS.acquire()
+    try:
+        return run_ffmpeg_with_progress(
+            args,
+            duration_sec=duration_sec,
+            on_progress=on_progress,
+            timeout=timeout,
+        )
+    finally:
+        _FFMPEG_ENCODE_SLOTS.release()
 
 
 _EMBED_REFERER_ROOTS = {
@@ -747,7 +958,7 @@ def rerender_for_editing(
     args.append(tmp)
 
     try:
-        proc = run_ffmpeg_with_progress(
+        proc = run_ffmpeg_serialized(
             args,
             duration_sec=duration,
             on_progress=on_progress,
@@ -957,7 +1168,13 @@ def clip_hls_ffmpeg_stream_copy(
     return True, 'ok (copy-ffmpeg)'
 
 
-def remux_concat_copy_only(concat_list_path: str, out_mp4: str) -> tuple[bool, str]:
+def remux_concat_copy_only(
+    concat_list_path: str,
+    out_mp4: str,
+    *,
+    duration_sec: float = 0.0,
+    on_progress: Optional[Callable[[float, str], None]] = None,
+) -> tuple[bool, str]:
     copy_args = [
         'ffmpeg', '-y', '-loglevel', 'error',
         '-fflags', '+genpts+discardcorrupt',
@@ -968,7 +1185,15 @@ def remux_concat_copy_only(concat_list_path: str, out_mp4: str) -> tuple[bool, s
         '-movflags', '+faststart',
         out_mp4,
     ]
-    proc = run_ffmpeg(copy_args)
+    try:
+        proc = run_ffmpeg_serialized(
+            copy_args,
+            duration_sec=duration_sec,
+            on_progress=on_progress,
+            timeout=1800,
+        )
+    except subprocess.TimeoutExpired:
+        return False, 'ffmpeg copy remux timeout (>30 min)'
     if proc.returncode != 0:
         err = (proc.stderr or '').strip()[:300]
         return False, f'ffmpeg copy remux failed: {err}'
@@ -994,9 +1219,17 @@ def remux_concat_demuxer(
     seek: float,
     duration: Optional[float],
     encode_mode: str = 'exact',
+    duration_sec: float = 0.0,
+    on_progress: Optional[Callable[[float, str], None]] = None,
 ) -> tuple[bool, str]:
+    progress_duration = duration_sec or (duration or 0.0)
     if duration is None:
-        ok, err = remux_concat_copy_only(concat_list_path, out_mp4)
+        ok, err = remux_concat_copy_only(
+            concat_list_path,
+            out_mp4,
+            duration_sec=progress_duration,
+            on_progress=on_progress,
+        )
         if ok:
             return True, err
         if encode_mode == 'preserve':
@@ -1010,7 +1243,15 @@ def remux_concat_demuxer(
             '-shortest',
             '-movflags', '+faststart', out_mp4,
         ]
-        proc = run_ffmpeg(encode_args)
+        try:
+            proc = run_ffmpeg_serialized(
+                encode_args,
+                duration_sec=progress_duration,
+                on_progress=on_progress,
+                timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            return False, 'ffmpeg concat timeout (>30 min)'
     elif encode_mode == 'preserve':
         return False, 'preserve mode cannot trim partial segments; use segment boundaries'
     else:
@@ -1031,7 +1272,15 @@ def remux_concat_demuxer(
             '-avoid_negative_ts', 'make_zero',
             '-movflags', '+faststart', out_mp4,
         ]
-        proc = run_ffmpeg(encode_args)
+        try:
+            proc = run_ffmpeg_serialized(
+                encode_args,
+                duration_sec=progress_duration or duration,
+                on_progress=on_progress,
+                timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            return False, 'ffmpeg concat timeout (>30 min)'
 
     if proc.returncode != 0:
         err = (proc.stderr or '').strip()[:300]
@@ -1106,12 +1355,26 @@ def clip_hls_preserve_copy(
         )
         if not list_path:
             return False, 'no segments downloaded'
-        if progress:
+        encode_start = 1.0 - ENCODE_SHARE_OF_PROGRESS
+        remux_duration = sum(max(seg.duration, 0.1) for seg in picked)
+
+        def remux_progress(frac: float, detail: str) -> None:
+            if not progress:
+                return
+            overall = encode_start + ENCODE_SHARE_OF_PROGRESS * max(0.0, min(frac, 1.0))
             progress(build_progress_event(
-                fraction=progress_base + progress_scale * (1.0 - ENCODE_SHARE_OF_PROGRESS),
-                msg='Remuxing (copy)…',
+                fraction=progress_base + progress_scale * overall,
+                msg=f'Remuxing (copy)… ({detail})',
             ))
-        ok, err = remux_concat_copy_only(list_path, output_mp4)
+
+        if progress:
+            remux_progress(0.0, 'start')
+        ok, err = remux_concat_copy_only(
+            list_path,
+            output_mp4,
+            duration_sec=remux_duration,
+            on_progress=remux_progress,
+        )
         if ok and progress:
             progress(build_progress_event(fraction=progress_base + progress_scale, msg='Done'))
         return ok, err
@@ -1169,11 +1432,22 @@ def clip_hls_segment_fallback(
             return False, 'no segments downloaded'
 
         clip_len = max(end_eff - start_sec, 1.0) if not full_span else max(parsed.duration, 1.0)
-        report(1.0 - ENCODE_SHARE_OF_PROGRESS, 'Encoding…', eta=clip_len * 0.45)
+        encode_start = 1.0 - ENCODE_SHARE_OF_PROGRESS
+        encode_duration = sum(max(seg.duration, 0.1) for seg in picked) or clip_len
+
+        def encode_progress(frac: float, detail: str) -> None:
+            report(
+                encode_start + ENCODE_SHARE_OF_PROGRESS * max(0.0, min(frac, 1.0)),
+                f'Encoding… ({detail})',
+            )
+
+        encode_progress(0.0, 'start')
 
         if full_span:
             ok, err = remux_concat_demuxer(
                 list_path, output_mp4, seek=0.0, duration=None, encode_mode=encode_mode,
+                duration_sec=encode_duration,
+                on_progress=encode_progress,
             )
         else:
             seek = max(0.0, start_sec - picked[0].timeline_start)
@@ -1183,6 +1457,8 @@ def clip_hls_segment_fallback(
                 seek=seek,
                 duration=end_eff - start_sec,
                 encode_mode=encode_mode,
+                duration_sec=clip_len,
+                on_progress=encode_progress,
             )
         if ok:
             report(1.0, 'Done')
@@ -1197,6 +1473,27 @@ def clip_hls_segment_fallback(
         return False, f'segment download failed: {exc}'
     finally:
         shutil.rmtree(parts_dir, ignore_errors=True)
+
+
+def _output_covers_expected(path: str, expected_sec: float, *, min_ratio: float = 0.85) -> bool:
+    """Reject truncated HLS downloads (e.g. only the first ~7s segment)."""
+    if expected_sec <= 0:
+        return True
+    # Short clips: keep the absolute tolerance used elsewhere.
+    if expected_sec <= 15:
+        return output_duration_acceptable(path, expected_sec)
+    actual = probe_duration_seconds(path)
+    if actual is None:
+        return True
+    if actual + DURATION_TOLERANCE_SEC < expected_sec * min_ratio:
+        log.warning(
+            'HLS output too short: %.2fs < %.0f%% of expected %.2fs',
+            actual,
+            min_ratio * 100,
+            expected_sec,
+        )
+        return False
+    return True
 
 
 def clip_hls_to_file(
@@ -1219,41 +1516,9 @@ def clip_hls_to_file(
 
     mode = encode_mode if encode_mode in ('preserve', 'exact') else 'preserve'
 
-    report(0.02, 'HLS: direct ffmpeg…')
-    if mode == 'preserve':
-        ok_direct, err_direct = clip_hls_ffmpeg_stream_copy(
-            playlist_url,
-            headers,
-            start_sec,
-            end_sec,
-            end_sec if end_sec != float('inf') else 1e7,
-            output_mp4,
-        )
-    else:
-        ok_direct, err_direct = clip_hls_ffmpeg_native(
-            playlist_url,
-            headers,
-            start_sec,
-            end_sec,
-            end_sec if end_sec != float('inf') else 1e7,
-            output_mp4,
-        )
-    if ok_direct and _output_usable(output_mp4):
-        if end_sec != float('inf'):
-            trim_media_to_duration(
-                output_mp4,
-                max(end_sec - start_sec, 0.1),
-                encode_mode=mode,
-            )
-        report(1.0, 'Done')
-        return True, err_direct
-    if ok_direct:
-        try:
-            os.remove(output_mp4)
-        except OSError:
-            pass
-    log.info('HLS direct ffmpeg did not produce output (%s), parsing playlist', err_direct)
-
+    # Resolve master → media playlist first so signed query params (t/s/e/…)
+    # are inherited onto the variant URL before ffmpeg/segment fetches.
+    report(0.02, 'HLS: loading playlist…')
     try:
         media_url, parsed, fetcher = resolve_hls_playlist(playlist_url, headers)
     except Exception as exc:
@@ -1281,22 +1546,56 @@ def clip_hls_to_file(
         )
 
     end_eff = end_sec if end_sec != float('inf') else parsed.duration
+    expected_span = max(end_eff - start_sec, 0.1) if end_eff != float('inf') else parsed.duration
+
+    report(0.04, f'HLS: ffmpeg ({len(parsed.segments)} segments, ~{parsed.duration:.0f}s)…')
+    if mode == 'preserve':
+        ok_direct, err_direct = clip_hls_ffmpeg_stream_copy(
+            media_url,
+            headers,
+            start_sec,
+            end_sec,
+            end_eff if end_eff != float('inf') else 1e7,
+            output_mp4,
+        )
+    else:
+        ok_direct, err_direct = clip_hls_ffmpeg_native(
+            media_url,
+            headers,
+            start_sec,
+            end_sec,
+            end_eff if end_eff != float('inf') else 1e7,
+            output_mp4,
+        )
+    if (
+        ok_direct
+        and _output_usable(output_mp4)
+        and _output_covers_expected(output_mp4, expected_span)
+    ):
+        if end_sec != float('inf'):
+            trim_media_to_duration(
+                output_mp4,
+                max(end_sec - start_sec, 0.1),
+                encode_mode=mode,
+            )
+        report(1.0, 'Done')
+        return True, err_direct
+    if ok_direct:
+        try:
+            os.remove(output_mp4)
+        except OSError:
+            pass
+        log.info(
+            'HLS direct ffmpeg rejected (%s), falling back to segments',
+            err_direct if not _output_usable(output_mp4) else 'output too short',
+        )
+
     if mode == 'preserve':
         picked = segments_for_window_preserve(parsed, start_sec, end_sec)
         if not picked:
             return False, 'no segments in time window'
         eff_start, eff_end = effective_preserve_window(picked)
-        report(0.05, f'HLS: stream copy (preserve, ~{eff_start:.1f}–{eff_end:.1f}s)…')
-        ok, err = clip_hls_ffmpeg_stream_copy(
-            media_url, headers, start_sec, end_sec, end_eff, output_mp4,
-        )
-        if ok:
-            expected = max(end_eff - start_sec, 0.1)
-            trim_media_to_duration(output_mp4, expected, encode_mode=mode)
-            report(1.0, 'Done')
-            return True, err
-        log.warning('HLS stream copy failed (%s), trying segment copy', err)
-        report(0.08, 'HLS: segment copy fallback…')
+        report(0.08, f'HLS: segment copy (preserve, ~{eff_start:.1f}–{eff_end:.1f}s)…')
         ok, err = clip_hls_preserve_copy(
             fetcher,
             picked,
@@ -1309,6 +1608,11 @@ def clip_hls_to_file(
         if ok:
             expected = max(eff_end - eff_start, 0.1)
             trim_media_to_duration(output_mp4, expected, encode_mode=mode)
+            if not _output_covers_expected(output_mp4, expected):
+                return False, (
+                    f'nur {probe_duration_seconds(output_mp4) or 0:.1f}s von '
+                    f'~{expected:.0f}s geladen — CDN-Token/Query prüfen, Video abspielen, erneut senden'
+                )
             report(1.0, 'Done')
         return ok, err
 
@@ -1320,31 +1624,9 @@ def clip_hls_to_file(
     expected_duration = None if full_span else max(end_eff - start_sec, 0.1)
 
     if not full_span:
-        report(0.05, 'HLS: cutting with ffmpeg…', eta=expected_duration * 0.6 if expected_duration else None)
-        ok, err = clip_hls_ffmpeg_native(
-            media_url, headers, start_sec, end_sec, end_eff, output_mp4,
-        )
-        if ok and output_duration_acceptable(output_mp4, expected_duration):
-            trim_media_to_duration(
-                output_mp4,
-                expected_duration,
-                encode_mode='exact',
-            )
-            report(1.0, 'Done')
-            return True, err
-        if ok:
-            try:
-                os.remove(output_mp4)
-            except OSError:
-                pass
-            log.warning('ffmpeg-hls duration check failed, using segment fallback')
-        else:
-            log.warning('ffmpeg-hls failed (%s), using segment fallback', err)
-
-    if not full_span:
         picked = segments_with_preroll(parsed, picked)
 
-    return clip_hls_segment_fallback(
+    ok, err = clip_hls_segment_fallback(
         fetcher,
         parsed,
         picked,
@@ -1358,6 +1640,12 @@ def clip_hls_to_file(
         progress_scale=progress_scale,
         encode_mode='exact',
     )
+    if ok and not _output_covers_expected(output_mp4, expected_span):
+        return False, (
+            f'nur {probe_duration_seconds(output_mp4) or 0:.1f}s von '
+            f'~{expected_span:.0f}s geladen — CDN-Token/Query prüfen, Video abspielen, erneut senden'
+        )
+    return ok, err
 
 
 def smart_clip_hls(

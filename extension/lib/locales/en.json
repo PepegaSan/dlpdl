@@ -34,7 +34,7 @@
   "popup.status.sent": "Sent — see progress/download in the web UI.",
   "popup.status.barShown": "Bar should be visible on the page",
   "popup.stream.cutOne": "Cut ({count})",
-  "popup.stream.cutOneTitle": "One marked range as a file",
+  "popup.stream.cutOneTitle": "Only checked clips, each as its own file",
   "popup.stream.merge": "Merge ({count})",
   "popup.stream.mergeTitle": "Merge all marked ranges into one file",
   "popup.stream.send": "Send",

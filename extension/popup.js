@@ -448,13 +448,16 @@ function renderStreams() {
     const btnGroup = document.createElement('div');
     btnGroup.className = 'stream-btns';
     if (hasCuts) {
-      const cut = document.createElement('button');
-      cut.type = 'button';
-      cut.className = 'stream-send';
-      cut.textContent = t('popup.stream.cutOne', { count: tabClips.length });
-      cut.title = t('popup.stream.cutOneTitle');
-      cut.addEventListener('click', () => sendStream(stream, true, cut, false));
-      btnGroup.appendChild(cut);
+      const selectedCount = selectedClips(tabClips).length;
+      if (selectedCount > 0) {
+        const cut = document.createElement('button');
+        cut.type = 'button';
+        cut.className = 'stream-send';
+        cut.textContent = t('popup.stream.cutOne', { count: selectedCount });
+        cut.title = t('popup.stream.cutOneTitle');
+        cut.addEventListener('click', () => sendStream(stream, true, cut, false));
+        btnGroup.appendChild(cut);
+      }
 
       if (mergeCount >= 2) {
         const merge = document.createElement('button');
@@ -500,6 +503,7 @@ async function refreshStreams() {
   }
   const cbRes = await sendBg('getClipClipboard');
   updateClipboardUi(cbRes?.clipboard || null);
+  renderClips();
   renderStreams();
   updateButtons();
 }
@@ -531,10 +535,10 @@ function renderClips() {
 }
 
 function updateButtons() {
-  const hasClips = clips.length > 0;
   const hasAnyClips = activeClipSource().length > 0;
-  const mergeCount = clipsForMerge(clips).length;
-  btnQueueEach.disabled = !pageUrl || !hasClips;
+  const selectedCount = selectedClips(activeClipSource()).length;
+  const mergeCount = clipsForMerge(activeClipSource()).length;
+  btnQueueEach.disabled = !pageUrl || selectedCount < 1;
   btnQueueMerge.disabled = !pageUrl || mergeCount < 2;
   if (btnCopyClips) {
     btnCopyClips.disabled = !hasAnyClips;
