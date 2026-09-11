@@ -1,7 +1,7 @@
 import { applyI18n, initI18n, t } from './lib/i18n.js';
 import { clipsForMerge, selectedClips } from './lib/jobs-client.js';
 import { openClipDirectUi } from './lib/open-ui.js';
-import { normalizeClockTime } from './lib/format-time.js';
+import { normalizeClockTime, parseClockTime } from './lib/format-time.js';
 import { loadSettings, saveClipDraft } from './lib/storage.js';
 const statusEl = document.getElementById('status');
 const pageUrlEl = document.getElementById('pageUrl');
@@ -350,7 +350,7 @@ async function sendStream(stream, withClips, button, mergeClips = false) {
 
   let clipPayload = [];
   if (withClips) {
-    const source = activeClipSource();
+    const source = await clipsReadyToSend();
     clipPayload = mergeClips ? clipsForMerge(source) : selectedClips(source);
     if (mergeClips && clipPayload.length < 2) {
       setStatus('popup.status.mergeNeedTwo');
@@ -639,6 +639,44 @@ btnShowBar?.addEventListener('click', () => {
 btnQueueEach.addEventListener('click', () => sendQueue(false));
 btnQueueMerge.addEventListener('click', () => sendQueue(true));
 
+function applyVisibleTimes(source) {
+  const next = (source || []).map((c) => ({ ...c }));
+  for (const list of [clipListEl, streamClipListEl]) {
+    if (!list) continue;
+    list.querySelectorAll(':scope > li').forEach((li, index) => {
+      const inputs = li.querySelectorAll('.clip-time-input');
+      const orig = source[index];
+      if (inputs.length < 2 || !orig) return;
+      const start = normalizeClockTime(inputs[0].value);
+      const end = normalizeClockTime(inputs[1].value);
+      if (!start || !end || parseClockTime(end) <= parseClockTime(start)) return;
+      if (start === orig.start && end === orig.end) return;
+      next[index] = { ...next[index], start, end };
+    });
+  }
+  return next;
+}
+
+async function persistTimeEdits(updated, previous) {
+  const tasks = [];
+  updated.forEach((clip, index) => {
+    const prev = previous[index];
+    if (!prev || (clip.start === prev.start && clip.end === prev.end)) return;
+    tasks.push(updateTabClipTimes(index, clip.start, clip.end));
+  });
+  if (tasks.length) await Promise.all(tasks);
+}
+
+/** What the inputs show right now — not a stale copy from before the last blur. */
+async function clipsReadyToSend() {
+  const previous = activeClipSource().map((c) => ({ ...c }));
+  const updated = applyVisibleTimes(previous);
+  await persistTimeEdits(updated, previous);
+  clips = updated.map((c) => ({ ...c }));
+  tabClips = clips.map((c) => ({ ...c }));
+  return clips;
+}
+
 async function sendQueue(mergeClips) {
   const tabId = await getActiveTabId();
   const [clipsRes, state] = await Promise.all([
@@ -652,7 +690,8 @@ async function sendQueue(mergeClips) {
     clips = [...state.clips];
   }
   if (state?.pageUrl) pageUrl = state.pageUrl;
-  const payload = mergeClips ? clipsForMerge(activeClipSource()) : selectedClips(activeClipSource());
+  const source = await clipsReadyToSend();
+  const payload = mergeClips ? clipsForMerge(source) : selectedClips(source);
   if (!pageUrl || !payload.length) {
     setStatus('popup.status.noClips');
     return;

@@ -84,7 +84,7 @@
   "ui.status.running": "Running…",
   "ui.status.ready": "Ready",
   "ui.status.error": "Error",
-  "ui.status.errorUnknown": "Unknown error — restart Docker; for turboviplay: play video in tab, then send again",
+  "ui.status.errorUnknown": "Unknown error — restart Docker. Play the video on the original site, then send again from the extension.",
   "ui.saveToPc": "Save to PC",
   "ui.downloadFailed": "Download failed ({code}). Reload the page; for large HLS files wait until Ready.",
   "ui.fileMissing": "File missing on server — re-queue the job or check Docker.",

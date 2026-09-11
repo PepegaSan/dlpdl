@@ -553,14 +553,40 @@ function updateOverlayUiNow() {
   }
 }
 
+function sendFromBar() {
+  const statusEl = overlayRoot?.querySelector('[data-role="status"]');
+  if (statusEl) statusEl.textContent = cdT('bar.status.sending');
+  return chrome.runtime.sendMessage({
+    action: 'queueFromPage',
+    pageUrl: submitUrlForHref(location.href),
+  }).then((res) => {
+    if (res?.ok) {
+      if (statusEl) statusEl.textContent = cdT('bar.status.sent');
+      return res;
+    }
+    const err = res?.errorKey ? cdT(res.errorKey) : (res?.error || 'error');
+    if (statusEl) statusEl.textContent = cdT('bar.status.sendFailed', { error: err });
+    return res;
+  }).catch((err) => {
+    if (statusEl) {
+      statusEl.textContent = cdT('bar.status.sendFailed', {
+        error: err?.message || String(err),
+      });
+    }
+    return { ok: false, error: String(err?.message || err) };
+  });
+}
+
 function applyBarI18n(bar) {
   const start = bar.querySelector('[data-action="start"]');
   const end = bar.querySelector('[data-action="end"]');
   const clear = bar.querySelector('[data-action="clear"]');
+  const send = bar.querySelector('[data-action="send"]');
   const hide = bar.querySelector('[data-action="hide"]');
   if (start) start.textContent = cdT('bar.start');
   if (end) end.textContent = cdT('bar.end');
   if (clear) clear.textContent = cdT('bar.cancel');
+  if (send) send.textContent = cdT('bar.send');
   if (hide) hide.title = cdT('bar.hideTitle');
 }
 
@@ -730,6 +756,7 @@ function ensureOverlay() {
     <button type="button" class="clip-direct-primary" data-action="start"></button>
     <button type="button" data-action="end" disabled></button>
     <button type="button" data-action="clear" hidden></button>
+    <button type="button" data-action="send"></button>
     <span class="clip-direct-status" data-role="status"></span>
     <button type="button" class="clip-direct-hide" data-action="hide" title="">✕</button>
   `;
@@ -765,6 +792,8 @@ function ensureOverlay() {
   bindBarButton('[data-action="clear"]', () => {
     doClearPending().catch(() => updateOverlayUiNow());
   });
+
+  bindBarButton('[data-action="send"]', () => sendFromBar());
 
   bindBarButton('[data-action="hide"]', () => {
     sessionBarHidden = true;

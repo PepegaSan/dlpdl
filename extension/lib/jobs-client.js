@@ -37,7 +37,7 @@ function baseFields(settings) {
     save_target: settings.saveTarget || 'browser',
     folder: settings.saveTarget === 'nas' ? settings.folder : '',
     clip_encode_mode: mode,
-    post_render: settings.postRender === true,
+    post_render: settings.postRender === true || settings.postRender === 'true',
   };
 }
 
@@ -67,10 +67,24 @@ export function buildPageJobPayload(settings, pageUrl, clips, mergeClips) {
   const valid = mergeClips ? clipsForMerge(clips) : selectedClips(clips);
   return {
     url: pageUrl,
+    page_url: htmlPageUrl(pageUrl),
     ytdl_options_overrides: '',
     ...baseFields(settings),
     ...clipFields(valid, mergeClips),
   };
+}
+
+function htmlPageUrl(url) {
+  if (!url || isHlsPlaylistUrl(url)) return '';
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    if (path.endsWith('.m3u8') || path.includes('/hls2') || path.includes('/hls/')) {
+      return '';
+    }
+  } catch {
+    return '';
+  }
+  return url;
 }
 
 function streamOverrides(stream, pageUrl, tabUrl, tabCookies = '') {
@@ -93,14 +107,17 @@ export function buildStreamJobPayload(
   mergeClips = false,
   tabUrl = '',
   tabCookies = '',
+  browserFetch = false,
 ) {
   const valid = mergeClips ? clipsForMerge(clips) : selectedClips(clips);
   const overrides = streamOverrides(stream, pageUrl, tabUrl, tabCookies);
   const body = {
     url: stream.url,
+    page_url: htmlPageUrl(pageUrl) || htmlPageUrl(tabUrl),
     ytdl_options_overrides: Object.keys(overrides).length
       ? JSON.stringify(overrides)
       : '',
+    browser_fetch: !!browserFetch,
     ...baseFields(settings),
   };
   if (!valid.length) {

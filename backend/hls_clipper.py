@@ -688,9 +688,86 @@ def normalize_referer_url(referer: str) -> str:
         return referer
 
 
+def _header_value(headers: Optional[dict], name: str) -> str:
+    if not headers:
+        return ''
+    want = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == want:
+            return str(value or '').strip()
+    return ''
+
+
+def _url_hostname(url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(url).hostname or '').lower()
+    except Exception:
+        return ''
+
+
+def _hosts_related(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return a.endswith(f'.{b}') or b.endswith(f'.{a}')
+
+
+def _looks_like_media_url(url: str) -> bool:
+    low = (url or '').lower()
+    path = urllib.parse.urlparse(url).path.lower() if url else ''
+    return (
+        '.m3u8' in low
+        or '/hls2' in path
+        or path.endswith('.mp4')
+        or path.endswith('.ts')
+        or path.endswith('.m4s')
+    )
+
+
+def apply_page_referer(
+    headers: Optional[dict],
+    media_url: str,
+    page_url: str,
+) -> dict:
+    """Prefer the HTML page as Referer when the media host is a separate CDN."""
+    out = dict(headers or {})
+    page = (page_url or '').strip()
+    if not page or _looks_like_media_url(page):
+        return out
+    media_host = _url_hostname(media_url)
+    page_host = _url_hostname(page)
+    if not media_host or not page_host or _hosts_related(media_host, page_host):
+        return out
+    ref_host = _url_hostname(_header_value(out, 'Referer'))
+    if ref_host and any(
+        hint in ref_host
+        for hint in (
+            'turboviplay',
+            'turbosplayer',
+            'emturbovid',
+            'dood.video',
+            'doodstream',
+            'cloudatacdn',
+        )
+    ):
+        return out
+    if not ref_host or _hosts_related(ref_host, media_host):
+        out['Referer'] = page
+        try:
+            parsed = urllib.parse.urlparse(page)
+            if parsed.scheme and parsed.netloc:
+                out['Origin'] = f'{parsed.scheme}://{parsed.netloc}'
+        except Exception:
+            pass
+    return out
+
+
 def normalize_http_headers(headers: Optional[dict]) -> dict:
     merged = dict(headers or {})
     merged.setdefault('User-Agent', DEFAULT_USER_AGENT)
+    merged.setdefault('Accept', '*/*')
+    merged.setdefault('Accept-Language', 'en-US,en;q=0.9')
     for key in list(merged.keys()):
         if key.lower() == 'referer' and merged[key]:
             merged[key] = normalize_referer_url(str(merged[key]))
@@ -702,6 +779,29 @@ def normalize_http_headers(headers: Optional[dict]) -> dict:
                 pass
             break
     return merged
+
+
+def _format_playlist_error(exc: BaseException, headers: Optional[dict]) -> str:
+    has_cookie = _cookie_header_present(headers)
+    has_referer = bool(_header_value(headers, 'Referer'))
+    code = getattr(exc, 'code', None)
+    detail = str(exc)
+    if code == 403:
+        if not has_cookie or not has_referer:
+            return (
+                f'{detail} — Referer/Cookies missing on the server. '
+                'Play the video on the original site, reload the extension, '
+                'then send again (do not open the .m3u8 URL as its own tab).'
+            )
+        return (
+            f'{detail} — CDN rejected the server request (headers were sent). '
+            'Play on the original page and send immediately via the extension. '
+            'If Clip-Direct runs on the NAS, the CDN may see a different IP '
+            'than the browser — use Docker on the PC (http://localhost:8090/).'
+        )
+    return (
+        f'{detail} — play the video on the original page, then send again'
+    )
 
 
 class _BlockCrossHostRedirect(urllib.request.HTTPRedirectHandler):
@@ -1062,6 +1162,126 @@ def trim_media_to_duration(
     return False, err
 
 
+def clip_local_media_window(
+    src_path: str,
+    dest_path: str,
+    start_in_file: float,
+    duration_sec: float,
+    *,
+    on_progress: Optional[Callable[[float, str], None]] = None,
+) -> tuple[bool, str]:
+    """
+    Frame-accurate trim of a remuxed local file.
+
+    Browser HLS downloads whole segments. File t=0 is the first picked
+    segment, not the playlist clock. start_in_file is clip_start minus
+    that first-segment timeline.
+    """
+    if not os.path.isfile(src_path):
+        return False, 'exact trim: missing remux'
+    seek = max(0.0, float(start_in_file))
+    dur = max(0.1, float(duration_sec))
+    actual = probe_duration_seconds(src_path)
+    if (
+        actual is not None
+        and seek <= 0.05
+        and actual <= dur + DURATION_TOLERANCE_SEC
+    ):
+        if dest_path != src_path:
+            shutil.copy2(src_path, dest_path)
+        return True, 'ok (already exact)'
+
+    seek_s = f'{seek:.3f}'
+    dur_s = f'{dur:.3f}'
+    args = [
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-fflags', '+genpts+discardcorrupt',
+        '-i', src_path,
+        '-vf', f'trim=start={seek_s}:duration={dur_s},setpts=PTS-STARTPTS',
+        '-af', (
+            f'atrim=start={seek_s}:duration={dur_s},asetpts=PTS-STARTPTS,'
+            'aresample=async=1:first_pts=0'
+        ),
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-c:a', 'aac',
+        '-avoid_negative_ts', 'make_zero',
+        '-movflags', '+faststart',
+        dest_path,
+    ]
+    try:
+        proc = run_ffmpeg_serialized(
+            args,
+            duration_sec=dur,
+            on_progress=on_progress,
+            timeout=1800,
+        )
+    except subprocess.TimeoutExpired:
+        return False, 'exact trim timeout (>30 min)'
+    if proc.returncode != 0 or not os.path.isfile(dest_path) or os.path.getsize(dest_path) < 4096:
+        err = (proc.stderr or '').strip()[:300]
+        if os.path.exists(dest_path):
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+        return False, f'exact trim failed: {err}'
+    log.info(
+        'exact trim %s: file_ss=%.3f dur=%.3f (src was %s)',
+        dest_path,
+        seek,
+        dur,
+        f'{actual:.2f}s' if actual is not None else 'unknown',
+    )
+    return True, 'ok (exact-trim)'
+
+
+def concat_local_mp4s(paths: list[str], dest: str) -> tuple[bool, str]:
+    """Concatenate already-remuxed local MP4s with stream copy."""
+    usable = [p for p in paths if p and os.path.isfile(p) and os.path.getsize(p) > 4096]
+    if not usable:
+        return False, 'concat: no parts'
+    if len(usable) == 1:
+        if os.path.abspath(usable[0]) != os.path.abspath(dest):
+            shutil.copy2(usable[0], dest)
+        return True, 'ok (one part)'
+    list_path = f'{dest}.concat.txt'
+    with open(list_path, 'w', encoding='utf-8') as fh:
+        for path in usable:
+            escaped = path.replace('\\', '/').replace("'", "'\\''")
+            fh.write(f"file '{escaped}'\n")
+    args = [
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-f', 'concat', '-safe', '0', '-i', list_path,
+        '-c', 'copy',
+        '-avoid_negative_ts', 'make_zero',
+        '-movflags', '+faststart',
+        dest,
+    ]
+    try:
+        proc = run_ffmpeg(args)
+        if proc.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) >= 4096:
+            return True, 'ok (concat copy)'
+        err = (proc.stderr or '').strip()[:300]
+        retry = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-f', 'concat', '-safe', '0', '-i', list_path,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            dest,
+        ]
+        proc = run_ffmpeg(retry)
+        if proc.returncode != 0 or not os.path.isfile(dest) or os.path.getsize(dest) < 4096:
+            err2 = (proc.stderr or '').strip()[:300]
+            return False, f'concat failed: {err2 or err}'
+        return True, 'ok (concat encode)'
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+
+
 def clip_hls_ffmpeg_native(
     media_url: str,
     headers: Optional[dict],
@@ -1166,6 +1386,49 @@ def clip_hls_ffmpeg_stream_copy(
     if not os.path.isfile(output_mp4) or os.path.getsize(output_mp4) == 0:
         return False, 'ffmpeg-copy: no output'
     return True, 'ok (copy-ffmpeg)'
+
+
+def remux_browser_payload(src_path: str, out_mp4: str) -> tuple[bool, str]:
+    """Remux a browser-downloaded MPEG-TS (or MP4) blob to a playable MP4."""
+    if not src_path or not os.path.isfile(src_path):
+        return False, 'browser ingest: empty payload'
+    head = b''
+    with open(src_path, 'rb') as fh:
+        head = fh.read(64)
+    looks_mp4 = b'ftyp' in head[:64]
+    args = [
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-fflags', '+genpts+discardcorrupt',
+    ]
+    if not looks_mp4:
+        args.extend(['-f', 'mpegts'])
+    args.extend([
+        '-i', src_path,
+        '-map', '0:v:0?', '-map', '0:a:0?',
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-avoid_negative_ts', 'make_zero',
+        '-movflags', '+faststart',
+        out_mp4,
+    ])
+    proc = run_ffmpeg(args)
+    if proc.returncode != 0:
+        retry = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-fflags', '+genpts+discardcorrupt',
+            '-i', src_path,
+            '-c', 'copy',
+            '-avoid_negative_ts', 'make_zero',
+            '-movflags', '+faststart',
+            out_mp4,
+        ]
+        proc = run_ffmpeg(retry)
+        if proc.returncode != 0:
+            err = (proc.stderr or '').strip()[:300]
+            return False, f'browser remux failed: {err}'
+    if not os.path.isfile(out_mp4) or os.path.getsize(out_mp4) < 4096:
+        return False, 'browser remux produced no output'
+    return True, 'ok (browser-hls)'
 
 
 def remux_concat_copy_only(
@@ -1522,11 +1785,7 @@ def clip_hls_to_file(
     try:
         media_url, parsed, fetcher = resolve_hls_playlist(playlist_url, headers)
     except Exception as exc:
-        hint = (
-            'CDN blockiert ohne Browser-Cookies — Video im Tab 20s abspielen, '
-            'dann erneut senden'
-        )
-        return False, f'{exc} ({hint})'
+        return False, _format_playlist_error(exc, headers)
 
     if parsed.encrypted:
         return False, 'encrypted HLS (EXT-X-KEY) is not supported'

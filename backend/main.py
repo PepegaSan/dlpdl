@@ -114,6 +114,10 @@ def _job_spec_from_post(post: dict) -> JobSpec:
     post_render = _as_bool(post.get('post_render', False))
 
     page_title = sanitize_title((post.get('page_title') or '').strip())
+    page_url = (post.get('page_url') or '').strip()
+    if page_url and not page_url.lower().startswith(('http://', 'https://')):
+        page_url = ''
+    page_url = page_url[:2000]
     clip_index = _optional_positive_int(post.get('clip_index'), 'clip_index')
     clip_count = _optional_positive_int(post.get('clip_count'), 'clip_count')
     if merge_clips and clip_ranges and clip_count is None:
@@ -133,6 +137,7 @@ def _job_spec_from_post(post: dict) -> JobSpec:
         ytdl_opts=overrides,
         title=page_title or url[:120],
         page_title=page_title,
+        page_url=page_url,
         clip_index=clip_index,
         clip_count=clip_count,
     )
@@ -150,7 +155,8 @@ async def api_create_job(request: web.Request) -> web.Response:
 
     clips_raw = post.get('clips')
     merge_clips = bool(post.get('merge_clips', False))
-    if clips_raw and not merge_clips and len(parse_clips_list(clips_raw)) > 1:
+    browser_fetch = _as_bool(post.get('browser_fetch'))
+    if clips_raw and not merge_clips and len(parse_clips_list(clips_raw)) > 1 and not browser_fetch:
         ids = []
         ranges = parse_clips_list(clips_raw)
         total = len(ranges)
@@ -167,7 +173,7 @@ async def api_create_job(request: web.Request) -> web.Response:
             ids.append(runner.create_job(_job_spec_from_post(single)))
         return web.json_response({'ids': ids, 'status': 'pending'})
 
-    job_id = runner.create_job(spec)
+    job_id = runner.create_waiting_job(spec) if browser_fetch else runner.create_job(spec)
     return web.json_response({'id': job_id, 'status': 'pending'})
 
 
@@ -186,6 +192,66 @@ async def api_delete_job(request: web.Request) -> web.Response:
     if not runner.delete_job(request.match_info['id']):
         raise web.HTTPNotFound()
     return web.json_response({'ok': True})
+
+
+async def api_job_progress(request: web.Request) -> web.Response:
+    try:
+        post = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({'error': 'invalid json'}, status=400)
+    job_id = request.match_info['id']
+    msg = str(post.get('msg') or 'Browser download…')
+    try:
+        progress = float(post.get('progress') or 0)
+    except (TypeError, ValueError):
+        progress = 0.0
+    if not runner.update_progress(job_id, msg, progress):
+        raise web.HTTPNotFound()
+    return web.json_response({'ok': True})
+
+
+async def api_job_fail(request: web.Request) -> web.Response:
+    try:
+        post = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({'error': 'invalid json'}, status=400)
+    job_id = request.match_info['id']
+    detail = str(post.get('error') or post.get('msg') or 'Browser download failed')
+    if not runner.fail_job(job_id, detail):
+        raise web.HTTPNotFound()
+    return web.json_response({'ok': True})
+
+
+async def api_job_ingest(request: web.Request) -> web.Response:
+    job_id = request.match_info['id']
+    payload = await request.read()
+    timeline_start = None
+    raw_tl = request.query.get('timeline_start')
+    if raw_tl not in (None, ''):
+        try:
+            timeline_start = float(raw_tl)
+        except (TypeError, ValueError):
+            timeline_start = None
+    parts: list[tuple[float, int]] = []
+    for chunk in (request.query.get('parts') or '').split(';'):
+        piece = chunk.strip()
+        if not piece or ':' not in piece:
+            continue
+        tl_s, _, len_s = piece.partition(':')
+        try:
+            parts.append((float(tl_s), int(len_s)))
+        except (TypeError, ValueError):
+            continue
+    ok, detail = runner.ingest_browser_media(
+        job_id,
+        payload,
+        timeline_start=timeline_start,
+        parts=parts or None,
+    )
+    if not ok:
+        status = 404 if detail == 'unknown job' else 400
+        return web.json_response({'error': detail}, status=status)
+    return web.json_response({'ok': True, 'msg': detail})
 
 
 async def api_download_file(request: web.Request) -> web.Response:
@@ -232,11 +298,14 @@ async def serve_ui_locale(request: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
-    app = web.Application(middlewares=[cors_middleware])
+    app = web.Application(middlewares=[cors_middleware], client_max_size=2 * 1024 * 1024 * 1024)
     app.router.add_post('/api/jobs', api_create_job)
     app.router.add_get('/api/jobs', api_list_jobs)
     app.router.add_get('/api/jobs/{id}', api_get_job)
     app.router.add_get('/api/jobs/{id}/file', api_download_file)
+    app.router.add_post('/api/jobs/{id}/progress', api_job_progress)
+    app.router.add_post('/api/jobs/{id}/fail', api_job_fail)
+    app.router.add_post('/api/jobs/{id}/ingest', api_job_ingest)
     app.router.add_delete('/api/jobs/{id}', api_delete_job)
     app.router.add_get('/', serve_index)
     app.router.add_get('/index.html', serve_index)

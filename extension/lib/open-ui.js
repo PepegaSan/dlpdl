@@ -17,20 +17,23 @@ export function clipDirectUiUrl(baseUrl) {
  * Focus an existing tab for this Clip-Direct host or open a new one.
  * @param {string} baseUrl
  */
-export async function openClipDirectUi(baseUrl) {
+export async function openClipDirectUi(baseUrl, opts = {}) {
   const uiUrl = clipDirectUiUrl(baseUrl);
   const originPrefix = uiUrl.replace(/\/+$/, '');
+  const background = opts.background === true;
   const tabs = await chrome.tabs.query({});
   const existing = tabs.find(
     (t) => typeof t.url === 'string' && t.url.startsWith(originPrefix),
   );
   if (existing?.id != null) {
-    await chrome.tabs.update(existing.id, { active: true });
-    if (existing.windowId != null) {
-      await chrome.windows.update(existing.windowId, { focused: true });
+    if (!background) {
+      await chrome.tabs.update(existing.id, { active: true });
+      if (existing.windowId != null) {
+        await chrome.windows.update(existing.windowId, { focused: true });
+      }
     }
     return { reused: true, url: uiUrl };
   }
-  await chrome.tabs.create({ url: uiUrl });
+  await chrome.tabs.create({ url: uiUrl, active: !background });
   return { reused: false, url: uiUrl };
 }

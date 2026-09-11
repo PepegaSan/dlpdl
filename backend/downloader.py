@@ -25,11 +25,15 @@ import yt_dlp
 from .filename import allocate_unique_stem, build_output_stem
 from .hls_clipper import (
     DEFAULT_USER_AGENT,
+    apply_page_referer,
+    clip_local_media_window,
+    concat_local_mp4s,
     ffmpeg_header_args,
     ffmpeg_http_input_extras,
     finalize_mp4_for_editor,
     normalize_http_headers,
     probe_progressive_media_url,
+    remux_browser_payload,
     rerender_for_editing,
     run_ffmpeg_with_progress,
     trim_media_to_duration,
@@ -68,6 +72,7 @@ class JobSpec:
     ytdl_opts: dict = field(default_factory=dict)
     title: str = ''
     page_title: str = ''
+    page_url: str = ''
     clip_index: Optional[int] = None
     clip_count: Optional[int] = None
 
@@ -141,6 +146,276 @@ class JobRunner:
         t = threading.Thread(target=self._run_job, args=(job_id,), daemon=True)
         t.start()
         return job_id
+
+    def create_waiting_job(self, spec: JobSpec) -> str:
+        """Job waits for the extension to POST the browser-downloaded media."""
+        job_id = str(uuid.uuid4())[:12]
+        state = JobState(
+            id=job_id,
+            spec=spec,
+            status='running',
+            msg='Browser download…',
+            progress=0.02,
+        )
+        with self._lock:
+            self._jobs[job_id] = state
+        return job_id
+
+    def update_progress(self, job_id: str, msg: str, progress: float) -> bool:
+        with self._lock:
+            j = self._jobs.get(job_id)
+            if not j or j.status not in ('pending', 'running'):
+                return False
+        self._update(
+            job_id,
+            status='running',
+            msg=(msg or 'Browser download…')[:200],
+            progress=max(0.0, min(1.0, float(progress))),
+        )
+        return True
+
+    def fail_job(self, job_id: str, message: str) -> bool:
+        with self._lock:
+            j = self._jobs.get(job_id)
+            if not j or j.status == 'ready':
+                return False
+        detail = (message or 'Browser download failed').strip()
+        self._update(job_id, status='error', error=detail, msg=detail)
+        return True
+
+    def _exact_trim_local(
+        self,
+        job_id: str,
+        src_mp4: str,
+        clip_start: float,
+        clip_end: float,
+        timeline_start: Optional[float],
+        progress_base: float = 0.91,
+    ) -> tuple[bool, str]:
+        if timeline_start is None:
+            file_ss = 0.0
+        else:
+            file_ss = max(0.0, float(clip_start) - float(timeline_start))
+        clip_dur = max(0.1, float(clip_end) - float(clip_start))
+
+        def _trim_progress(frac: float, info: str) -> None:
+            self._update(
+                job_id,
+                status='running',
+                msg=f'Exakter Schnitt… ({info})',
+                progress=progress_base + 0.02 * max(0.0, min(frac, 1.0)),
+            )
+
+        self._update(job_id, status='running', msg='Exakter Schnitt…', progress=progress_base)
+        exact_tmp = f'{src_mp4}.exact.mp4'
+        ok_t, trim_detail = clip_local_media_window(
+            src_mp4,
+            exact_tmp,
+            file_ss,
+            clip_dur,
+            on_progress=_trim_progress,
+        )
+        if not ok_t:
+            return False, trim_detail
+        os.replace(exact_tmp, src_mp4)
+        return True, trim_detail
+
+    def _maybe_exact_trim_browser(
+        self,
+        job_id: str,
+        spec: JobSpec,
+        out_mp4: str,
+        timeline_start: Optional[float],
+        detail: str,
+    ) -> tuple[bool, str]:
+        if spec.clip_encode_mode != 'exact':
+            return True, detail
+        start = spec.clip_start
+        end = spec.clip_end
+        if (start is None or end is None) and len(spec.clip_ranges) == 1:
+            start, end = spec.clip_ranges[0]
+        if start is None or end is None or end == float('inf') or end <= start:
+            return True, detail
+        ok_t, trim_detail = self._exact_trim_local(
+            job_id, out_mp4, float(start), float(end), timeline_start,
+        )
+        if not ok_t:
+            return False, trim_detail
+        return True, f'{detail} + {trim_detail}'
+
+    def _ingest_browser_parts(
+        self,
+        job_id: str,
+        spec: JobSpec,
+        payload: bytes,
+        part_specs: list[tuple[float, int]],
+        job_tmp: str,
+        out_mp4: str,
+    ) -> tuple[bool, str]:
+        expected = sum(n for _tl, n in part_specs)
+        if expected > len(payload):
+            return False, 'browser merge parts larger than payload'
+        offset = 0
+        remuxed: list[str] = []
+        details: list[str] = []
+        ranges = list(spec.clip_ranges or [])
+        total = len(part_specs)
+        for i, (tl, nbytes) in enumerate(part_specs):
+            chunk = payload[offset:offset + nbytes]
+            offset += nbytes
+            if len(chunk) < 4096:
+                return False, f'merge part {i + 1} empty'
+            raw_i = os.path.join(job_tmp, f'part_{i:03d}.bin')
+            mp4_i = os.path.join(job_tmp, f'part_{i:03d}.mp4')
+            with open(raw_i, 'wb') as fh:
+                fh.write(chunk)
+            self._update(
+                job_id,
+                status='running',
+                msg=f'Remux Teil {i + 1}/{total}…',
+                progress=0.90 + 0.02 * (i / max(total, 1)),
+            )
+            ok, detail = remux_browser_payload(raw_i, mp4_i)
+            try:
+                os.remove(raw_i)
+            except OSError:
+                pass
+            if not ok:
+                return False, f'Teil {i + 1}: {detail}'
+            if (
+                spec.clip_encode_mode == 'exact'
+                and i < len(ranges)
+                and ranges[i][1] != float('inf')
+                and ranges[i][1] > ranges[i][0]
+            ):
+                ok_t, trim_detail = self._exact_trim_local(
+                    job_id,
+                    mp4_i,
+                    float(ranges[i][0]),
+                    float(ranges[i][1]),
+                    float(tl),
+                    progress_base=0.91 + 0.02 * (i / max(total, 1)),
+                )
+                if not ok_t:
+                    return False, f'Teil {i + 1}: {trim_detail}'
+                detail = f'{detail} + {trim_detail}'
+            remuxed.append(mp4_i)
+            details.append(detail)
+
+        self._update(job_id, status='running', msg=f'Merge {total} Teile…', progress=0.94)
+        ok, concat_detail = concat_local_mp4s(remuxed, out_mp4)
+        if not ok:
+            return False, concat_detail
+        return True, f'{concat_detail}; {"; ".join(details)}'
+
+    def ingest_browser_media(
+        self,
+        job_id: str,
+        payload: bytes,
+        *,
+        timeline_start: Optional[float] = None,
+        parts: Optional[list[tuple[float, int]]] = None,
+    ) -> tuple[bool, str]:
+        with self._lock:
+            state = self._jobs.get(job_id)
+        if not state:
+            return False, 'unknown job'
+        if state.status == 'ready':
+            return False, 'job already finished'
+        if not payload or len(payload) < 4096:
+            self.fail_job(job_id, 'Browser sent an empty download')
+            return False, 'empty payload'
+
+        spec = state.spec
+        remux_msg = (
+            'Neu rendern (Keyframe-Fix)…'
+            if spec.post_render
+            else 'Remux…'
+        )
+        self._update(job_id, status='running', msg=remux_msg, progress=0.90)
+        job_tmp = os.path.join(self.temp_dir, job_id)
+        os.makedirs(job_tmp, exist_ok=True)
+
+        out_dir = self.download_dir
+        if spec.folder:
+            out_dir = os.path.join(self.download_dir, spec.folder.strip().strip('/\\'))
+            os.makedirs(out_dir, exist_ok=True)
+        stem = allocate_unique_stem(out_dir, build_output_stem(spec))
+        out_mp4 = os.path.join(out_dir, f'{stem}.mp4')
+        part_specs = [p for p in (parts or []) if p[1] > 0]
+
+        try:
+            if len(part_specs) > 1:
+                ok, detail = self._ingest_browser_parts(
+                    job_id, spec, payload, part_specs, job_tmp, out_mp4,
+                )
+            else:
+                raw_path = os.path.join(job_tmp, 'browser.bin')
+                with open(raw_path, 'wb') as fh:
+                    fh.write(payload)
+                ok, detail = remux_browser_payload(raw_path, out_mp4)
+                try:
+                    os.remove(raw_path)
+                except OSError:
+                    pass
+                if ok:
+                    ok, detail = self._maybe_exact_trim_browser(
+                        job_id, spec, out_mp4, timeline_start, detail,
+                    )
+        except Exception as exc:
+            log.exception('job %s browser remux crashed', job_id)
+            self.fail_job(job_id, str(exc))
+            return False, str(exc)
+        if not ok:
+            self.fail_job(job_id, detail)
+            return False, detail
+
+        msg = f'Done ({detail}, {spec.clip_encode_mode})'
+        if spec.post_render:
+            def _rerender_progress(frac: float, info: str) -> None:
+                self._update(
+                    job_id,
+                    status='running',
+                    msg=f'Neu rendern (Keyframe-Fix)… ({info})',
+                    progress=0.93 + 0.06 * max(0.0, min(frac, 1.0)),
+                )
+
+            self._update(
+                job_id,
+                status='running',
+                msg='Neu rendern (Keyframe-Fix)…',
+                progress=0.93,
+            )
+            ok_r, r_detail, new_path = rerender_for_editing(
+                out_mp4,
+                on_progress=_rerender_progress,
+            )
+            if ok_r:
+                out_mp4 = new_path
+                msg = f'{msg} + {r_detail}'
+            else:
+                log.warning('job %s rerender failed: %s', job_id, r_detail)
+                ok2, d2 = finalize_mp4_for_editor(out_mp4)
+                if not ok2:
+                    log.warning('job %s: %s', job_id, d2)
+        else:
+            ok2, d2 = finalize_mp4_for_editor(out_mp4)
+            if not ok2:
+                log.warning('job %s: %s', job_id, d2)
+
+        size = os.path.getsize(out_mp4) if os.path.isfile(out_mp4) else None
+        self._update(
+            job_id,
+            status='ready',
+            msg=msg,
+            filename=os.path.basename(out_mp4),
+            filepath=out_mp4,
+            size=size,
+            progress=1.0,
+            error='',
+        )
+        shutil.rmtree(job_tmp, ignore_errors=True)
+        return True, msg
 
     def delete_job(self, job_id: str) -> bool:
         with self._lock:
@@ -315,6 +590,19 @@ class _DownloadWorker:
                     'job %s: cloudatacdn without Referer — send from page with playing video',
                     self.job_id,
                 )
+        h = apply_page_referer(h, self.spec.url, self.spec.page_url)
+        has_cookie = any(k.lower() == 'cookie' and str(v or '').strip() for k, v in h.items())
+        referer = ''
+        for key, value in h.items():
+            if key.lower() == 'referer':
+                referer = str(value or '')
+                break
+        log.info(
+            'job %s headers: cookie=%s referer=%s',
+            self.job_id,
+            'yes' if has_cookie else 'no',
+            referer[:96] or '-',
+        )
         return h
 
     def _normalized_headers(self) -> dict:
@@ -635,7 +923,7 @@ class _DownloadWorker:
 
         ok, msg = smart_clip_hls(
             self.spec.url,
-            self._headers(),
+            self._normalized_headers(),
             start,
             end,
             raw_ts,
@@ -739,7 +1027,7 @@ class _DownloadWorker:
 
             ok, err = smart_clip_hls(
                 self.spec.url,
-                self._headers(),
+                self._normalized_headers(),
                 float(start),
                 float(end),
                 raw_ts,

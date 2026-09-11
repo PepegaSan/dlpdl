@@ -119,6 +119,23 @@ export function isHlsPlaylistUrl(url) {
 }
 
 /**
+ * KVS-style signed HLS (tnmr.org, /hls2/…?t=&s=&e=). Needs the HTML page as
+ * Referer — the CDN host itself is rejected.
+ */
+export function isTokenizedHlsCdnUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    const q = u.searchParams;
+    if (!(q.has('t') && q.has('s') && q.has('e'))) return false;
+    const path = u.pathname.toLowerCase();
+    return path.includes('/hls') || path.endsWith('.m3u8') || isHlsPlaylistUrl(url);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Many CDNs (e.g. phncdn) expose seg-NNN.ts in devtools; the playlist is sibling master.m3u8.
  */
 export function guessPlaylistUrlFromSegment(segmentUrl) {

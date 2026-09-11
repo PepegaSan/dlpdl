@@ -45,7 +45,7 @@ Times in merge names use `M-SS` or `H-MM-SS` (no colons). If a file already exis
 | Mode | HLS path | Use when |
 | --- | --- | --- |
 | **`preserve`** (default) | Download whole TS segments → concat demuxer → **`-c copy`** only; window snaps to segment boundaries | Pixel comparison / forensic (Oxco) |
-| **`exact`** | ffmpeg reads `.m3u8` with libx264 CRF 20 (+ segment fallback with trim) | Frame-accurate in/out at marked times |
+| **`exact`** | Docker: ffmpeg reads `.m3u8` with libx264 CRF 20 (+ segment fallback with trim). Browser HLS: remux segments, then `clip_local_media_window` to the marked times | Frame-accurate in/out at marked times |
 
 **Exact mode — primary:** ffmpeg reads the **`.m3u8` URL** directly (`-ss` / `-to` on the playlist timeline). Finished message includes **`ok (ffmpeg-hls)`** when this path succeeded.
 
@@ -58,6 +58,8 @@ Times in merge names use `M-SS` or `H-MM-SS` (no colons). If a file already exis
 **Start quality (exact):** native path uses ~10s decode preroll (`-ss` before + after `-i`). Fallback prepends **two** HLS segments and uses `trim`/`atrim` on the concat demuxer.
 
 **Duration check (exact):** if native ffmpeg output is much longer than `end − start`, fallback runs automatically.
+
+**Browser HLS (`browser_fetch`):** remux is stream-copy of whole segments. With **`exact`**, ingest then re-encodes a trim using `timeline_start` (first downloaded segment) so a later time edit (e.g. −10s) is actually cut. **Merge** posts `parts=timeline:bytes;…` and trims each scene before concat. Changing times on an already finished job does nothing — send again. The popup sends whatever is in the time fields at click (so 16:55 → 16:45 is not lost if Merge is clicked before blur finishes).
 
 Docker dev: `deploy/docker-compose.yml` mounts `../backend` into the container so rebuild is not required for Python-only changes (restart container after edits).
 
