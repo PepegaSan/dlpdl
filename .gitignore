@@ -1,5 +1,6 @@
 downloads/
 docs/HOSTERS.md
+.cursor/
 __pycache__/
 *.pyc
 .venv/
