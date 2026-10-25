@@ -8,11 +8,13 @@ server whose behaviour per URL prefix mimics hoster quirks:
   /redirect/...   .m3u8 -> 302 to /range/..., media 404 (relative URIs must follow the redirect)
   /flaky/...      first media response per URL is cut short, Range -> 403, then complete
   /truncated/...  every media response is cut short, Range -> 403
+  /expire/...     segments from seg_004 on return an HTML page (token expired mid-download)
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -20,6 +22,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from Cryptodome.Cipher import AES
 
 from backend import hls_clipper
 
@@ -138,6 +141,81 @@ def _build_streams(root: str) -> None:
     with open(os.path.join(drm_dir, 'audio_drm.m3u8'), 'w', encoding='utf-8') as fh:
         fh.write('\n'.join(drm_audio) + '\n')
 
+    # AES-128 with an explicit IV, then a key change (IV = sequence number) mid-stream.
+    rot_dir = os.path.join(root, 'aes_rot')
+    os.makedirs(rot_dir)
+    k1, k2 = bytes(range(16)), bytes(range(16, 32))
+    iv1 = bytes.fromhex('000102030405060708090a0b0c0d0e0f')
+    for name, key in (('k1.key', k1), ('k2.key', k2)):
+        with open(os.path.join(rot_dir, name), 'wb') as fh:
+            fh.write(key)
+    rot = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:2',
+           '#EXT-X-MEDIA-SEQUENCE:0', '#EXT-X-PLAYLIST-TYPE:VOD']
+    for index, (extinf, uri) in enumerate(pairs):
+        if index == 0:
+            rot.append(f'#EXT-X-KEY:METHOD=AES-128,URI="k1.key",IV=0x{iv1.hex()}')
+        if index == 5:
+            rot.append('#EXT-X-KEY:METHOD=AES-128,URI="k2.key"')
+        key, iv = (k1, iv1) if index < 5 else (k2, index.to_bytes(16, 'big'))
+        with open(os.path.join(root, 'ts', uri), 'rb') as fh:
+            plain = fh.read()
+        pad = 16 - len(plain) % 16
+        with open(os.path.join(rot_dir, uri), 'wb') as fh:
+            fh.write(AES.new(key, AES.MODE_CBC, iv).encrypt(plain + bytes([pad]) * pad))
+        rot += [extinf, uri]
+    with open(os.path.join(rot_dir, 'index.m3u8'), 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join([*rot, '#EXT-X-ENDLIST', '']))
+
+    # fMP4 whose second half (another encode, own init) follows a discontinuity.
+    src_b = os.path.join(root, 'src_b.mp4')
+    _ffmpeg(
+        '-i', src, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30',
+        '-g', '25', '-keyint_min', '25', '-sc_threshold', '0', '-c:a', 'copy', src_b,
+        cwd=root,
+    )
+    _hls(
+        src_b, os.path.join(root, 'fmp4_b'),
+        '-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4',
+        '-hls_segment_filename', 'seg_%03d.m4s',
+    )
+
+    def _extinf_pairs(name: str) -> list[tuple[str, str]]:
+        lines = open(os.path.join(root, name, 'index.m3u8'), encoding='utf-8').read().splitlines()
+        return [(lines[i], lines[i + 1]) for i, line in enumerate(lines) if line.startswith('#EXTINF')]
+
+    fdisc = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:2', '#EXT-X-PLAYLIST-TYPE:VOD',
+             '#EXT-X-MAP:URI="../fmp4/init.mp4"']
+    for extinf, uri in _extinf_pairs('fmp4')[:5]:
+        fdisc += [extinf, f'../fmp4/{uri}']
+    fdisc += ['#EXT-X-DISCONTINUITY', '#EXT-X-MAP:URI="../fmp4_b/init.mp4"']
+    for extinf, uri in _extinf_pairs('fmp4_b')[:5]:
+        fdisc += [extinf, f'../fmp4_b/{uri}']
+    fdisc_dir = os.path.join(root, 'fmp4_disc')
+    os.makedirs(fdisc_dir)
+    with open(os.path.join(fdisc_dir, 'index.m3u8'), 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join([*fdisc, '#EXT-X-ENDLIST', '']))
+
+    # Separate audio rendition whose segments (3 s) do not line up with the video's (2 s).
+    len_dir = os.path.join(root, 'separate_audio_len')
+    os.makedirs(os.path.join(len_dir, 'video'))
+    os.makedirs(os.path.join(len_dir, 'audio'))
+    _ffmpeg(
+        '-i', src, '-an', '-c:v', 'copy', '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod',
+        '-hls_segment_filename', 'video/seg_%03d.ts', 'video/index.m3u8', cwd=len_dir,
+    )
+    _ffmpeg(
+        '-i', src, '-vn', '-c:a', 'aac', '-f', 'hls', '-hls_time', '3', '-hls_playlist_type', 'vod',
+        '-hls_segment_filename', 'audio/seg_%03d.ts', 'audio/index.m3u8', cwd=len_dir,
+    )
+    with open(os.path.join(len_dir, 'index.m3u8'), 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join([
+            '#EXTM3U',
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="en",DEFAULT=YES,AUTOSELECT=YES,URI="audio/index.m3u8"',
+            '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=320x240,CODECS="avc1.42e01e,mp4a.40.2",AUDIO="aud"',
+            'video/index.m3u8',
+            '',
+        ]))
+
 
 class _Handler(BaseHTTPRequestHandler):
     root = ''
@@ -192,7 +270,10 @@ class _Handler(BaseHTTPRequestHandler):
             if mode == 'truncated' or self.hits[path] == 1:
                 self._send_cut_short(file_path)
                 return
-        if mode == 'html' and is_media:
+        expired = mode == 'expire' and is_media and (
+            (match := re.search(r'seg_(\d+)\.', rel)) is not None and int(match.group(1)) >= 4
+        )
+        if (mode == 'html' and is_media) or expired:
             self._send(200, b'<!DOCTYPE html><html><body>Access denied</body></html>' + b' ' * 4096, 'text/html')
             return
         if mode == 'needrange' and is_media and not rng:

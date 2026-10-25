@@ -22,9 +22,13 @@ def _clip(base, tmp_path, stream, mode, prefix='range'):
     return ok, msg, out
 
 
-@pytest.mark.parametrize(
-    'stream', ['ts', 'fmp4', 'byterange', 'fmp4_byterange', 'aes', 'discontinuity', 'separate_audio'],
-)
+STREAMS = [
+    'ts', 'fmp4', 'byterange', 'fmp4_byterange', 'aes', 'aes_rot', 'discontinuity', 'fmp4_disc',
+    'separate_audio', 'separate_audio_len',
+]
+
+
+@pytest.mark.parametrize('stream', STREAMS)
 @pytest.mark.parametrize('mode', ['preserve', 'exact'])
 def test_clip_variants(hls_server, tmp_path, stream, mode):
     ok, msg, out = _clip(hls_server, tmp_path, stream, mode)
@@ -105,6 +109,20 @@ def test_cdn_rejecting_python_falls_back_to_ffmpeg(hls_server, tmp_path):
     assert ok, msg
     assert 'ffmpeg' in msg
     assert probe(out)[1] == {'video', 'audio'}
+
+
+def test_html_for_a_later_segment_fails_with_advice_and_no_fallback(hls_server, tmp_path):
+    diag = diagnostics.Diagnostics()
+    diagnostics.set_diagnostics(diag)
+    try:
+        ok, msg, out = _clip(hls_server, tmp_path, 'ts', 'preserve', prefix='expire')
+    finally:
+        diagnostics.set_diagnostics(None)
+    assert not ok
+    assert 'Webseite' in msg and 'Segment 3/' in msg, msg
+    assert not os.path.exists(out)
+    kinds = [e['kind'] for e in diag.to_dict()['events']]
+    assert 'segment_rejected' in kinds and 'ffmpeg_failed' not in kinds
 
 
 def test_html_instead_of_video_fails_fast_with_advice(hls_server, tmp_path):

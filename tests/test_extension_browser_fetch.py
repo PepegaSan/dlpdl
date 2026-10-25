@@ -21,7 +21,10 @@ pytestmark = [
     pytest.mark.skipif(not shutil.which('node'), reason='node not installed'),
 ]
 
-STREAMS = ['ts', 'fmp4', 'byterange', 'fmp4_byterange', 'aes', 'discontinuity', 'separate_audio']
+STREAMS = [
+    'ts', 'fmp4', 'byterange', 'fmp4_byterange', 'aes', 'aes_rot', 'discontinuity', 'fmp4_disc',
+    'separate_audio', 'separate_audio_len',
+]
 
 
 def _browser_fetch(url, windows, out):
@@ -76,7 +79,11 @@ def test_browser_fetch_single_window(hls_server, tmp_path, stream, mode):
         assert 5.5 <= duration <= 8.5, (duration, msg)
 
 
-@pytest.mark.parametrize('stream', ['byterange', 'fmp4_byterange', 'aes', 'discontinuity', 'separate_audio'])
+@pytest.mark.parametrize(
+    'stream',
+    ['byterange', 'fmp4_byterange', 'aes', 'aes_rot', 'discontinuity', 'fmp4_disc', 'separate_audio',
+     'separate_audio_len'],
+)
 def test_browser_fetch_merge_windows(hls_server, tmp_path, stream):
     windows = [{'start': 2, 'end': 4}, {'start': 12, 'end': 14}]
     raw = tmp_path / 'browser.bin'
@@ -96,12 +103,24 @@ def test_browser_fetch_follows_playlist_redirect(hls_server, tmp_path):
     assert raw.stat().st_size > 100_000
 
 
-def test_discontinuity_window_is_split_into_pieces(hls_server, tmp_path):
+@pytest.mark.parametrize('stream', ['discontinuity', 'fmp4_disc'])
+def test_discontinuity_window_is_split_into_pieces(hls_server, tmp_path, stream):
     info = _browser_fetch(
-        f'{hls_server}/range/discontinuity/index.m3u8', [{'start': 8, 'end': 12}], tmp_path / 'b.bin',
+        f'{hls_server}/range/{stream}/index.m3u8', [{'start': 8, 'end': 12}], tmp_path / 'b.bin',
     )
     pieces = info['parts'][0]['pieces']
     assert [p['kind'] for p in pieces] == ['v', 'v']
+
+
+def test_separate_audio_with_other_segment_length_keeps_its_own_timeline(hls_server, tmp_path):
+    info = _browser_fetch(
+        f'{hls_server}/range/separate_audio_len/index.m3u8', [{'start': 5, 'end': 11}], tmp_path / 'b.bin',
+    )
+    pieces = info['parts'][0]['pieces']
+    assert [p['kind'] for p in pieces] == ['v', 'a']
+    # video segments are 2 s (first picked starts at 4), audio segments 3 s (first picked starts at 3)
+    assert info['timelineStart'] == pytest.approx(4.0, abs=0.1)
+    assert pieces[1]['timelineStart'] == pytest.approx(3.0, abs=0.1)
 
 
 def test_separate_audio_piece_carries_its_timeline(hls_server, tmp_path):

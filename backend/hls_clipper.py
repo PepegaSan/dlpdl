@@ -1949,6 +1949,10 @@ def remux_concat_demuxer(
     return True, 'ok (segments)'
 
 
+class _PreflightRejected(Exception):
+    """A segment is not media (HTML error page, missing init…): no fallback helps."""
+
+
 def _download_segments_to_list(
     fetcher: HttpFetcher,
     picked: list[MediaSegment],
@@ -1974,6 +1978,15 @@ def _download_segments_to_list(
     try:
         for index, seg in enumerate(picked):
             chunk = fetch_segment_bytes(fetcher, seg)
+            kind = classify_media_bytes(chunk[:PREFIX_SCAN_BYTES * 2])
+            # Tokens expire mid-download too: an HTML/JSON page for segment N
+            # must stop here with advice, not surface as "ffmpeg concat failed".
+            problem = preflight_problem(kind, seg.init is not None)
+            if problem:
+                diagnostics.note('segment_rejected', index=index, total=total, media=kind, url=seg.uri)
+                raise _PreflightRejected(
+                    f'{problem} (Segment {index + 1}/{total} — Zugang während des Downloads abgelaufen?)',
+                )
             if seg.init is not None:
                 group = (seg.init, seg.discontinuity)
                 if group != fmp4_group:
@@ -1989,7 +2002,6 @@ def _download_segments_to_list(
                 if fmp4:
                     fmp4.close()
                     fmp4, fmp4_group = None, None
-                kind = classify_media_bytes(chunk[:PREFIX_SCAN_BYTES * 2])
                 ext = kind if kind in ('aac', 'mp3') else 'ts'
                 if ext == 'ts':
                     chunk = align_transport_stream(chunk)
@@ -2079,6 +2091,8 @@ def clip_hls_preserve_copy(
         if ok and progress:
             progress(build_progress_event(fraction=progress_base + progress_scale, msg='Done'))
         return ok, err
+    except _PreflightRejected:
+        raise
     except RuntimeError as exc:
         return False, str(exc)
     except urllib.error.HTTPError as exc:
@@ -2170,6 +2184,8 @@ def clip_hls_segment_fallback(
                     encode_mode=encode_mode,
                 )
         return ok, err
+    except _PreflightRejected:
+        raise
     except Exception as exc:
         return False, f'segment download failed: {exc}'
     finally:
@@ -2269,10 +2285,6 @@ def clip_hls_to_file(
     )
 
 
-class _PreflightRejected(Exception):
-    """First segment is not media (HTML error page, missing init…): no fallback helps."""
-
-
 def _preflight_first_segment(fetcher: HttpFetcher, seg: MediaSegment) -> None:
     chunk = fetch_segment_bytes(fetcher, seg)
     kind = classify_media_bytes(chunk)
@@ -2338,34 +2350,38 @@ def _clip_rendition(
     except Exception as exc:
         segment_error = f'segment download failed: {exc}'
 
-    if not segment_error and mode == 'preserve':
-        eff_start, eff_end = effective_preserve_window(picked)
-        report(0.08, f'HLS: segment copy (preserve, ~{eff_start:.1f}–{eff_end:.1f}s)…')
-        ok, err = clip_hls_preserve_copy(
-            fetcher, picked, raw_ts_path, output_mp4,
-            progress=progress, progress_base=progress_base, progress_scale=progress_scale,
-        )
-        if ok:
-            expected = max(eff_end - eff_start, 0.1)
-            trim_media_to_duration(output_mp4, expected, encode_mode=mode)
-            if not _output_covers_expected(output_mp4, expected):
-                return False, too_short(expected), eff_start
-            report(1.0, 'Done')
-            return True, err, eff_start
-        segment_error = err
-    elif not segment_error:
-        ok, err = clip_hls_segment_fallback(
-            fetcher, parsed, picked,
-            start_sec=start_sec, end_sec=end_sec, end_eff=end_eff,
-            raw_ts_path=raw_ts_path, output_mp4=output_mp4,
-            progress=progress, progress_base=progress_base, progress_scale=progress_scale,
-            encode_mode='exact',
-        )
-        if ok:
-            if not _output_covers_expected(output_mp4, expected_span):
-                return False, too_short(expected_span), start_sec
-            return True, err, start_sec
-        segment_error = err
+    try:
+        if not segment_error and mode == 'preserve':
+            eff_start, eff_end = effective_preserve_window(picked)
+            report(0.08, f'HLS: segment copy (preserve, ~{eff_start:.1f}–{eff_end:.1f}s)…')
+            ok, err = clip_hls_preserve_copy(
+                fetcher, picked, raw_ts_path, output_mp4,
+                progress=progress, progress_base=progress_base, progress_scale=progress_scale,
+            )
+            if ok:
+                expected = max(eff_end - eff_start, 0.1)
+                trim_media_to_duration(output_mp4, expected, encode_mode=mode)
+                if not _output_covers_expected(output_mp4, expected):
+                    return False, too_short(expected), eff_start
+                report(1.0, 'Done')
+                return True, err, eff_start
+            segment_error = err
+        elif not segment_error:
+            ok, err = clip_hls_segment_fallback(
+                fetcher, parsed, picked,
+                start_sec=start_sec, end_sec=end_sec, end_eff=end_eff,
+                raw_ts_path=raw_ts_path, output_mp4=output_mp4,
+                progress=progress, progress_base=progress_base, progress_scale=progress_scale,
+                encode_mode='exact',
+            )
+            if ok:
+                if not _output_covers_expected(output_mp4, expected_span):
+                    return False, too_short(expected_span), start_sec
+                return True, err, start_sec
+            segment_error = err
+    except _PreflightRejected as exc:
+        # The CDN answered a later segment with a page: ffmpeg would get the same.
+        return False, str(exc), start_sec
 
     fetcher.prefetched.clear()
     diagnostics.note('attempt', path='segments', ok=False, error=segment_error)
