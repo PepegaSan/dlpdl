@@ -23,6 +23,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from . import diagnostics
+from .media_probe import classify_media_bytes, preflight_problem
+
 log = logging.getLogger('clip_direct.hls')
 
 DEFAULT_USER_AGENT = (
@@ -107,20 +110,41 @@ def raise_if_cancelled() -> None:
 
 
 @dataclass(frozen=True)
+class InitSection:
+    """fMP4 / CMAF #EXT-X-MAP: the moov every following fragment needs."""
+    uri: str
+    byterange: Optional[tuple[int, int]] = None  # (length, offset)
+
+
+@dataclass(frozen=True)
+class SegmentKey:
+    method: str  # only AES-128 is decrypted
+    uri: str
+    iv: Optional[bytes] = None  # None: IV = media sequence number
+
+
+@dataclass(frozen=True)
 class MediaSegment:
     timeline_start: float
     duration: float
     uri: str
+    byterange: Optional[tuple[int, int]] = None  # (length, offset)
+    init: Optional[InitSection] = None
+    key: Optional[SegmentKey] = None
+    sequence: int = 0
+    discontinuity: int = 0
 
 
 @dataclass
 class ParsedPlaylist:
     segments: list[MediaSegment]
     duration: float
-    encrypted: bool
-    # fMP4 / CMAF HLS: #EXT-X-MAP init segment (moov) that every fragment needs.
+    encrypted: bool  # True only for encryption we cannot handle (e.g. SAMPLE-AES)
     init_uri: Optional[str] = None
-    init_byterange: Optional[tuple[int, int]] = None  # (length, offset)
+    init_byterange: Optional[tuple[int, int]] = None
+    key_method: str = ''
+    # Separate audio rendition (#EXT-X-MEDIA TYPE=AUDIO) of the chosen variant.
+    audio_url: Optional[str] = None
 
 
 def url_looks_like_hls(url: Optional[str]) -> bool:
@@ -199,6 +223,13 @@ class HttpFetcher:
         self._timeout = timeout
         self._segment_delay = max(0.0, float(segment_delay))
         self._last_fetch_at = 0.0
+        self.key_cache: dict[str, bytes] = {}
+        self.init_cache: dict[InitSection, bytes] = {}
+        self.prefetched: dict[MediaSegment, bytes] = {}
+
+    @property
+    def header_names(self) -> list[str]:
+        return sorted(self._headers)
 
     def get_text(self, url: str) -> str:
         return self.get_bytes(url).decode('utf-8', 'ignore')
@@ -269,14 +300,20 @@ class HttpFetcher:
             return data
         return data
 
-    def get_bytes(self, url: str) -> bytes:
+    def get_bytes(self, url: str, byte_range: Optional[tuple[int, int]] = None) -> bytes:
+        """GET a resource; byte_range=(length, offset) for #EXT-X-BYTERANGE segments."""
         last_exc: Optional[BaseException] = None
         best = b''
+        range_header = None
+        if byte_range:
+            length, offset = byte_range
+            range_header = {'Range': f'bytes={offset}-{offset + length - 1}'}
         for attempt in range(SEGMENT_FETCH_RETRY_MAX):
             raise_if_cancelled()
             self._throttle()
             try:
-                with self._open(url) as resp:
+                with self._open(url, range_header) as resp:
+                    status = getattr(resp, 'status', None) or resp.getcode()
                     declared = None
                     raw_len = resp.headers.get('Content-Length')
                     if raw_len:
@@ -286,6 +323,13 @@ class HttpFetcher:
                             declared = None
                     data = self._read_body(resp)
                 self._last_fetch_at = time.monotonic()
+                diagnostics.count(f'http_{status}')
+                if byte_range and status != 206:
+                    length, offset = byte_range
+                    data = data[offset:offset + length]
+                    declared = None
+                elif byte_range:
+                    declared = None
                 if declared is not None and 0 < len(data) < declared:
                     try:
                         data = self._resume_range(url, data, declared)
@@ -308,6 +352,8 @@ class HttpFetcher:
                 )
             except urllib.error.HTTPError as exc:
                 last_exc = exc
+                diagnostics.count(f'http_{exc.code}')
+                diagnostics.note('http_error', url=url, status=exc.code, attempt=attempt + 1)
                 if exc.code not in (429, 500, 502, 503, 504) or attempt >= SEGMENT_FETCH_RETRY_MAX - 1:
                     if exc.code == 429:
                         raise RuntimeError(
@@ -426,76 +472,198 @@ def resolve_hls_uri(base_url: str, ref: str) -> str:
     )
 
 
-def resolve_master_playlist(text: str, base_url: str) -> Optional[str]:
-    best_uri: Optional[str] = None
-    best_bw = -1
-    pending_bw: Optional[int] = None
+_ATTR_RE = re.compile(r'([A-Za-z0-9-]+)=("([^"]*)"|[^,]*)')
+_VIDEO_CODEC_HINTS = ('avc', 'hvc', 'hev', 'av01', 'vp09', 'vp9', 'mp4v', 'dvh')
+
+
+def _hls_attrs(line: str) -> dict[str, str]:
+    body = line.split(':', 1)[1] if ':' in line else ''
+    return {
+        m.group(1).upper(): (m.group(3) if m.group(3) is not None else m.group(2)).strip()
+        for m in _ATTR_RE.finditer(body)
+    }
+
+
+def _parse_byterange(value: Optional[str]) -> Optional[tuple[int, Optional[int]]]:
+    match = re.fullmatch(r'\s*(\d+)(?:@(\d+))?\s*', value or '')
+    if not match:
+        return None
+    return int(match.group(1)), (int(match.group(2)) if match.group(2) else None)
+
+
+def select_master_variant(text: str, base_url: str) -> tuple[Optional[str], Optional[str]]:
+    """Best video variant (resolution, then bandwidth) and its separate audio rendition."""
+    audio_groups: dict[str, list[tuple[bool, str]]] = {}
+    variants: list[tuple[dict[str, str], str]] = []
+    pending: Optional[dict[str, str]] = None
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith('#EXT-X-STREAM-INF'):
-            match = re.search(r'BANDWIDTH=(\d+)', stripped)
-            pending_bw = int(match.group(1)) if match else 0
-        elif stripped and not stripped.startswith('#'):
-            if pending_bw is not None and pending_bw > best_bw:
-                best_bw = pending_bw
-                best_uri = resolve_hls_uri(base_url, stripped)
-            pending_bw = None
-    return best_uri
+        if stripped.startswith('#EXT-X-MEDIA:'):
+            attrs = _hls_attrs(stripped)
+            if attrs.get('TYPE', '').upper() == 'AUDIO' and attrs.get('URI'):
+                audio_groups.setdefault(attrs.get('GROUP-ID', ''), []).append(
+                    (attrs.get('DEFAULT', 'NO').upper() == 'YES', resolve_hls_uri(base_url, attrs['URI'])),
+                )
+        elif stripped.startswith('#EXT-X-STREAM-INF'):
+            pending = _hls_attrs(stripped)
+        elif stripped and not stripped.startswith('#') and pending is not None:
+            variants.append((pending, resolve_hls_uri(base_url, stripped)))
+            pending = None
+    if not variants:
+        return None, None
+
+    def has_video(attrs: dict[str, str]) -> bool:
+        codecs = attrs.get('CODECS', '').lower()
+        return bool(attrs.get('RESOLUTION')) or not codecs or any(h in codecs for h in _VIDEO_CODEC_HINTS)
+
+    def rank(item: tuple[dict[str, str], str]) -> tuple[int, int]:
+        attrs = item[0]
+        res = re.match(r'(\d+)x(\d+)', attrs.get('RESOLUTION', ''))
+        area = int(res.group(1)) * int(res.group(2)) if res else 0
+        try:
+            bandwidth = int(attrs.get('BANDWIDTH') or attrs.get('AVERAGE-BANDWIDTH') or 0)
+        except ValueError:
+            bandwidth = 0
+        return area, bandwidth
+
+    pool = [v for v in variants if has_video(v[0])] or variants
+    best_attrs, best_uri = max(pool, key=rank)
+    audio_url = None
+    group = audio_groups.get(best_attrs.get('AUDIO', ''))
+    if group:
+        audio_url = next((uri for is_default, uri in group if is_default), group[0][1])
+    return best_uri, audio_url
+
+
+def resolve_master_playlist(text: str, base_url: str) -> Optional[str]:
+    return select_master_variant(text, base_url)[0]
 
 
 def parse_media_playlist(text: str, base_url: str) -> ParsedPlaylist:
     segments: list[MediaSegment] = []
     timeline = 0.0
     pending_duration: Optional[float] = None
+    pending_range: Optional[tuple[int, Optional[int]]] = None
+    media_sequence = 0
+    discontinuity = 0
+    init: Optional[InitSection] = None
+    key: Optional[SegmentKey] = None
+    key_method = ''
     encrypted = False
-    init_uri: Optional[str] = None
-    init_byterange: Optional[tuple[int, int]] = None
+    range_end: dict[str, int] = {}
 
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith('#EXT-X-KEY') and 'METHOD=NONE' not in stripped.upper():
-            encrypted = True
-        elif stripped.startswith('#EXT-X-MAP:') and init_uri is None:
-            uri_match = re.search(r'URI="([^"]+)"', stripped)
-            if uri_match:
-                init_uri = resolve_hls_uri(base_url, uri_match.group(1))
-                range_match = re.search(r'BYTERANGE="(\d+)(?:@(\d+))?"', stripped)
-                if range_match:
-                    init_byterange = (int(range_match.group(1)), int(range_match.group(2) or 0))
+        if stripped.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+            try:
+                media_sequence = int(stripped.split(':', 1)[1])
+            except ValueError:
+                media_sequence = 0
+        elif stripped.startswith('#EXT-X-KEY:'):
+            attrs = _hls_attrs(stripped)
+            method = attrs.get('METHOD', 'NONE').upper()
+            if method == 'NONE':
+                key = None
+            elif method == 'AES-128' and attrs.get('URI'):
+                iv_hex = attrs.get('IV', '')
+                iv = None
+                if iv_hex:
+                    iv = bytes.fromhex(iv_hex[2:] if iv_hex.lower().startswith('0x') else iv_hex).rjust(16, b'\0')
+                key = SegmentKey('AES-128', resolve_hls_uri(base_url, attrs['URI']), iv)
+                key_method = key_method or 'AES-128'
+            else:
+                encrypted = True
+                key_method = method
+                key = None
+        elif stripped.startswith('#EXT-X-MAP:'):
+            attrs = _hls_attrs(stripped)
+            if attrs.get('URI'):
+                rng = _parse_byterange(attrs.get('BYTERANGE'))
+                init = InitSection(
+                    resolve_hls_uri(base_url, attrs['URI']),
+                    (rng[0], rng[1] or 0) if rng else None,
+                )
+        elif stripped == '#EXT-X-DISCONTINUITY':
+            discontinuity += 1
+        elif stripped.startswith('#EXT-X-BYTERANGE:'):
+            pending_range = _parse_byterange(stripped.split(':', 1)[1])
         elif stripped.startswith('#EXTINF:'):
             try:
                 pending_duration = float(stripped[len('#EXTINF:'):].split(',')[0])
             except ValueError:
                 pending_duration = 0.0
         elif stripped and not stripped.startswith('#'):
+            uri = resolve_hls_uri(base_url, stripped)
+            byterange = None
+            if pending_range:
+                length, offset = pending_range
+                if offset is None:
+                    offset = range_end.get(uri, 0)
+                byterange = (length, offset)
+                range_end[uri] = offset + length
             duration = pending_duration or 0.0
             segments.append(
                 MediaSegment(
                     timeline_start=timeline,
                     duration=duration,
-                    uri=resolve_hls_uri(base_url, stripped),
+                    uri=uri,
+                    byterange=byterange,
+                    init=init,
+                    key=key,
+                    sequence=media_sequence + len(segments),
+                    discontinuity=discontinuity,
                 ),
             )
             timeline += duration
             pending_duration = None
+            pending_range = None
 
+    first_init = next((s.init for s in segments if s.init), None)
     return ParsedPlaylist(
         segments=segments,
         duration=timeline,
         encrypted=encrypted,
-        init_uri=init_uri,
-        init_byterange=init_byterange,
+        init_uri=first_init.uri if first_init else None,
+        init_byterange=first_init.byterange if first_init else None,
+        key_method=key_method,
     )
 
 
-def fetch_init_segment(fetcher: 'HttpFetcher', parsed: ParsedPlaylist) -> bytes:
-    """Bytes of the #EXT-X-MAP init segment, or b'' for plain MPEG-TS playlists."""
-    if not parsed.init_uri:
-        return b''
-    data = fetcher.get_bytes(parsed.init_uri)
-    if parsed.init_byterange:
-        length, offset = parsed.init_byterange
-        data = data[offset:offset + length]
+def fetch_init_bytes(fetcher: 'HttpFetcher', init: InitSection) -> bytes:
+    cached = fetcher.init_cache.get(init)
+    if cached is None:
+        cached = fetcher.get_bytes(init.uri, byte_range=init.byterange)
+        fetcher.init_cache[init] = cached
+    return cached
+
+
+def _decrypt_aes128(fetcher: 'HttpFetcher', key: SegmentKey, sequence: int, data: bytes) -> bytes:
+    try:
+        from Cryptodome.Cipher import AES
+    except ImportError as exc:  # pragma: no cover - shipped with yt-dlp[default]
+        raise RuntimeError('AES-128 HLS braucht pycryptodomex (kommt mit yt-dlp[default])') from exc
+    secret = fetcher.key_cache.get(key.uri)
+    if secret is None:
+        secret = fetcher.get_bytes(key.uri)
+        if len(secret) != 16:
+            raise RuntimeError(f'HLS-Schlüssel hat {len(secret)} statt 16 Bytes (Login/Token nötig?)')
+        fetcher.key_cache[key.uri] = secret
+    iv = key.iv or sequence.to_bytes(16, 'big')
+    plain = AES.new(secret, AES.MODE_CBC, iv).decrypt(data[: len(data) - len(data) % 16])
+    pad = plain[-1] if plain else 0
+    if 1 <= pad <= 16 and plain.endswith(bytes([pad]) * pad):
+        plain = plain[:-pad]
+    return plain
+
+
+def fetch_segment_bytes(fetcher: 'HttpFetcher', seg: MediaSegment) -> bytes:
+    """Segment payload ready for ffmpeg: byte range applied, AES-128 decrypted."""
+    cached = fetcher.prefetched.pop(seg, None)
+    if cached is not None:
+        return cached
+    data = fetcher.get_bytes(seg.uri, byte_range=seg.byterange)
+    if seg.key is not None:
+        data = _decrypt_aes128(fetcher, seg.key, seg.sequence, data)
     return data
 
 
@@ -525,12 +693,17 @@ def _fetch_resolved_media_playlist(
     if depth > 4:
         raise ValueError('too many nested HLS playlists')
     body = fetcher.get_text(playlist_url)
+    diagnostics.note('playlist', url=playlist_url, depth=depth, text=body[:3000])
     media_url = playlist_url
     if '#EXT-X-STREAM-INF' in body:
-        variant = resolve_master_playlist(body, playlist_url)
+        variant, audio_url = select_master_variant(body, playlist_url)
         if not variant:
             raise ValueError('no variant in master playlist')
-        return _fetch_resolved_media_playlist(fetcher, variant, depth + 1)
+        diagnostics.note('variant', video=variant, audio=audio_url or '')
+        media_url, parsed = _fetch_resolved_media_playlist(fetcher, variant, depth + 1)
+        if audio_url and not parsed.audio_url:
+            parsed.audio_url = audio_url
+        return media_url, parsed
     parsed = parse_media_playlist(body, media_url)
     if parsed.segments:
         sample = parsed.segments[: min(3, len(parsed.segments))]
@@ -553,6 +726,13 @@ def resolve_hls_playlist(
             'yes' if _cookie_header_present(headers) else 'no',
         )
     return media_url, parsed, fetcher
+
+
+def _remove_quiet(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _output_usable(path: str, min_bytes: int = 4096) -> bool:
@@ -611,7 +791,7 @@ def segments_for_window(
 
 def _segment_index(playlist: ParsedPlaylist, seg: MediaSegment) -> int:
     for index, candidate in enumerate(playlist.segments):
-        if candidate.uri == seg.uri and abs(candidate.timeline_start - seg.timeline_start) < 0.02:
+        if candidate == seg:
             return index
     return -1
 
@@ -649,7 +829,7 @@ def segments_with_preroll(
     if not before:
         return picked
     preroll = before[-extra_segments:]
-    if preroll and preroll[-1].uri == picked[0].uri:
+    if preroll and preroll[-1] == picked[0]:
         return picked
     return [*preroll, *picked]
 
@@ -678,7 +858,22 @@ def run_ffmpeg(args: list[str], timeout: float = FFMPEG_TIMEOUT_SEC) -> subproce
         if token is not None:
             token.unregister(proc)
     raise_if_cancelled()
+    if code != 0:
+        _note_ffmpeg_failure(args, code, err or '')
     return subprocess.CompletedProcess(args, code, out or '', err or '')
+
+
+def _note_ffmpeg_failure(args: list[str], code: int, stderr: str) -> None:
+    diagnostics.note(
+        'ffmpeg_failed',
+        tool=os.path.basename(args[0]) if args else '',
+        code=code,
+        args=' '.join(
+            '<hidden>' if prev in ('-headers', '-user_agent', '-referer', '-cookies') else a
+            for prev, a in zip(args, args[1:])
+        )[:1500],
+        stderr=stderr[-2000:],
+    )
 
 
 def run_ffmpeg_with_progress(
@@ -760,7 +955,10 @@ def run_ffmpeg_with_progress(
     raise_if_cancelled()
     stderr = proc.stderr.read() if proc.stderr else ''
     proc.wait(timeout=5)
-    return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, '', stderr)
+    code = proc.returncode if proc.returncode is not None else 1
+    if code != 0:
+        _note_ffmpeg_failure(cmd, code, stderr)
+    return subprocess.CompletedProcess(cmd, code, '', stderr)
 
 
 # libx264 + concat remux: one at a time so N jobs don't all freeze at "Encoding 83%".
@@ -1690,7 +1888,6 @@ def _download_segments_to_list(
     progress: Optional[Callable[[dict], None]],
     progress_base: float,
     progress_scale: float,
-    init_bytes: bytes = b'',
 ) -> tuple[Optional[str], list[str]]:
     total = len(picked)
     bytes_done = 0
@@ -1701,21 +1898,34 @@ def _download_segments_to_list(
             msg=f'Segments 0/{total}…',
         ))
 
-    # fMP4 fragments are not standalone files: write init + all fragments into
-    # one fragmented MP4 (what a player does) instead of one file per segment.
-    fmp4_path = os.path.join(parts_dir, 'segments.mp4') if init_bytes else None
-    fmp4 = open(fmp4_path, 'wb') if fmp4_path else None
-    segment_paths: list[str] = [fmp4_path] if fmp4_path else []
+    # fMP4 fragments are not standalone files: init + fragments go into one
+    # fragmented MP4 per (init, discontinuity) run, like a player would buffer.
+    segment_paths: list[str] = []
+    fmp4 = None
+    fmp4_group: Optional[tuple[InitSection, int]] = None
     try:
-        if fmp4:
-            fmp4.write(init_bytes)
         for index, seg in enumerate(picked):
-            if fmp4:
-                chunk = fetcher.get_bytes(seg.uri)
+            chunk = fetch_segment_bytes(fetcher, seg)
+            if seg.init is not None:
+                group = (seg.init, seg.discontinuity)
+                if group != fmp4_group:
+                    if fmp4:
+                        fmp4.close()
+                    path = os.path.join(parts_dir, f'part_{len(segment_paths):04d}.mp4')
+                    fmp4 = open(path, 'wb')
+                    fmp4.write(fetch_init_bytes(fetcher, seg.init))
+                    segment_paths.append(path)
+                    fmp4_group = group
                 fmp4.write(chunk)
             else:
-                part_path = os.path.join(parts_dir, f'seg_{index:04d}.ts')
-                chunk = align_transport_stream(fetcher.get_bytes(seg.uri))
+                if fmp4:
+                    fmp4.close()
+                    fmp4, fmp4_group = None, None
+                kind = classify_media_bytes(chunk[:PREFIX_SCAN_BYTES * 2])
+                ext = kind if kind in ('aac', 'mp3') else 'ts'
+                if ext == 'ts':
+                    chunk = align_transport_stream(chunk)
+                part_path = os.path.join(parts_dir, f'seg_{index:04d}.{ext}')
                 with open(part_path, 'wb') as fh:
                     fh.write(chunk)
                 segment_paths.append(part_path)
@@ -1767,17 +1977,14 @@ def clip_hls_preserve_copy(
     progress: Optional[Callable[[dict], None]] = None,
     progress_base: float = 0.0,
     progress_scale: float = 1.0,
-    parsed: Optional[ParsedPlaylist] = None,
 ) -> tuple[bool, str]:
     """Download whole TS segments and remux with stream copy (forensic / pixel-stable)."""
     parts_dir = os.path.splitext(raw_ts_path)[0] + '_parts'
     shutil.rmtree(parts_dir, ignore_errors=True)
     os.makedirs(parts_dir, exist_ok=True)
     try:
-        init_bytes = fetch_init_segment(fetcher, parsed) if parsed else b''
         list_path, _paths = _download_segments_to_list(
             fetcher, picked, parts_dir, progress, progress_base, progress_scale,
-            init_bytes=init_bytes,
         )
         if not list_path:
             return False, 'no segments downloaded'
@@ -1853,7 +2060,6 @@ def clip_hls_segment_fallback(
             progress,
             progress_base,
             progress_scale,
-            init_bytes=fetch_init_segment(fetcher, parsed),
         )
         if not list_path:
             return False, 'no segments downloaded'
@@ -1951,8 +2157,23 @@ def clip_hls_to_file(
     except Exception as exc:
         return False, _format_playlist_error(exc, headers)
 
+    diagnostics.note(
+        'media_playlist',
+        url=media_url,
+        segments=len(parsed.segments),
+        duration=round(parsed.duration, 2),
+        fmp4=bool(parsed.init_uri),
+        byterange=any(s.byterange for s in parsed.segments[:5]),
+        key=parsed.key_method,
+        discontinuities=parsed.segments[-1].discontinuity if parsed.segments else 0,
+        audio_rendition=bool(parsed.audio_url),
+        header_names=fetcher.header_names,
+    )
     if parsed.encrypted:
-        return False, 'encrypted HLS (EXT-X-KEY) is not supported'
+        return False, (
+            f'Stream ist mit {parsed.key_method or "DRM"} verschlüsselt — '
+            'nur AES-128 wird unterstützt, DRM-Streams lassen sich nicht schneiden'
+        )
     if not parsed.segments:
         return False, 'empty media playlist'
     if not _playlist_segments_look_valid(parsed):
@@ -1968,108 +2189,191 @@ def clip_hls_to_file(
             + (f' (erstes Segment: {first})' if first else '')
         )
 
-    end_eff = end_sec if end_sec != float('inf') else parsed.duration
-    expected_span = max(end_eff - start_sec, 0.1) if end_eff != float('inf') else parsed.duration
+    if not parsed.audio_url:
+        ok, msg, _ = _clip_rendition(
+            media_url, parsed, fetcher, headers, start_sec, end_sec,
+            raw_ts_path, output_mp4, progress, progress_base, progress_scale, mode,
+        )
+        return ok, msg
+    return _clip_with_audio_rendition(
+        media_url, parsed, fetcher, headers, start_sec, end_sec,
+        raw_ts_path, output_mp4, progress, progress_base, progress_scale, mode,
+    )
 
-    report(0.04, f'HLS: ffmpeg ({len(parsed.segments)} segments, ~{parsed.duration:.0f}s)…')
-    if mode == 'preserve':
-        ok_direct, err_direct = clip_hls_ffmpeg_stream_copy(
-            media_url,
-            headers,
-            start_sec,
-            end_sec,
-            end_eff if end_eff != float('inf') else 1e7,
-            output_mp4,
-        )
-    else:
-        ok_direct, err_direct = clip_hls_ffmpeg_native(
-            media_url,
-            headers,
-            start_sec,
-            end_sec,
-            end_eff if end_eff != float('inf') else 1e7,
-            output_mp4,
-        )
-    if (
-        ok_direct
-        and _output_usable(output_mp4)
-        and _output_covers_expected(output_mp4, expected_span)
-    ):
-        if end_sec != float('inf'):
-            trim_media_to_duration(
-                output_mp4,
-                max(end_sec - start_sec, 0.1),
-                encode_mode=mode,
-            )
-        report(1.0, 'Done')
-        return True, err_direct
-    if ok_direct:
-        try:
-            os.remove(output_mp4)
-        except OSError:
-            pass
-        log.info(
-            'HLS direct ffmpeg rejected (%s), falling back to segments',
-            err_direct if not _output_usable(output_mp4) else 'output too short',
-        )
+
+class _PreflightRejected(Exception):
+    """First segment is not media (HTML error page, missing init…): no fallback helps."""
+
+
+def _preflight_first_segment(fetcher: HttpFetcher, seg: MediaSegment) -> None:
+    chunk = fetch_segment_bytes(fetcher, seg)
+    kind = classify_media_bytes(chunk)
+    diagnostics.note(
+        'preflight', media=kind, bytes=len(chunk), has_init=seg.init is not None,
+        head=chunk[:16].hex(),
+    )
+    problem = preflight_problem(kind, seg.init is not None)
+    if problem:
+        raise _PreflightRejected(problem)
+    fetcher.prefetched[seg] = chunk
+
+
+def _clip_rendition(
+    media_url: str,
+    parsed: ParsedPlaylist,
+    fetcher: HttpFetcher,
+    headers: Optional[dict],
+    start_sec: float,
+    end_sec: float,
+    raw_ts_path: str,
+    output_mp4: str,
+    progress: Optional[Callable[[dict], None]],
+    progress_base: float,
+    progress_scale: float,
+    mode: str,
+) -> tuple[bool, str, float]:
+    """Clip one media playlist. Returns (ok, message, timeline start of the output)."""
+    def report(frac: float, message: str) -> None:
+        if progress:
+            overall = progress_base + progress_scale * max(0.0, min(1.0, frac))
+            progress(build_progress_event(fraction=overall, msg=message))
+
+    end_eff = end_sec if end_sec != float('inf') else parsed.duration
+    expected_span = max(end_eff - start_sec, 0.1)
+    too_short = (
+        lambda expected: f'nur {probe_duration_seconds(output_mp4) or 0:.1f}s von '
+        f'~{expected:.0f}s geladen — CDN-Token/Query prüfen, Video abspielen, erneut senden'
+    )
 
     if mode == 'preserve':
         picked = segments_for_window_preserve(parsed, start_sec, end_sec)
-        if not picked:
-            return False, 'no segments in time window'
+    else:
+        picked = segments_for_window(parsed, start_sec, end_sec)
+    if not picked:
+        return False, 'no segments in time window', start_sec
+    full_span = start_sec <= 0.01 and end_eff >= parsed.duration - 0.5
+    if mode == 'exact' and not full_span:
+        picked = segments_with_preroll(parsed, picked)
+
+    # Segments via Python first: it handles fMP4 init, byte ranges, AES-128 and
+    # CDNs that reject ffmpeg's HTTP client (phncdn answers ffmpeg with 410).
+    segment_error = ''
+    try:
+        _preflight_first_segment(fetcher, picked[0])
+    except _PreflightRejected as exc:
+        return False, str(exc), start_sec
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        segment_error = f'segment download failed: {exc}'
+
+    if not segment_error and mode == 'preserve':
         eff_start, eff_end = effective_preserve_window(picked)
         report(0.08, f'HLS: segment copy (preserve, ~{eff_start:.1f}–{eff_end:.1f}s)…')
         ok, err = clip_hls_preserve_copy(
-            fetcher,
-            picked,
-            raw_ts_path,
-            output_mp4,
-            progress=progress,
-            progress_base=progress_base,
-            progress_scale=progress_scale,
-            parsed=parsed,
+            fetcher, picked, raw_ts_path, output_mp4,
+            progress=progress, progress_base=progress_base, progress_scale=progress_scale,
         )
         if ok:
             expected = max(eff_end - eff_start, 0.1)
             trim_media_to_duration(output_mp4, expected, encode_mode=mode)
             if not _output_covers_expected(output_mp4, expected):
-                return False, (
-                    f'nur {probe_duration_seconds(output_mp4) or 0:.1f}s von '
-                    f'~{expected:.0f}s geladen — CDN-Token/Query prüfen, Video abspielen, erneut senden'
-                )
+                return False, too_short(expected), eff_start
             report(1.0, 'Done')
-        return ok, err
-
-    picked = segments_for_window(parsed, start_sec, end_sec)
-    if not picked:
-        return False, 'no segments in time window'
-
-    full_span = start_sec <= 0.01 and end_eff >= parsed.duration - 0.5
-    expected_duration = None if full_span else max(end_eff - start_sec, 0.1)
-
-    if not full_span:
-        picked = segments_with_preroll(parsed, picked)
-
-    ok, err = clip_hls_segment_fallback(
-        fetcher,
-        parsed,
-        picked,
-        start_sec=start_sec,
-        end_sec=end_sec,
-        end_eff=end_eff,
-        raw_ts_path=raw_ts_path,
-        output_mp4=output_mp4,
-        progress=progress,
-        progress_base=progress_base,
-        progress_scale=progress_scale,
-        encode_mode='exact',
-    )
-    if ok and not _output_covers_expected(output_mp4, expected_span):
-        return False, (
-            f'nur {probe_duration_seconds(output_mp4) or 0:.1f}s von '
-            f'~{expected_span:.0f}s geladen — CDN-Token/Query prüfen, Video abspielen, erneut senden'
+            return True, err, eff_start
+        segment_error = err
+    elif not segment_error:
+        ok, err = clip_hls_segment_fallback(
+            fetcher, parsed, picked,
+            start_sec=start_sec, end_sec=end_sec, end_eff=end_eff,
+            raw_ts_path=raw_ts_path, output_mp4=output_mp4,
+            progress=progress, progress_base=progress_base, progress_scale=progress_scale,
+            encode_mode='exact',
         )
-    return ok, err
+        if ok:
+            if not _output_covers_expected(output_mp4, expected_span):
+                return False, too_short(expected_span), start_sec
+            return True, err, start_sec
+        segment_error = err
+
+    fetcher.prefetched.clear()
+    diagnostics.note('attempt', path='segments', ok=False, error=segment_error)
+    if any(s.byterange or s.key for s in picked[:3]) or len({s.init for s in picked}) > 1:
+        return False, segment_error, start_sec
+
+    log.info('HLS segment path failed (%s) — trying direct ffmpeg', segment_error[:200])
+    report(0.5, 'HLS: Segmente abgelehnt, versuche ffmpeg direkt…')
+    _remove_quiet(output_mp4)
+    clip = clip_hls_ffmpeg_stream_copy if mode == 'preserve' else clip_hls_ffmpeg_native
+    ok_direct, err_direct = clip(
+        media_url, headers, start_sec, end_sec,
+        end_eff if end_eff != float('inf') else 1e7, output_mp4,
+    )
+    diagnostics.note('attempt', path='ffmpeg-direct', ok=ok_direct, error='' if ok_direct else err_direct)
+    if ok_direct and _output_usable(output_mp4) and _output_covers_expected(output_mp4, expected_span):
+        if end_sec != float('inf'):
+            trim_media_to_duration(output_mp4, max(end_sec - start_sec, 0.1), encode_mode=mode)
+        report(1.0, 'Done')
+        return True, err_direct, start_sec
+    _remove_quiet(output_mp4)
+    return False, f'{segment_error} | {err_direct if not ok_direct else too_short(expected_span)}', start_sec
+
+
+def _clip_with_audio_rendition(
+    media_url: str,
+    parsed: ParsedPlaylist,
+    fetcher: HttpFetcher,
+    headers: Optional[dict],
+    start_sec: float,
+    end_sec: float,
+    raw_ts_path: str,
+    output_mp4: str,
+    progress: Optional[Callable[[dict], None]],
+    progress_base: float,
+    progress_scale: float,
+    mode: str,
+) -> tuple[bool, str]:
+    """Video and audio come from separate playlists: clip both, then mux."""
+    stem = os.path.splitext(output_mp4)[0]
+    video_tmp, audio_tmp = f'{stem}.video.mp4', f'{stem}.audio.mp4'
+    try:
+        ok, msg, video_start = _clip_rendition(
+            media_url, parsed, fetcher, headers, start_sec, end_sec,
+            raw_ts_path, video_tmp, progress, progress_base, progress_scale * 0.75, mode,
+        )
+        if not ok:
+            return False, msg
+        try:
+            audio_url, audio_parsed = _fetch_resolved_media_playlist(fetcher, parsed.audio_url or '')
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            return False, f'Tonspur-Playlist nicht ladbar: {exc}'
+        ok, audio_msg, audio_start = _clip_rendition(
+            audio_url, audio_parsed, fetcher, headers, start_sec, end_sec,
+            os.path.splitext(raw_ts_path)[0] + '_audio.ts', audio_tmp,
+            progress, progress_base + progress_scale * 0.75, progress_scale * 0.2, mode,
+        )
+        if not ok:
+            return False, f'Tonspur: {audio_msg}'
+        offset = audio_start - video_start
+        args = ['ffmpeg', '-y', '-loglevel', 'error', '-i', video_tmp]
+        if abs(offset) > 0.01:
+            args += ['-itsoffset', f'{offset:.3f}']
+        args += [
+            '-i', audio_tmp,
+            '-map', '0:v:0', '-map', '1:a:0',
+            '-c', 'copy', '-movflags', '+faststart', output_mp4,
+        ]
+        proc = run_ffmpeg(args)
+        if proc.returncode != 0 or not _output_usable(output_mp4):
+            return False, f'Video+Ton zusammenführen fehlgeschlagen: {(proc.stderr or "").strip()[:300]}'
+        if progress:
+            progress(build_progress_event(fraction=progress_base + progress_scale, msg='Done'))
+        return True, f'{msg} + separate audio'
+    finally:
+        _remove_quiet(video_tmp)
+        _remove_quiet(audio_tmp)
 
 
 def smart_clip_hls(

@@ -93,8 +93,8 @@ async function fetchJobs() {
   return Array.isArray(data.jobs) ? data.jobs : [];
 }
 
-function fileUrl(id) {
-  const base = `/api/jobs/${encodeURIComponent(id)}/file`;
+function fileUrl(id, resource = 'file') {
+  const base = `/api/jobs/${encodeURIComponent(id)}/${resource}`;
   const token = apiToken();
   return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 }
@@ -283,6 +283,15 @@ function renderJob(job) {
       refresh();
     });
     actions.appendChild(cancel);
+  }
+  if (job.status === 'error' && job.has_diagnose) {
+    const diag = document.createElement('a');
+    diag.className = 'btn secondary';
+    diag.href = fileUrl(job.id, 'diagnose');
+    diag.download = `clip-direct-diagnose-${job.id.slice(0, 12)}.json`;
+    diag.textContent = t('ui.diagnose');
+    diag.title = t('ui.diagnoseHint');
+    actions.appendChild(diag);
   }
   if (isReady || isError) {
     const rm = document.createElement('button');

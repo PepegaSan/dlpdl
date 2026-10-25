@@ -90,6 +90,8 @@
   "ui.fileMissing": "Datei auf dem Server nicht gefunden — Job erneut senden oder Docker prüfen.",
   "ui.remove": "Entfernen",
   "ui.cancel": "Abbrechen",
+  "ui.diagnose": "Diagnose",
+  "ui.diagnoseHint": "Bericht herunterladen, was der Server versucht hat (ohne Tokens/Cookies) — hilft bei Hoster-Problemen",
   "ui.status.cancelled": "Abgebrochen",
   "ui.tokenPrompt": "Dieser Clip-Direct-Server ist mit einem API-Token geschützt (CLIP_DIRECT_TOKEN). Token eingeben:",
   "ui.tokenRequired": "Token erforderlich — Seite neu laden und Token eingeben"

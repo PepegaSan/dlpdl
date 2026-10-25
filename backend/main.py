@@ -372,6 +372,21 @@ async def api_download_file(request: web.Request) -> web.Response:
     )
 
 
+async def api_job_diagnose(request: web.Request) -> web.Response:
+    job_id = request.match_info['id']
+    path = runner.diagnose_path(job_id)
+    if not path:
+        raise web.HTTPNotFound(reason='no diagnose report')
+    return web.FileResponse(
+        path,
+        headers={
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Disposition': f'attachment; filename="clip-direct-diagnose-{job_id[:12]}.json"',
+            'Cache-Control': 'no-store, must-revalidate',
+        },
+    )
+
+
 _NO_CACHE = {'Cache-Control': 'no-store, must-revalidate'}
 
 
@@ -405,6 +420,7 @@ def create_app() -> web.Application:
     app.router.add_get('/api/jobs', api_list_jobs)
     app.router.add_get('/api/jobs/{id}', api_get_job)
     app.router.add_get('/api/jobs/{id}/file', api_download_file)
+    app.router.add_get('/api/jobs/{id}/diagnose', api_job_diagnose)
     app.router.add_post('/api/jobs/{id}/progress', api_job_progress)
     app.router.add_post('/api/jobs/{id}/fail', api_job_fail)
     app.router.add_post('/api/jobs/{id}/ingest', api_job_ingest)

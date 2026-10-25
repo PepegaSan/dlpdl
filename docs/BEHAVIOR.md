@@ -48,20 +48,22 @@ Times in merge names use `M-SS` or `H-MM-SS` (no colons). If a file already exis
 
 | Mode | HLS path | Use when |
 | --- | --- | --- |
-| **`preserve`** (default) | Download whole TS segments → concat demuxer → **`-c copy`** only; window snaps to segment boundaries | Pixel comparison / forensic (Oxco) |
-| **`exact`** | Docker: ffmpeg reads `.m3u8` with libx264 CRF 20 (+ segment fallback with trim). Browser HLS: remux segments, then `clip_local_media_window` to the marked times | Frame-accurate in/out at marked times |
+| **`preserve`** (default) | Download whole segments → concat demuxer → **`-c copy`** only; window snaps to segment boundaries | Pixel comparison / forensic (Oxco) |
+| **`exact`** | Docker: download segments (+2 preroll) → concat demuxer → `trim`/`atrim`, libx264 CRF 20. Browser HLS: remux segments, then `clip_local_media_window` to the marked times | Frame-accurate in/out at marked times |
 
-**Exact mode — primary:** ffmpeg reads the **`.m3u8` URL** directly (`-ss` / `-to` on the playlist timeline). Finished message includes **`ok (ffmpeg-hls)`** when this path succeeded.
+**Order (both modes):** Python downloads the segments first — it handles fMP4 init, BYTERANGE, AES-128, discontinuities and CDNs that reject ffmpeg (phncdn: 410). The first segment is checked by its bytes; an HTML/JSON error page fails at once with advice. Only if the segment path fails does ffmpeg read the **`.m3u8` URL** directly (`ok (copy-ffmpeg)` / `ok (ffmpeg-hls)`). Normal messages: **`ok (copy-segments)`** (preserve), **`ok (segments)`** (exact).
 
-**Exact mode — fallback:** download TS segments → **ffmpeg concat demuxer** → trim/`atrim` or re-encode. Message: **`ok (segments)`**.
+**Separate audio:** if the chosen master variant has an `#EXT-X-MEDIA:TYPE=AUDIO` playlist, video and audio are clipped separately and muxed (`+ separate audio`).
 
-**Preserve mode:** finished message **`ok (copy)`**. Clip may start/end slightly earlier/later than markers (whole HLS segments only).
+**Errors:** known patterns (`no tfhd`, 403/404/410/429, HTML instead of video, DNS, timeout) get a `Hinweis: …` in plain German before the technical text. Each failed job stores a diagnose report (`DOWNLOAD_DIR/.diag/<id>.json`, 7 days, deleted with the job).
+
+**Preserve mode:** clip may start/end slightly earlier/later than markers (whole HLS segments only).
 
 **Post-render (`post_render`, optional, orthogonal to encode mode):** when enabled, after the clip/merge is written the MP4 is re-encoded once via `rerender_for_editing()` (`hls_clipper.py`): constant frame rate (`-vsync cfr` at the source `r_frame_rate`), PTS reset to 0 (`setpts=PTS-STARTPTS`), audio re-synced (`aresample=async=1:first_pts=0`), libx264 CRF 18 + `+faststart`. This replaces the stream-copy faststart remux for that file. Fixes editors/ML pipelines that freeze the last frame for ~2s or choke on open-GOP / non-keyframe starts. Finished message gets **`+ rerender cfr`** appended. On failure it falls back to the normal faststart remux. Runs on every completion path (single, clip, merge, progressive) because it lives in `_mark_finished`.
 
-**Start quality (exact):** native path uses ~10s decode preroll (`-ss` before + after `-i`). Fallback prepends **two** HLS segments and uses `trim`/`atrim` on the concat demuxer.
+**Start quality (exact):** the segment path prepends **two** HLS segments and uses `trim`/`atrim` on the concat demuxer; the ffmpeg-direct fallback uses ~10s decode preroll (`-ss` before + after `-i`).
 
-**Duration check (exact):** if native ffmpeg output is much longer than `end − start`, fallback runs automatically.
+**Duration check:** output much shorter than the window fails with “nur Xs von ~Ys geladen”.
 
 **Browser HLS (`browser_fetch`):** remux is stream-copy of whole segments. With **`exact`**, ingest then re-encodes a trim using `timeline_start` (first downloaded segment) so a later time edit (e.g. −10s) is actually cut. **Merge** posts `parts=timeline:bytes;…` and trims each scene before concat. Changing times on an already finished job does nothing — send again. The popup sends whatever is in the time fields at click (so 16:55 → 16:45 is not lost if Merge is clicked before blur finishes).
 
@@ -73,6 +75,7 @@ Docker dev: `deploy/docker-compose.yml` mounts `../backend` into the container s
 - Manual **Auf PC speichern** always works.
 - Keep a **single** tab on `http://localhost:8090/` when using auto-save.
 - Jobs sorted by `created_at` (ids are random). Running jobs get **Cancel** (`POST /api/jobs/{id}/cancel`).
+- Failed jobs with a report get **Diagnose** (downloads `GET /api/jobs/{id}/diagnose`).
 - With `CLIP_DIRECT_TOKEN` set, a 401 prompts once for the token (stored in `localStorage`, sent as header and `?token=` on file links).
 
 ## HLS implementation (`backend/hls_clipper.py`)

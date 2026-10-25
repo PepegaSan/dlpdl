@@ -89,6 +89,7 @@ Default port: **8090**. Map `downloads` volume as needed (see `deploy/SYNOLOGY.m
 | `GET` | `/api/jobs/{id}` | Job status |
 | `GET` | `/api/jobs/{id}/file` | Download finished file |
 | `POST` | `/api/jobs/{id}/cancel` | Stop a pending/running job (kills ffmpeg/yt-dlp) |
+| `GET` | `/api/jobs/{id}/diagnose` | JSON report of a failed job (playlist excerpt, HTTP statuses, attempts, ffmpeg errors; tokens masked) |
 | `DELETE` | `/api/jobs/{id}` | Remove job (cancels it if still running) |
 
 `POST` bodies must be `application/json` (except the extension's `/ingest` upload). Only `http(s)` URLs are accepted; `ytdl_options_overrides` is limited to a whitelist (headers, HLS/downloader options).
@@ -106,6 +107,10 @@ Default port: **8090**. Map `downloads` volume as needed (see `deploy/SYNOLOGY.m
 | `FFMPEG_TIMEOUT_SEC` | `1800` | Hard limit per ffmpeg call |
 
 Requests from other websites (foreign `Origin`) are rejected; the extension and the bundled UI are allowed.
+
+### Tests
+
+`pip install -r requirements-dev.txt`, then `python -m pytest`. The HLS tests generate real streams with ffmpeg (skipped if ffmpeg is missing) and serve them locally with typical CDN quirks.
 
 ## Publishing your own repository
 

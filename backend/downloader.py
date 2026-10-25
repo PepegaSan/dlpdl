@@ -43,6 +43,16 @@ from .hls_clipper import (
     set_cancel_token,
     trim_media_to_duration,
 )
+from .diagnostics import (
+    Diagnostics,
+    purge_old_reports,
+    redact_url,
+    remove_report,
+    report_path,
+    save_report,
+    set_diagnostics,
+)
+from .media_probe import explain_failure
 from .smart_clip import is_hls_url, smart_clip_hls
 
 log = logging.getLogger('clip_direct')
@@ -104,6 +114,8 @@ class JobState:
     browser_fetch: bool = False
     ingest_started: bool = False
     token: CancelToken = field(default_factory=CancelToken, repr=False)
+    diag: Diagnostics = field(default_factory=Diagnostics, repr=False)
+    has_diagnose: bool = False
 
 
 class JobRunner:
@@ -116,6 +128,7 @@ class JobRunner:
         self._lock = threading.Lock()
         self._slots = threading.Semaphore(MAX_PARALLEL_JOBS)
         self._purge_orphan_temp()
+        purge_old_reports(download_dir)
         threading.Thread(target=self._reap_stale_jobs, daemon=True).start()
 
     def _purge_orphan_temp(self) -> None:
@@ -195,6 +208,7 @@ class JobRunner:
             'browser_fetch': j.browser_fetch,
             'created_at': j.created_at,
             'downloadable': bool(j.status == 'ready' and file_path),
+            'has_diagnose': j.has_diagnose,
         }
 
     def create_job(self, spec: JobSpec) -> str:
@@ -459,6 +473,13 @@ class JobRunner:
             shutil.rmtree(job_tmp, ignore_errors=True)
             return False, 'unknown job'
         set_cancel_token(state.token)
+        set_diagnostics(state.diag)
+        state.diag.note(
+            'browser_ingest',
+            bytes=os.path.getsize(raw_path) if os.path.isfile(raw_path) else 0,
+            parts=len(parts or []),
+            timeline_start=timeline_start,
+        )
         out_dir = resolve_output_dir(self.download_dir, state.spec.folder)
         stem = allocate_unique_stem(out_dir, build_output_stem(state.spec))
         out_mp4 = os.path.join(out_dir, f'{stem}.mp4')
@@ -477,6 +498,7 @@ class JobRunner:
             return False, str(exc)
         finally:
             set_cancel_token(None)
+            set_diagnostics(None)
             release_stem(out_dir, stem)
             shutil.rmtree(job_tmp, ignore_errors=True)
 
@@ -580,7 +602,11 @@ class JobRunner:
                 os.remove(j.filepath)
             except OSError:
                 pass
+        remove_report(self.download_dir, job_id)
         return True
+
+    def diagnose_path(self, job_id: str) -> Optional[str]:
+        return report_path(self.download_dir, job_id)
 
     def _update(self, job_id: str, **kwargs) -> None:
         with self._lock:
@@ -593,9 +619,37 @@ class JobRunner:
             # Late progress events must not reset a finished/failed job to "running".
             if j.status in ('ready', 'error') and kwargs.get('status') == 'running':
                 return
+            failing = kwargs.get('status') == 'error' and j.status != 'error'
+            if failing:
+                raw_error = kwargs.get('error') or kwargs.get('msg') or ''
+                friendly = explain_failure(raw_error)
+                kwargs['error'] = friendly
+                if kwargs.get('msg') == raw_error:
+                    kwargs['msg'] = friendly
             for k, v in kwargs.items():
                 setattr(j, k, v)
             j.updated_at = time.time()
+        if failing:
+            self._save_diagnose(j, raw_error)
+
+    def _save_diagnose(self, j: JobState, raw_error: str) -> None:
+        spec = j.spec
+        report = {
+            'job_id': j.id,
+            'created_at': j.created_at,
+            'failed_at': time.time(),
+            'error': raw_error,
+            'error_shown': j.error,
+            'url': redact_url(spec.url),
+            'page_url': redact_url(spec.page_url) if spec.page_url else '',
+            'clip_ranges': spec.clip_ranges or [[spec.clip_start, spec.clip_end]],
+            'encode_mode': spec.clip_encode_mode,
+            'browser_fetch': j.browser_fetch,
+            'header_names': sorted((spec.ytdl_opts.get('http_headers') or {}).keys()),
+            **j.diag.to_dict(),
+        }
+        if save_report(self.download_dir, j.id, report):
+            j.has_diagnose = True
 
     def _run_job(self, job_id: str) -> None:
         with self._lock:
@@ -606,6 +660,7 @@ class JobRunner:
             if state.token.cancelled:
                 return
         set_cancel_token(state.token)
+        set_diagnostics(state.diag)
         job_temp = os.path.join(self.temp_dir, job_id)
         worker: Optional[_DownloadWorker] = None
         try:
@@ -616,6 +671,7 @@ class JobRunner:
             pass
         finally:
             set_cancel_token(None)
+            set_diagnostics(None)
             self._slots.release()
             shutil.rmtree(job_temp, ignore_errors=True)
             if worker is not None:
