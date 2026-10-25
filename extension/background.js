@@ -96,7 +96,7 @@ function shouldRememberCookies(url) {
 function rememberTabCookies(tabId, url, cookieHeader) {
   if (!cookieHeader || tabId == null || tabId < 0) return;
   if (shouldRememberCookies(url)) {
-    session.rememberRequestCookies(tabId, cookieHeader);
+    session.rememberRequestCookies(tabId, cookieHeader, url);
   }
 }
 
@@ -562,7 +562,7 @@ async function queueStream(stream, pageUrl, clips, mergeClips, tabHint = null) {
   if (isClipDirectUiUrl(tabUrl)) {
     tabUrl = pageUrl || tabUrl;
   }
-  const tabCookies = tabId != null ? session.cookieHeader(tabId) : '';
+  const tabCookies = tabId != null ? session.cookieHeader(tabId, stream.url) : '';
   let mergedCookies = mergeCookieHeader(stream.cookie, tabCookies);
   try {
     const apiCookies = await collectStreamCookies(stream.url, pageUrl, tabUrl);
@@ -571,7 +571,7 @@ async function queueStream(stream, pageUrl, clips, mergeClips, tabHint = null) {
     console.warn('Clip-Direct: cookie collection failed, sending without API cookies', err);
   }
   if (mergedCookies && tabId != null) {
-    session.rememberRequestCookies(tabId, mergedCookies);
+    session.rememberRequestCookies(tabId, mergedCookies, stream.url);
   }
   const enriched = normalizeStreamForQueue(
     enrichStreamForQueue(

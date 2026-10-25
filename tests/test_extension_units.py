@@ -63,6 +63,63 @@ console.log(JSON.stringify({
     assert res['newest'].endswith('seg-40.mp4')
 
 
+COOKIE_STUB = '''
+// chrome.cookies.getAll with real matching rules: url → host/domain match, domain → suffix match,
+// partitioned cookies only when the same partitionKey is asked for.
+const COOKIES = [
+  { name: 'sid', value: 'page-session', domain: 'tube-site.com' },
+  { name: 'cf_clearance', value: 'cdn-ok', domain: '.hoster-cdn.net' },
+  { name: 'embed_token', value: 'player', domain: 'hoster.com' },
+  { name: 'player_part', value: 'chips', domain: 'cdn7.hoster-cdn.net', partitionKey: { topLevelSite: 'https://tube-site.com' } },
+  { name: 'dood_sess', value: 'dood', domain: 'dood.video' },
+  { name: 'cdata', value: 'cloud', domain: 'www.cloudatacdn.com' },
+];
+const matchesDomain = (host, domain) => {
+  const d = domain.replace(/^\\./, '');
+  return host === d || host.endsWith(`.${d}`);
+};
+globalThis.chrome = { cookies: { getAll: async (q) => COOKIES.filter((c) => {
+  const partition = q.partitionKey?.topLevelSite || null;
+  if ((c.partitionKey?.topLevelSite || null) !== partition) return false;
+  if (q.url) return matchesDomain(new URL(q.url).hostname, c.domain);
+  if (q.domain) return matchesDomain(c.domain.replace(/^\\./, ''), q.domain);
+  return false;
+}) } };
+'''
+
+
+def test_only_the_stream_hosts_cookies_are_sent():
+    res = _node(COOKIE_STUB + '''
+const { collectStreamCookies } = await import(__COOKIES__);
+const page = 'https://tube-site.com/video/123';
+console.log(JSON.stringify({
+  cdn: await collectStreamCookies('https://cdn7.hoster-cdn.net/hls/abc/index.m3u8', page, page),
+  cloud: await collectStreamCookies('https://cdn3.cloudatacdn.com/v/abc.mp4', page, page),
+}));
+''', COOKIES='browser-cookies.js')
+    cdn = dict(part.split('=', 1) for part in res['cdn'].split('; '))
+    assert set(cdn) == {'cf_clearance', 'player_part'}, res['cdn']
+    # the known CDN root is included only for its own domain family
+    assert res['cloud'] == 'cdata=cloud'
+
+
+def test_tab_cookie_jar_is_scoped_to_the_stream_host_family():
+    res = _node('''
+globalThis.chrome = { storage: { session: { get: async () => ({}), set: async () => {} } } };
+const { TabSessionStore } = await import(__SESSION__);
+const store = new TabSessionStore();
+store.rememberRequestCookies(7, 'sid=page', 'https://tube-site.com/video/123');
+store.rememberRequestCookies(7, 'cf=a; tok=b', 'https://cdn7.hoster-cdn.net/hls/abc/seg1.ts');
+store.rememberRequestCookies(7, 'root=c', 'https://hoster-cdn.net/ping');
+console.log(JSON.stringify({
+  cdn: store.cookieHeader(7, 'https://cdn7.hoster-cdn.net/hls/abc/index.m3u8'),
+  other: store.cookieHeader(7, 'https://x9cdn.net/hls/abc/index.m3u8'),
+}));
+''', SESSION='tab-session.js')
+    assert res['cdn'] == 'cf=a; tok=b; root=c'
+    assert res['other'] == ''
+
+
 def test_forbidden_segment_is_not_retried_and_stops_the_other_workers():
     res = _node('''
 import { createServer } from 'node:http';

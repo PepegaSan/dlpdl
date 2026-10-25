@@ -99,6 +99,10 @@ All backend calls go through `apiFetch` in `lib/jobs-client.js` (optional `X-Cli
 
 **Browser HLS jobs** run in the service worker after the popup/bar already got "queued": one at a time, keepalive while working, active ids in `chrome.storage.session` so a restarted worker fails orphans instead of leaving them "running". DNR header rules are per job and only match extension requests (`tabIds: [-1]`).
 
+**Cookies for stream jobs** (`lib/browser-cookies.js`, tab jar in `lib/tab-session.js`): only what the browser itself would send to the stream host — its own cookies, parent-domain cookies, CHIPS-partitioned ones under the page's top-level site, and known CDN roots of the same domain family. The embedding page's session cookies are never forwarded.
+
+**Keep playback** (`lib/keep-playback-boot.js` → `lib/keep-playback.js`, MAIN world): injected only once the page shows a `<video>`; fakes `document.hidden`/`visibilityState` and swallows `visibilitychange`, nothing else (`pagehide`/`freeze` reach the page). After the window loses focus, a programmatic `pause()` within 2 s resumes that one video; user pauses are respected.
+
 **Shortcuts** (`manifest.json` `commands`): Alt+Shift+S mark start, Alt+Shift+E mark end (changeable at `chrome://extensions/shortcuts`).
 
 Content script (`content.js`) must **not** use ES `import` — run as a classic script in `manifest.json` (no `type: "module"`). Helpers are inlined at the top of `content.js`.

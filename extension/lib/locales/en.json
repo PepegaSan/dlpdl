@@ -75,7 +75,7 @@
   "options.keepPlayback": "Keep video playing in background tabs",
   "options.keepPlaybackOn": "On (CDN hosts, default)",
   "options.keepPlaybackOff": "Off — never intervene",
-  "options.keepPlaybackNote": "Stops tube/CDN players from pausing when you switch tabs (keeps the CDN session warm). YouTube and Vimeo are always excluded. Reload the video page (F5) after saving.",
+  "options.keepPlaybackNote": "Stops tube/CDN players from pausing when you switch tabs (keeps the CDN session warm). Only acts on pages that show a video; YouTube and Vimeo are always excluded. Reload the video page (F5) after saving.",
   "options.save": "Save",
   "options.saved": "Saved",
   "options.openWebUi": "Open web UI",

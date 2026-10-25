@@ -75,7 +75,7 @@
   "options.keepPlayback": "Video im Hintergrund weiterlaufen lassen",
   "options.keepPlaybackOn": "An (CDN-Hoster, Standard)",
   "options.keepPlaybackOff": "Aus — nie eingreifen",
-  "options.keepPlaybackNote": "Verhindert, dass Tube-/CDN-Player pausieren, wenn du den Tab wechselst (CDN-Session bleibt warm). YouTube und Vimeo sind immer ausgenommen. Nach dem Speichern die Videoseite neu laden (F5).",
+  "options.keepPlaybackNote": "Verhindert, dass Tube-/CDN-Player pausieren, wenn du den Tab wechselst (CDN-Session bleibt warm). Greift nur auf Seiten mit einem Video ein; YouTube und Vimeo sind immer ausgenommen. Nach dem Speichern die Videoseite neu laden (F5).",
   "options.save": "Speichern",
   "options.saved": "Gespeichert",
   "options.openWebUi": "Web-UI öffnen",

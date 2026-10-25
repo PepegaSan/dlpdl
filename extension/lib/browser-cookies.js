@@ -40,23 +40,18 @@ function httpOrigins(...raws) {
   return [...out];
 }
 
-function domainsForUrl(raw) {
-  const out = new Set();
-  if (!raw) return out;
+export function hostOf(url) {
   try {
-    const host = new URL(raw).hostname.toLowerCase();
-    out.add(host);
-    const parts = host.split('.');
-    if (parts.length >= 2) {
-      out.add(parts.slice(-2).join('.'));
-    }
-    if (parts.length >= 3) {
-      out.add(parts.slice(-3).join('.'));
-    }
+    return new URL(url).hostname.toLowerCase();
   } catch {
-    /* ignore */
+    return '';
   }
-  return out;
+}
+
+/** Same host, or one is a subdomain of the other. */
+export function hostsRelated(a, b) {
+  if (!a || !b) return false;
+  return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
 }
 
 /** Merge multiple `a=b; c=d` cookie header strings without duplicates. */
@@ -76,19 +71,16 @@ export function mergeCookieHeader(...parts) {
 }
 
 /**
- * Collect cookies for stream + page URLs and known CDN roots.
- * Later sources overwrite earlier ones so stream-host cookies win collisions.
+ * Cookies the browser itself would send to the stream host: its own (also
+ * those set on a parent domain) plus CHIPS-partitioned ones under the page's
+ * top-level site. Cookies of the embedding page or of unrelated CDNs never
+ * reach the stream host in the browser either, so they are not sent along —
+ * that keeps the page's session private and the Cookie header small.
  * @returns {Promise<string>} Cookie header value
  */
 export async function collectStreamCookies(streamUrl, pageUrl = '', tabUrl = '') {
-  const pageFirst = [pageUrl, tabUrl].filter(Boolean);
-  const urls = [...new Set([...pageFirst, streamUrl].filter(Boolean))];
-  const domains = new Set(CDN_ROOT_DOMAINS);
-  for (const raw of urls) {
-    for (const d of domainsForUrl(raw)) {
-      domains.add(d);
-    }
-  }
+  const streamHost = hostOf(streamUrl);
+  if (!streamHost) return '';
   const topLevels = httpOrigins(pageUrl, tabUrl);
 
   const jar = new Map();
@@ -100,13 +92,13 @@ export async function collectStreamCookies(streamUrl, pageUrl = '', tabUrl = '')
     }
   };
 
-  for (const url of urls) {
-    absorb(await getCookiesSafe({ url }));
-    for (const topLevelSite of topLevels) {
-      absorb(await getCookiesSafe({ url, partitionKey: { topLevelSite } }));
-    }
+  absorb(await getCookiesSafe({ url: streamUrl }));
+  for (const topLevelSite of topLevels) {
+    absorb(await getCookiesSafe({ url: streamUrl, partitionKey: { topLevelSite } }));
   }
-  for (const domain of domains) {
+  // Known CDN roots only when the stream belongs to that domain family.
+  for (const domain of CDN_ROOT_DOMAINS) {
+    if (!hostsRelated(streamHost, domain)) continue;
     absorb(await getCookiesSafe({ domain }));
     for (const topLevelSite of topLevels) {
       absorb(await getCookiesSafe({ domain, partitionKey: { topLevelSite } }));

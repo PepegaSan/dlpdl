@@ -2,6 +2,7 @@
  * Per-tab stream list and clip bundle in memory + chrome.storage.session.
  */
 
+import { hostOf, hostsRelated } from './browser-cookies.js';
 import { normalizeClockTime, parseClockTime } from './format-time.js';
 
 const STREAMS_KEY = 'cdDetectedStreams';
@@ -16,7 +17,7 @@ export class TabSessionStore {
   lastHlsSegmentUrlByTab = {};
   /** @type {Record<number, { clips: object[], pageUrl: string, pageKey: string, ts: number }>} */
   clipsByTab = {};
-  /** @type {Record<number, Record<string, string>>} */
+  /** @type {Record<number, Record<string, Record<string, string>>>} tab → host → name → value */
   cookieJarByTab = {};
   #streamTimer = null;
   #clipTimer = null;
@@ -97,9 +98,13 @@ export class TabSessionStore {
     return tabId != null ? this.lastHlsSegmentUrlByTab[tabId] : null;
   }
 
-  rememberRequestCookies(tabId, cookieHeader) {
+  /** Cookies this tab sent to `url`, kept per host so they only go back to that host's family. */
+  rememberRequestCookies(tabId, cookieHeader, url) {
     if (tabId == null || tabId < 0 || !cookieHeader) return;
-    const jar = { ...(this.cookieJarByTab[tabId] || {}) };
+    const host = hostOf(url);
+    if (!host) return;
+    const tabJar = { ...(this.cookieJarByTab[tabId] || {}) };
+    const jar = { ...(tabJar[host] || {}) };
     for (const part of cookieHeader.split(';')) {
       const piece = part.trim();
       if (!piece) continue;
@@ -107,13 +112,20 @@ export class TabSessionStore {
       if (eq <= 0) continue;
       jar[piece.slice(0, eq).trim()] = piece.slice(eq + 1).trim();
     }
-    this.cookieJarByTab[tabId] = jar;
+    tabJar[host] = jar;
+    this.cookieJarByTab[tabId] = tabJar;
   }
 
-  cookieHeader(tabId) {
-    const jar = this.cookieJarByTab[tabId];
-    if (!jar) return '';
-    return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+  /** Cookie header for a stream: only what this tab sent to the stream's own domain family. */
+  cookieHeader(tabId, streamUrl) {
+    const tabJar = this.cookieJarByTab[tabId];
+    const streamHost = hostOf(streamUrl);
+    if (!tabJar || !streamHost) return '';
+    const merged = {};
+    for (const [host, jar] of Object.entries(tabJar)) {
+      if (hostsRelated(host, streamHost)) Object.assign(merged, jar);
+    }
+    return Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('; ');
   }
 
   clearTab(tabId) {
