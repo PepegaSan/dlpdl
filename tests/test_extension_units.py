@@ -120,6 +120,46 @@ console.log(JSON.stringify({
     assert res['other'] == ''
 
 
+def test_fast_server_is_used_only_when_enabled_and_answering():
+    res = _node('''
+const { pickServer } = await import(__SELECT__);
+const calls = [];
+const answer = (status) => async (url, init) => {
+  calls.push({ url, token: init.headers['X-Clip-Direct-Token'] || '' });
+  return { ok: status >= 200 && status < 300, status };
+};
+const hang = () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error('timeout')), 50));
+const base = { clipDirectBaseUrl: 'http://nas:8090', apiToken: 'secret', fastServerEnabled: true };
+const pick = (patch, fetchImpl) => pickServer({ ...base, ...patch }, { fetchImpl, timeoutMs: 20 });
+const up = await pick({ fastServerUrl: 'http://pc-up:8090' }, answer(200));
+// same PC again within the cache window: no second probe, even though it would now fail
+const cached = await pick({ fastServerUrl: 'http://pc-up:8090' }, answer(500));
+const down = await pick({ fastServerUrl: 'http://pc-down:8090' }, hang);
+const forbidden = await pick({ fastServerUrl: 'http://pc-401:8090' }, answer(401));
+const off = await pick({ fastServerUrl: 'http://pc-off:8090', fastServerEnabled: false }, answer(200));
+const same = await pick({ fastServerUrl: 'http://nas:8090/' }, answer(200));
+console.log(JSON.stringify({
+  up: [up.clipDirectBaseUrl, up.serverRole],
+  down: [down.clipDirectBaseUrl, down.serverRole],
+  forbidden: forbidden.serverRole,
+  off: off.serverRole,
+  same: same.serverRole,
+  cached: cached.serverRole,
+  probes: calls.map((c) => c.url),
+  token: calls[0].token,
+}));
+''', SELECT='server-select.js')
+    assert res['up'] == ['http://pc-up:8090/', 'fast']
+    assert res['down'] == ['http://nas:8090/', 'main']
+    assert res['forbidden'] == 'main'
+    assert res['off'] == 'main'
+    assert res['same'] == 'main'
+    # second call for the same PC within the cache window reuses the first probe
+    assert res['cached'] == 'fast'
+    assert res['probes'] == ['http://pc-up:8090/api/jobs', 'http://pc-401:8090/api/jobs']
+    assert res['token'] == 'secret'
+
+
 def test_forbidden_segment_is_not_retried_and_stops_the_other_workers():
     res = _node('''
 import { createServer } from 'node:http';

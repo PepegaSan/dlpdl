@@ -2,7 +2,8 @@ import { applyI18n, initI18n, t } from './lib/i18n.js';
 import { clipsForMerge, selectedClips } from './lib/jobs-client.js';
 import { openClipDirectUi } from './lib/open-ui.js';
 import { formatClockTime, normalizeClockTime, parseClockTime } from './lib/format-time.js';
-import { loadSettings, saveClipDraft } from './lib/storage.js';
+import { serverReachable } from './lib/server-select.js';
+import { loadSettings, saveClipDraft, saveSettings } from './lib/storage.js';
 const statusEl = document.getElementById('status');
 const pageUrlEl = document.getElementById('pageUrl');
 const nowTimeEl = document.getElementById('nowTime');
@@ -28,6 +29,7 @@ const streamCountEl = document.getElementById('streamCount');
 const streamListEl = document.getElementById('streamList');
 const btnClearStreams = document.getElementById('btnClearStreams');
 const btnOpenUi = document.getElementById('btnOpenUi');
+const btnFastServer = document.getElementById('btnFastServer');
 const btnCopyClips = document.getElementById('btnCopyClips');
 const btnPasteClips = document.getElementById('btnPasteClips');
 const clipClipboardHint = document.getElementById('clipClipboardHint');
@@ -62,7 +64,13 @@ optionsLink.addEventListener('click', (e) => {
 btnOpenUi?.addEventListener('click', async () => {
   try {
     const settings = await loadSettings();
-    await openClipDirectUi(settings.clipDirectBaseUrl);
+    let base = settings.clipDirectBaseUrl;
+    if (settings.fastServerEnabled) {
+      // Jobs may have gone to the PC instance: open the UI of the server that got the last one.
+      const { cdLastServerUrl } = await chrome.storage.local.get('cdLastServerUrl');
+      if (cdLastServerUrl) base = cdLastServerUrl;
+    }
+    await openClipDirectUi(base);
     setStatus('popup.status.webUiOpened');
   } catch (err) {
     setStatus('popup.status.webUiFailed', { error: err?.message || err });
@@ -72,6 +80,36 @@ btnOpenUi?.addEventListener('click', async () => {
 function sendBg(action, extra = {}) {
   return chrome.runtime.sendMessage({ action, ...extra });
 }
+
+let fastTimer = null;
+let fastProbeBusy = false;
+
+/** PC pill: shows whether the PC instance is preferred and answering; a click toggles it. */
+async function refreshFastServer() {
+  if (!btnFastServer || fastProbeBusy) return;
+  fastProbeBusy = true;
+  try {
+    const settings = await loadSettings();
+    const url = String(settings.fastServerUrl || '').trim();
+    btnFastServer.hidden = !url;
+    if (!url) return;
+    let state = 'off';
+    if (settings.fastServerEnabled) {
+      state = (await serverReachable(url, settings.apiToken)) ? 'on' : 'down';
+    }
+    btnFastServer.classList.toggle('is-on', state === 'on');
+    btnFastServer.classList.toggle('is-down', state === 'down');
+    btnFastServer.title = t(`popup.pc.${state}`, { url });
+  } finally {
+    fastProbeBusy = false;
+  }
+}
+
+btnFastServer?.addEventListener('click', async () => {
+  const settings = await loadSettings();
+  await saveSettings({ fastServerEnabled: !settings.fastServerEnabled });
+  await refreshFastServer();
+});
 
 function activeClipSource() {
   if (clips.length) return clips;
@@ -478,9 +516,10 @@ async function sendStream(stream, withClips, button, mergeClips = false) {
       mergeClips,
     });
     if (result?.ok) {
-      if (mergeClips) setStatus('popup.status.mergeQueued');
-      else if (withClips) setStatus('popup.status.cutQueued');
-      else setStatus('popup.status.streamQueued');
+      const tag = serverTag(result);
+      if (mergeClips) setStatus('popup.status.mergeQueued', undefined, tag);
+      else if (withClips) setStatus('popup.status.cutQueued', undefined, tag);
+      else setStatus('popup.status.streamQueued', undefined, tag);
     } else if (result?.errorKey) {
       setStatus('popup.status.error', { error: t(result.errorKey) });
     } else {
@@ -648,13 +687,18 @@ function statusTone(key) {
   return 'error';
 }
 
-function setStatus(keyOrText, params) {
+/** " → PC" when the job went to the fast server, so the user knows which Web-UI to look at. */
+function serverTag(result) {
+  return result?.serverRole === 'fast' ? ` ${t('popup.server.fastTag')}` : '';
+}
+
+function setStatus(keyOrText, params, suffix = '') {
   clearTimeout(statusTimer);
   statusKey = keyOrText;
   if (keyOrText.includes('.')) {
-    statusEl.textContent = t(keyOrText, params);
+    statusEl.textContent = t(keyOrText, params) + suffix;
   } else {
-    statusEl.textContent = keyOrText;
+    statusEl.textContent = keyOrText + suffix;
   }
   const tone = statusTone(keyOrText);
   statusEl.className = `status tone-${tone}`;
@@ -892,7 +936,7 @@ async function sendQueue(mergeClips) {
     mergeClips,
   });
   if (result?.ok) {
-    setStatus('popup.status.sent');
+    setStatus('popup.status.sent', undefined, serverTag(result));
   } else if (result?.errorKey) {
     setStatus('popup.status.error', { error: t(result.errorKey) });
   } else {
@@ -908,10 +952,13 @@ async function boot() {
   await refresh();
   await refreshStreams();
   pollTimer = setInterval(poll, 1000);
+  void refreshFastServer();
+  fastTimer = setInterval(refreshFastServer, 5000);
 }
 
 boot();
 
 window.addEventListener('unload', () => {
   if (pollTimer) clearInterval(pollTimer);
+  if (fastTimer) clearInterval(fastTimer);
 });

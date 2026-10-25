@@ -38,6 +38,7 @@ import { openClipDirectUi } from './lib/open-ui.js';
 import { collectStreamCookies, mergeCookieHeader } from './lib/browser-cookies.js';
 import { enrichStreamForQueue, httpHeadersForStream } from './lib/stream-headers.js';
 import { loadSettings } from './lib/storage.js';
+import { pickServer } from './lib/server-select.js';
 import { TabSessionStore } from './lib/tab-session.js';
 
 const BADGE_COLOR = '#22c55e';
@@ -218,6 +219,20 @@ async function activeTabId() {
   return tab?.id;
 }
 
+const LAST_SERVER_KEY = 'cdLastServerUrl';
+
+/** Settings for a new job: the PC instance when enabled and reachable, else the main server. */
+async function loadQueueSettings() {
+  const settings = await pickServer(await loadSettings());
+  try {
+    // The popup's Web-UI button opens the server that got the last job.
+    await chrome.storage.local.set({ [LAST_SERVER_KEY]: settings.clipDirectBaseUrl });
+  } catch {
+    /* ignore */
+  }
+  return settings;
+}
+
 async function jobBodyWithTabMeta(body, tabId) {
   const enriched = { ...body };
   const id = tabId ?? (await activeTabId());
@@ -265,10 +280,11 @@ async function postJob(settings, body, tabId) {
       error: backendError(text, res.statusText),
     };
   }
+  const serverRole = settings.serverRole || 'main';
   try {
-    return { ok: true, data: JSON.parse(text) };
+    return { ok: true, data: JSON.parse(text), serverRole };
   } catch {
-    return { ok: true, data: { raw: text } };
+    return { ok: true, data: { raw: text }, serverRole };
   }
 }
 
@@ -415,11 +431,11 @@ function holdServiceWorker(on) {
   }
 }
 
-async function trackBrowserJob(jobId, active) {
+async function trackBrowserJob(jobId, active, baseUrl = '') {
   const key = `${ACTIVE_JOB_PREFIX}${jobId}`;
   try {
     if (active) {
-      await chrome.storage.session.set({ [key]: Date.now() });
+      await chrome.storage.session.set({ [key]: { at: Date.now(), baseUrl } });
     } else {
       await chrome.storage.session.remove(key);
     }
@@ -441,7 +457,10 @@ async function failOrphanBrowserJobs() {
   const settings = await loadSettings();
   await initI18n(settings.uiLocale).catch(() => {});
   for (const key of keys) {
-    await failBrowserJob(settings, key.slice(ACTIVE_JOB_PREFIX.length), t('progress.workerRestarted'));
+    // The job may live on the PC instance; fail it where it was created.
+    const baseUrl = all[key]?.baseUrl;
+    const target = baseUrl ? { ...settings, clipDirectBaseUrl: baseUrl } : settings;
+    await failBrowserJob(target, key.slice(ACTIVE_JOB_PREFIX.length), t('progress.workerRestarted'));
   }
 }
 
@@ -514,7 +533,7 @@ function enqueueBrowserFetch(job) {
 }
 
 async function queueStreamBrowser(stream, pageUrl, tabUrl, clips, mergeClips, tabId, mergedCookies) {
-  const settings = await loadSettings();
+  const settings = await loadQueueSettings();
   const headers = httpHeadersForStream(stream, pageUrl, tabUrl, mergedCookies);
   const body = buildStreamJobPayload(
     settings,
@@ -532,7 +551,7 @@ async function queueStreamBrowser(stream, pageUrl, tabUrl, clips, mergeClips, ta
   if (!jobId) {
     return { ok: false, error: 'no job id' };
   }
-  await trackBrowserJob(jobId, true);
+  await trackBrowserJob(jobId, true, settings.clipDirectBaseUrl);
   const windows = clipWindows(clips, mergeClips);
   enqueueBrowserFetch({
     settings,
@@ -621,7 +640,7 @@ async function queueStream(stream, pageUrl, clips, mergeClips, tabHint = null) {
       enriched, pageUrl, tabUrl, valid, !!mergeClips, tabId, mergedCookies,
     );
   }
-  const settings = await loadSettings();
+  const settings = await loadQueueSettings();
   const body = buildStreamJobPayload(
     settings,
     enriched,
@@ -783,7 +802,7 @@ async function queueClips(pageUrl, clips, mergeClips, tabHint = null) {
   if (!clips?.length) {
     return { ok: false, error: 'no_clips' };
   }
-  const settings = await loadSettings();
+  const settings = await loadQueueSettings();
   const tabId = await tabIdForQueue(tabHint);
 
   // MeTube behaviour: page URL for sites with yt-dlp extractors (YouTube, Vimeo, …).
@@ -830,7 +849,7 @@ async function queueFromPage(pageUrl, tabHint) {
     if (valid.length) {
       return queueClips(resolvedPage, valid, false, tabId);
     }
-    const settings = await loadSettings();
+    const settings = await loadQueueSettings();
     const body = buildPageJobPayload(settings, resolvedPage, [], false);
     const result = await postJob(settings, body, tabId);
     if (result.ok) await maybeOpenUi(settings);

@@ -605,7 +605,7 @@ function sendFromBar() {
     pageUrl: submitUrlForHref(location.href),
   }).then((res) => {
     if (res?.ok) {
-      setBarStatus(cdT('bar.status.sent'), 'ok');
+      setBarStatus(cdT(res.serverRole === 'fast' ? 'bar.status.sentFast' : 'bar.status.sent'), 'ok');
       return res;
     }
     const err = res?.errorKey ? cdT(res.errorKey) : (res?.error || 'error');

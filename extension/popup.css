@@ -107,6 +107,43 @@ h1 {
   background: var(--surface-2);
   color: var(--text);
 }
+/* PC render instance: grey = off, green = on and answering, orange = on but silent */
+.pc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.4px;
+}
+.pc-pill::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+.pc-pill.is-on {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.pc-pill.is-on::before {
+  background: var(--ok);
+}
+.pc-pill.is-down {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.pc-pill.is-down::before {
+  background: var(--warn);
+}
 
 /* Status banner */
 .status {

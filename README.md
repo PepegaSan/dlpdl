@@ -80,6 +80,38 @@ Default port: **8090**. Map `downloads` volume as needed (see `deploy/SYNOLOGY.m
 
 `docker-compose.yml` mounts `backend/` and `ui/` from your clone so UI/i18n updates apply after **container restart** without a full rebuild.
 
+## Rendering on your PC while the server runs on the NAS (optional)
+
+`exact` clips, post-render and merge fallbacks re-encode with libx264 — slow on a NAS CPU. A second Clip-Direct instance on the PC writes into the **same NAS folder** the container uses, and the extension prefers it whenever it answers.
+
+### Setup
+
+1. Map the NAS share that holds the clone as a network drive (compose mounts `../downloads`, so the target is `<drive>:\<clone>\downloads`). A UNC path (`\\<nas>\<share>\<clone>\downloads`) works as well.
+2. Double-click **`setup-pc.bat`** in your PC clone. It
+   - searches the mapped drives for a Clip-Direct clone (`deploy\docker-compose.yml` + `downloads`) and asks you to confirm, or to type the path if nothing is found;
+   - checks Python 3.11+ and ffmpeg on `PATH`, installs the Python dependencies if missing;
+   - writes `%LOCALAPPDATA%\clip-direct\pc-render.json` (download folder as UNC path, local temp folder, port, bind address, token);
+   - asks whether to **start at logon** and then registers a Task Scheduler job that runs `pythonw -m backend.pc_render` without a window (20 s after logon, restarted on failure);
+   - adds Start-menu entries *Clip-Direct → PC Render starten / beenden*;
+   - starts the instance (bound to `127.0.0.1:8090`, log in `%LOCALAPPDATA%\clip-direct\pc-render.log`) and prints the values for the extension.
+3. In the extension popup click the **PC** dot (grey → green), or use the options page (*Fast server on this PC*, *Prefer the PC when reachable*, *Test reachability*).
+
+`setup-pc.bat -Remove` removes task, shortcuts and configuration; `setup-pc.bat -Stop` only stops the instance. `start.bat` and `start.ps1` pick the configuration up as well, so a visible console start keeps working.
+
+### What you may need to change
+
+| Situation | What to do |
+| --- | --- |
+| Port 8090 is taken on the PC (e.g. a local Docker instance) | `setup-pc.bat -Port 8091`, then enter `http://localhost:8091/` in the extension |
+| The NAS runs with `CLIP_DIRECT_TOKEN` | `setup-pc.bat -Token <same token>` — both instances must use the same token (or none) |
+| The clone is not on a mapped drive | `setup-pc.bat -DownloadDir "\\<nas>\<share>\<clone>\downloads"` |
+| Other PCs in the LAN should use this instance too | `setup-pc.bat -BindHost 0.0.0.0` (consider a token) |
+| No autostart wanted | answer `n`, or `setup-pc.bat -NoAutostart`; use the Start-menu entry instead |
+| Task Scheduler reports an error | the account name is taken from `WindowsIdentity` (`PC-NAME\User`), which also works when the PC is named like the user; if it still fails, copy the Start-menu shortcut *PC Render starten* into `shell:startup` |
+| Re-run or change settings | just run `setup-pc.bat` again with the new parameters — it overwrites the configuration and restarts the instance |
+
+The NAS address stays the main server in the extension. Each job probes the PC (`GET /api/jobs`, 1.5 s, cached 10 s); if it answers, download *and* encode run there (also with the browser's IP, which helps CDNs that bind tokens to it), otherwise the job goes to the NAS as before. The popup and the on-page bar show `→ PC`, the PC dot turns orange when the instance is preferred but silent, and the Web-UI button opens the instance that took the last job. Both instances keep their own job list.
+
 ## API (summary)
 
 | Method | Path | Purpose |

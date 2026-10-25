@@ -1,9 +1,12 @@
 import { openClipDirectUi } from './lib/open-ui.js';
-import { applyI18n, initI18n } from './lib/i18n.js';
+import { applyI18n, initI18n, t } from './lib/i18n.js';
+import { resetServerProbe, serverReachable } from './lib/server-select.js';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings } from './lib/storage.js';
 
 const fields = [
   'clipDirectBaseUrl',
+  'fastServerUrl',
+  'fastServerEnabled',
   'uiLocale',
   'saveTarget',
   'folder',
@@ -16,7 +19,12 @@ const fields = [
   'apiToken',
 ];
 
-const boolFields = new Set(['openUiAfterQueue', 'postRender', 'keepPlayback']);
+const boolFields = new Set(['openUiAfterQueue', 'postRender', 'keepPlayback', 'fastServerEnabled']);
+
+function withSlash(value) {
+  const s = String(value || '').trim();
+  return s && !s.endsWith('/') ? `${s}/` : s;
+}
 
 async function init() {
   const s = await loadSettings();
@@ -45,15 +53,26 @@ document.getElementById('save').addEventListener('click', async () => {
       patch[key] = el.value;
     }
   }
-  let base = String(patch.clipDirectBaseUrl || '').trim();
-  if (base && !base.endsWith('/')) base += '/';
+  const base = withSlash(patch.clipDirectBaseUrl);
   if (base) patch.clipDirectBaseUrl = base;
+  patch.fastServerUrl = withSlash(patch.fastServerUrl);
+  resetServerProbe();
   await saveSettings(patch);
   await initI18n(patch.uiLocale);
   applyI18n();
   const saved = document.getElementById('saved');
   saved.hidden = false;
   setTimeout(() => { saved.hidden = true; }, 2000);
+});
+
+document.getElementById('testFastServer')?.addEventListener('click', async () => {
+  const result = document.getElementById('fastServerResult');
+  const url = withSlash(document.getElementById('fastServerUrl')?.value);
+  const token = document.getElementById('apiToken')?.value || '';
+  result.textContent = '…';
+  const ok = url ? await serverReachable(url, token) : false;
+  result.textContent = t(ok ? 'options.fastServerOk' : 'options.fastServerFail');
+  result.style.color = ok ? 'green' : '#b02a37';
 });
 
 document.getElementById('openUi')?.addEventListener('click', async () => {

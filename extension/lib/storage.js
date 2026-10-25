@@ -15,10 +15,14 @@ import { draftKeyForHref } from './page-url.js';
  * @property {boolean} keepPlayback keep CDN videos playing in background tabs
  * @property {string} uiLocale en | de
  * @property {string} apiToken optional CLIP_DIRECT_TOKEN of the backend
+ * @property {string} fastServerUrl optional second instance on the PC (see lib/server-select.js)
+ * @property {boolean} fastServerEnabled send jobs to fastServerUrl when it answers
  */
 
 export const DEFAULT_SETTINGS = {
   clipDirectBaseUrl: 'http://localhost:8090/',
+  fastServerUrl: 'http://localhost:8090/',
+  fastServerEnabled: false,
   uiLocale: 'en',
   saveTarget: 'browser',
   downloadType: 'video',

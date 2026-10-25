@@ -26,6 +26,16 @@
   <label data-i18n="options.apiToken"></label>
   <input type="password" id="apiToken" autocomplete="off" />
   <p class="note" data-i18n="options.apiTokenNote"></p>
+  <label data-i18n="options.fastServerUrl"></label>
+  <input type="url" id="fastServerUrl" placeholder="http://localhost:8090/" />
+  <label data-i18n="options.fastServerEnabled"></label>
+  <select id="fastServerEnabled">
+    <option value="false" data-i18n="options.fastServerOff"></option>
+    <option value="true" data-i18n="options.fastServerOn"></option>
+  </select>
+  <p class="note" data-i18n="options.fastServerNote"></p>
+  <button type="button" id="testFastServer" style="margin-top:4px" data-i18n="options.fastServerTest"></button>
+  <span id="fastServerResult" class="note"></span>
   <label data-i18n="options.saveTarget"></label>
   <select id="saveTarget">
     <option value="browser" data-i18n="options.saveBrowser"></option>

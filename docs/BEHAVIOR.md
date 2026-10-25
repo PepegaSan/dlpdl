@@ -105,6 +105,8 @@ All backend calls go through `apiFetch` in `lib/jobs-client.js` (optional `X-Cli
 
 **Keep playback** (`lib/keep-playback-boot.js` → `lib/keep-playback.js`, MAIN world): injected only once the page shows a `<video>`; fakes `document.hidden`/`visibilityState` and swallows `visibilitychange`, nothing else (`pagehide`/`freeze` reach the page). After the window loses focus, a programmatic `pause()` within 2 s resumes that one video; user pauses are respected.
 
+**Fast server** (`lib/server-select.js`): with `fastServerEnabled` every queue path (`queueClips`, `queueStream`, browser fetch, page bar) first probes `fastServerUrl` (`GET api/jobs`, 1.5 s, result cached 10 s) and swaps `clipDirectBaseUrl` in the settings copy it hands on, so progress/ingest/fail of a browser job reach the same instance. `postJob` results carry `serverRole` (`main`/`fast`) for the `→ PC` tag; `cdLastServerUrl` in `storage.local` tells the popup which Web-UI to open; orphaned browser jobs are failed on the instance that created them. The popup's **PC** pill probes `fastServerUrl` every 5 s while open and toggles `fastServerEnabled`. `setup-pc.ps1` writes `%LOCALAPPDATA%\clip-direct\pc-render.json` (UNC download dir, local temp dir, port, bind host, token); `backend/pc_render.py` maps it onto the environment and starts `backend.main`, logging to `pc-render.log` (used by the autostart task via `pythonw`, by `start.bat`, and read by `start.ps1` unless overridden).
+
 **Shortcuts** (`manifest.json` `commands`): Alt+Shift+S mark start, Alt+Shift+E mark end (changeable at `chrome://extensions/shortcuts`).
 
 Content script (`content.js`) must **not** use ES `import` — run as a classic script in `manifest.json` (no `type: "module"`). Helpers are inlined at the top of `content.js`.
