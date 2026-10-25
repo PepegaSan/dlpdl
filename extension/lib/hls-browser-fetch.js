@@ -43,10 +43,19 @@ function parseMasterVariant(text, baseUrl) {
   return bestUri;
 }
 
+/** `length[@offset]` → { length, offset }; offset null = continue after the previous range. */
+function parseByteRange(value) {
+  const match = String(value || '').trim().match(/^(\d+)(?:@(\d+))?$/);
+  if (!match) return null;
+  return { length: Number(match[1]), offset: match[2] != null ? Number(match[2]) : null };
+}
+
 function parseMediaPlaylist(text, baseUrl) {
   const segments = [];
   let pendingDuration = null;
+  let pendingRange = null;
   let timeline = 0;
+  const rangeEnd = new Map();
   /** fMP4/CMAF HLS: #EXT-X-MAP init segment (moov) every fragment needs. */
   let init = null;
   for (const raw of String(text).split(/\r?\n/)) {
@@ -57,10 +66,11 @@ function parseMediaPlaylist(text, baseUrl) {
         const range = line.match(/BYTERANGE="(\d+)(?:@(\d+))?"/i);
         init = {
           uri: resolveHlsUri(baseUrl, uri[1]),
-          length: range ? Number(range[1]) : null,
-          offset: range ? Number(range[2] || 0) : 0,
+          range: range ? { length: Number(range[1]), offset: Number(range[2] || 0) } : null,
         };
       }
+    } else if (line.startsWith('#EXT-X-BYTERANGE:')) {
+      pendingRange = parseByteRange(line.slice('#EXT-X-BYTERANGE:'.length));
     } else if (line.startsWith('#EXTINF:')) {
       const match = line.match(/#EXTINF:([\d.]+)/i);
       pendingDuration = match ? Number(match[1]) : 0;
@@ -68,26 +78,23 @@ function parseMediaPlaylist(text, baseUrl) {
       const duration = pendingDuration != null && Number.isFinite(pendingDuration)
         ? pendingDuration
         : 0;
-      segments.push({
-        uri: resolveHlsUri(baseUrl, line),
-        duration,
-        start: timeline,
-      });
+      const uri = resolveHlsUri(baseUrl, line);
+      let range = null;
+      if (pendingRange) {
+        const offset = pendingRange.offset ?? (rangeEnd.get(uri) || 0);
+        range = { length: pendingRange.length, offset };
+        rangeEnd.set(uri, offset + pendingRange.length);
+      }
+      segments.push({ uri, range, duration, start: timeline });
       timeline += duration;
       pendingDuration = null;
+      pendingRange = null;
     }
   }
   return { segments, duration: timeline, init };
 }
 
-async function fetchInitSegment(init, signal) {
-  if (!init) return null;
-  const blob = await fetchSegment(init.uri, signal);
-  if (init.length == null) return blob;
-  return blob.slice(init.offset, init.offset + init.length);
-}
-
-async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
+async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS, headers = undefined) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -95,6 +102,7 @@ async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
       cache: 'no-store',
       credentials: 'include',
       signal: ctrl.signal,
+      headers,
     });
     return res;
   } finally {
@@ -131,12 +139,16 @@ function throwIfAborted(signal) {
   }
 }
 
-async function fetchSegment(url, signal) {
+/** @returns {Promise<{ blob: Blob, partial: boolean }>} partial = server honoured Range (206). */
+async function fetchSegmentResponse(url, signal, range) {
+  const headers = range
+    ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` }
+    : undefined;
   let lastErr = `HTTP error for ${url}`;
   for (let attempt = 0; attempt < RETRIES; attempt += 1) {
     throwIfAborted(signal);
     try {
-      const res = await fetchWithTimeout(url);
+      const res = await fetchWithTimeout(url, FETCH_TIMEOUT_MS, headers);
       if (res.status === 429 || res.status >= 500) {
         lastErr = `HTTP ${res.status}`;
         await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
@@ -145,7 +157,7 @@ async function fetchSegment(url, signal) {
       if (!res.ok) {
         throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
       }
-      return await res.blob();
+      return { blob: await res.blob(), partial: res.status === 206 };
     } catch (err) {
       lastErr = err?.message || String(err);
       if (attempt >= RETRIES - 1) break;
@@ -153,6 +165,35 @@ async function fetchSegment(url, signal) {
     }
   }
   throw new Error(lastErr);
+}
+
+/**
+ * Segment or init bytes. `files` (uri → Promise<Blob|null>) holds the first
+ * Range request per file: if the CDN ignored Range and sent the whole file,
+ * every other byte range of that file is sliced from it instead of refetched.
+ */
+async function fetchSegment(url, signal, range = null, files = null) {
+  if (!range) {
+    return (await fetchSegmentResponse(url, signal, null)).blob;
+  }
+  const slice = (blob) => blob.slice(range.offset, range.offset + range.length);
+  const first = files?.get(url);
+  if (first) {
+    const whole = await first;
+    if (whole) return slice(whole);
+  } else if (files) {
+    const pending = fetchSegmentResponse(url, signal, range);
+    files.set(url, pending.then((r) => (r.partial ? null : r.blob), () => null));
+    const res = await pending;
+    return res.partial ? res.blob : slice(res.blob);
+  }
+  const res = await fetchSegmentResponse(url, signal, range);
+  return res.partial ? res.blob : slice(res.blob);
+}
+
+async function fetchInitSegment(init, signal, files) {
+  if (!init) return null;
+  return fetchSegment(init.uri, signal, init.range, files);
 }
 
 async function resolveMediaPlaylist(playlistUrl) {
@@ -229,9 +270,10 @@ export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
     params: { done: 0, total },
   });
   let done = 0;
+  const fullFiles = new Map();
   // Blobs stay out of the JS heap; the final Blob is assembled without copying.
   const chunks = await mapPool(picked, SEGMENT_CONCURRENCY, async (seg) => {
-    const data = await fetchSegment(seg.uri, signal);
+    const data = await fetchSegment(seg.uri, signal, seg.range, fullFiles);
     done += 1;
     onProgress(0.06 + 0.9 * (done / total), `HLS: ${done}/${total} segments`, {
       key: 'progress.hlsSegments',
@@ -241,7 +283,7 @@ export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
   });
   throwIfAborted(signal);
   // Each window gets its own init so merged parts stay independently decodable.
-  const initBlob = await fetchInitSegment(parsed.init, signal);
+  const initBlob = await fetchInitSegment(parsed.init, signal, fullFiles);
   return {
     blob: initBlob
       ? new Blob([initBlob, ...chunks], { type: 'video/mp4' })

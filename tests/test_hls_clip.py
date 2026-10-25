@@ -22,7 +22,9 @@ def _clip(base, tmp_path, stream, mode, prefix='range'):
     return ok, msg, out
 
 
-@pytest.mark.parametrize('stream', ['ts', 'fmp4', 'byterange', 'aes', 'discontinuity', 'separate_audio'])
+@pytest.mark.parametrize(
+    'stream', ['ts', 'fmp4', 'byterange', 'fmp4_byterange', 'aes', 'discontinuity', 'separate_audio'],
+)
 @pytest.mark.parametrize('mode', ['preserve', 'exact'])
 def test_clip_variants(hls_server, tmp_path, stream, mode):
     ok, msg, out = _clip(hls_server, tmp_path, stream, mode)

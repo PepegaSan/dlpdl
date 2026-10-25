@@ -62,6 +62,10 @@ def _build_streams(root: str) -> None:
         '-hls_segment_filename', 'seg_%03d.m4s',
     )
     _hls(src, os.path.join(root, 'byterange'), '-hls_flags', 'single_file')
+    _hls(
+        src, os.path.join(root, 'fmp4_byterange'),
+        '-hls_segment_type', 'fmp4', '-hls_flags', 'single_file',
+    )
 
     aes_dir = os.path.join(root, 'aes')
     os.makedirs(aes_dir)
