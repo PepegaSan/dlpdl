@@ -1,13 +1,34 @@
 import pytest
 
+import subprocess
+
 from backend.hls_clipper import (
     InitSection,
     parse_media_playlist,
     resolve_hls_uri,
+    run_ffmpeg_copy,
     segments_with_preroll,
     segments_for_window,
     select_master_variant,
 )
+
+
+def test_copy_remux_retries_without_the_aac_bitstream_filter():
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        # first run: ffmpeg refuses the filter for MP3; second run succeeds
+        return subprocess.CompletedProcess(args, 1 if len(calls) == 1 else 0, '', 'not supported')
+
+    args = ['ffmpeg', '-i', 'in.ts', '-c', 'copy', '-bsf:a', 'aac_adtstoasc', 'out.mp4']
+    proc = run_ffmpeg_copy(args, run=fake_run, timeout=5)
+    assert proc.returncode == 0
+    assert calls == [args, ['ffmpeg', '-i', 'in.ts', '-c', 'copy', 'out.mp4']]
+    # without the filter there is nothing to retry
+    calls.clear()
+    run_ffmpeg_copy(['ffmpeg', '-i', 'in.mp4', 'out.mp4'], run=fake_run)
+    assert len(calls) == 1
 
 BASE = 'https://cdn.example/path/index.m3u8'
 

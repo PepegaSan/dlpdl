@@ -59,6 +59,15 @@ def _build_streams(root: str) -> None:
         cwd=root,
     )
     _hls(src, os.path.join(root, 'ts'), '-hls_segment_filename', 'seg_%03d.ts')
+    # MP3 audio in TS: `-bsf:a aac_adtstoasc` is refused for it by modern ffmpeg.
+    mp3_dir = os.path.join(root, 'ts_mp3')
+    os.makedirs(mp3_dir)
+    _ffmpeg(
+        '-i', src, '-c:v', 'copy', '-c:a', 'libmp3lame',
+        '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod',
+        '-hls_segment_filename', 'seg_%03d.ts', 'index.m3u8',
+        cwd=mp3_dir,
+    )
     _hls(
         src, os.path.join(root, 'fmp4'),
         '-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4',

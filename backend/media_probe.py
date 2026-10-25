@@ -82,12 +82,17 @@ _HINTS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'HTTP (Error )?401|Server returned 401', re.I),
      'CDN verlangt eine Anmeldung (401) — im Browser eingeloggt abspielen und erneut senden'),
     (re.compile(r'Invalid data found when processing input|moov atom not found', re.I),
-     'Heruntergeladene Daten sind kein lesbares Video (Fehlerseite oder abgebrochener Download)'),
+     'ffmpeg konnte die Daten nicht lesen — Fehlerseite statt Video, abgebrochener Download, '
+     'verschlüsseltes Init-Segment oder ein Codec, den ffmpeg nicht kennt'),
     (re.compile(r'Name or service not known|getaddrinfo failed|Temporary failure in name resolution', re.I),
      'Server kann den CDN-Host nicht auflösen (DNS) — Netzwerk des NAS prüfen'),
     (re.compile(r'CERTIFICATE_VERIFY_FAILED|certificate verify failed', re.I),
      'TLS-Zertifikat des CDN wird nicht akzeptiert'),
-    (re.compile(r'timed out|timeout', re.I),
+    # Local processing limits first: "ffmpeg concat timeout (>30 min)" is not the CDN's fault.
+    (re.compile(r'(ffmpeg|rerender|trim|concat|remux)[^|]*timeout|timeout \(>', re.I),
+     'Verarbeitung mit ffmpeg hat zu lange gedauert — kürzeren Clip oder einen Modus '
+     'ohne Re-Encode versuchen'),
+    (re.compile(r'timed out|ETIMEDOUT|connection timeout', re.I),
      'CDN antwortet zu langsam (Timeout) — später erneut senden'),
 ]
 

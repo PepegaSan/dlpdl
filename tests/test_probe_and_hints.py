@@ -38,11 +38,22 @@ def test_preflight_rules():
     ('preserve copy failed: HTTP 403', '403'),
     ('Server returned 404 Not Found', '404'),
     ('urlopen error [Errno -2] Name or service not known', 'DNS'),
-    ('The read operation timed out', 'Timeout'),
+    ('The read operation timed out', 'CDN antwortet zu langsam'),
+    ('<urlopen error timed out>', 'CDN antwortet zu langsam'),
+    ('rerender timeout (>30 min)', 'Verarbeitung mit ffmpeg'),
+    ('ffmpeg concat timeout (>30 min)', 'Verarbeitung mit ffmpeg'),
+    ('exact trim timeout', 'Verarbeitung mit ffmpeg'),
+    ('ffmpeg timeout (>1800s)', 'Verarbeitung mit ffmpeg'),
+    ('ffmpeg-copy: Invalid data found when processing input', 'Codec'),
 ])
 def test_explain_failure_adds_hint(raw, needle):
     out = explain_failure(raw)
     assert out.startswith('Hinweis:') and needle in out and raw[:40] in out
+
+
+def test_local_ffmpeg_timeouts_are_not_blamed_on_the_cdn():
+    for raw in ('rerender timeout (>30 min)', 'ffmpeg copy remux timeout (>30 min)'):
+        assert 'CDN' not in explain_failure(raw), raw
 
 
 def test_explain_failure_leaves_unknown_and_is_idempotent():

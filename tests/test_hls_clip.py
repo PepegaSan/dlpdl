@@ -72,6 +72,16 @@ def test_encrypted_audio_rendition_fails_clearly(hls_server, tmp_path):
     assert not os.path.exists(out)
 
 
+@pytest.mark.parametrize('mode', ['preserve', 'exact'])
+def test_mp3_audio_ts_clips_without_the_aac_bitstream_filter(hls_server, tmp_path, mode):
+    ok, msg, out = _clip(hls_server, tmp_path, 'ts_mp3', mode)
+    assert ok, msg
+    assert 'ffmpeg' not in msg, msg
+    duration, kinds = probe(out)
+    assert kinds == {'video', 'audio'}, msg
+    assert END - START - 0.5 <= duration <= END - START + 4.5, (duration, msg)
+
+
 def test_truncated_segment_is_retried_not_kept(hls_server):
     fetcher = HttpFetcher({})
     full = fetcher.get_bytes(f'{hls_server}/range/ts/seg_002.ts')

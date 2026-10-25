@@ -872,6 +872,40 @@ def run_ffmpeg(args: list[str], timeout: float = FFMPEG_TIMEOUT_SEC) -> subproce
     return subprocess.CompletedProcess(args, code, out or '', err or '')
 
 
+AAC_ADTS_BSF = ('-bsf:a', 'aac_adtstoasc')
+
+
+def _without_aac_bsf(args: list[str]) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for i, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if arg == AAC_ADTS_BSF[0] and i + 1 < len(args) and args[i + 1] == AAC_ADTS_BSF[1]:
+            skip = True
+            continue
+        out.append(arg)
+    return out
+
+
+def run_ffmpeg_copy(
+    args: list[str],
+    run: Callable[..., subprocess.CompletedProcess] = run_ffmpeg,
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    """Stream copy TS → MP4.
+
+    `-bsf:a aac_adtstoasc` is needed for ADTS AAC on older ffmpeg builds but is
+    refused for MP3/MP2 audio ("not supported by the bitstream filter"), so a
+    failed run is repeated without it.
+    """
+    proc = run(args, **kwargs)
+    if proc.returncode != 0 and AAC_ADTS_BSF[1] in args:
+        proc = run(_without_aac_bsf(args), **kwargs)
+    return proc
+
+
 def _note_ffmpeg_failure(args: list[str], code: int, stderr: str) -> None:
     diagnostics.note(
         'ffmpeg_failed',
@@ -1302,7 +1336,7 @@ def finalize_mp4_for_editor(path: str) -> tuple[bool, str]:
         '-movflags', '+faststart',
         tmp,
     ]
-    proc = run_ffmpeg(args)
+    proc = run_ffmpeg_copy(args)
     if proc.returncode != 0:
         err = (proc.stderr or '').strip()[:300]
         if os.path.exists(tmp):
@@ -1740,7 +1774,7 @@ def clip_hls_ffmpeg_stream_copy(
         start_sec,
         clip_dur,
     )
-    proc = run_ffmpeg(args)
+    proc = run_ffmpeg_copy(args)
     if proc.returncode != 0:
         err = (proc.stderr or '').strip()[:400]
         return False, f'ffmpeg-copy: {err}'
@@ -1810,8 +1844,9 @@ def remux_concat_copy_only(
         out_mp4,
     ]
     try:
-        proc = run_ffmpeg_serialized(
+        proc = run_ffmpeg_copy(
             copy_args,
+            run=run_ffmpeg_serialized,
             duration_sec=duration_sec,
             on_progress=on_progress,
             timeout=1800,
