@@ -37,12 +37,14 @@ from .hls_clipper import (
     normalize_http_headers,
     probe_progressive_media_url,
     raise_if_cancelled,
+    mux_video_audio,
     remux_browser_payload,
     rerender_for_editing,
     run_ffmpeg_with_progress,
     set_cancel_token,
     trim_media_to_duration,
 )
+from .clip_parse import IngestPart
 from .diagnostics import (
     Diagnostics,
     purge_old_reports,
@@ -340,29 +342,31 @@ class JobRunner:
         job_id: str,
         spec: JobSpec,
         raw_path: str,
-        part_specs: list[tuple[float, int]],
+        part_specs: list[IngestPart],
         job_tmp: str,
         out_mp4: str,
     ) -> tuple[bool, str]:
-        expected = sum(n for _tl, n in part_specs)
+        expected = sum(p.size for p in part_specs)
         if expected > os.path.getsize(raw_path):
             return False, 'browser merge parts larger than payload'
         remuxed: list[str] = []
         details: list[str] = []
         ranges = list(spec.clip_ranges or [])
+        if not ranges and spec.clip_start is not None and spec.clip_end is not None:
+            ranges = [(spec.clip_start, spec.clip_end)]
         total = len(part_specs)
         src = open(raw_path, 'rb')
         try:
-            for i, (tl, nbytes) in enumerate(part_specs):
+            for i, part in enumerate(part_specs):
                 raise_if_cancelled()
-                if nbytes < 4096:
+                if part.size < 4096:
                     return False, f'merge part {i + 1} empty'
                 raw_i = os.path.join(job_tmp, f'part_{i:03d}.bin')
                 mp4_i = os.path.join(job_tmp, f'part_{i:03d}.mp4')
                 with open(raw_i, 'wb') as fh:
-                    _copy_bytes(src, fh, nbytes)
+                    _copy_bytes(src, fh, part.size)
                 ok, detail = self._ingest_one_part(
-                    job_id, spec, i, total, tl, raw_i, mp4_i, ranges,
+                    job_id, spec, i, total, part, raw_i, mp4_i, ranges,
                 )
                 if not ok:
                     return False, detail
@@ -383,18 +387,22 @@ class JobRunner:
         spec: JobSpec,
         i: int,
         total: int,
-        tl: float,
+        part: IngestPart,
         raw_i: str,
         mp4_i: str,
         ranges: list[tuple[float, float]],
     ) -> tuple[bool, str]:
+        tl = part.timeline_start
         self._update(
             job_id,
             status='running',
             msg=f'Remux Teil {i + 1}/{total}…',
             progress=0.90 + 0.02 * (i / max(total, 1)),
         )
-        ok, detail = remux_browser_payload(raw_i, mp4_i)
+        if part.pieces:
+            ok, detail = _remux_ingest_pieces(raw_i, mp4_i, part)
+        else:
+            ok, detail = remux_browser_payload(raw_i, mp4_i)
         try:
             os.remove(raw_i)
         except OSError:
@@ -449,7 +457,7 @@ class JobRunner:
         raw_path: str,
         *,
         timeline_start: Optional[float] = None,
-        parts: Optional[list[tuple[float, int]]] = None,
+        parts: Optional[list[IngestPart]] = None,
     ) -> None:
         threading.Thread(
             target=self.ingest_browser_media,
@@ -464,7 +472,7 @@ class JobRunner:
         raw_path: str,
         *,
         timeline_start: Optional[float] = None,
-        parts: Optional[list[tuple[float, int]]] = None,
+        parts: Optional[list[IngestPart]] = None,
     ) -> tuple[bool, str]:
         with self._lock:
             state = self._jobs.get(job_id)
@@ -511,7 +519,7 @@ class JobRunner:
         out_mp4: str,
         *,
         timeline_start: Optional[float],
-        parts: Optional[list[tuple[float, int]]],
+        parts: Optional[list[IngestPart]],
     ) -> tuple[bool, str]:
         if not os.path.isfile(raw_path) or os.path.getsize(raw_path) < 4096:
             self.fail_job(job_id, 'Browser sent an empty download')
@@ -524,10 +532,10 @@ class JobRunner:
             else 'Remux…'
         )
         self._update(job_id, status='running', msg=remux_msg, progress=0.90)
-        part_specs = [p for p in (parts or []) if p[1] > 0]
+        part_specs = [p for p in (parts or []) if p.size > 0]
 
         try:
-            if len(part_specs) > 1:
+            if len(part_specs) > 1 or (part_specs and part_specs[0].pieces):
                 ok, detail = self._ingest_browser_parts(
                     job_id, spec, raw_path, part_specs, job_tmp, out_mp4,
                 )
@@ -1478,3 +1486,49 @@ def _remove_quiet(path: Optional[str]) -> None:
             os.remove(path)
         except OSError:
             pass
+
+
+def _remux_ingest_pieces(raw_path: str, out_mp4: str, part: IngestPart) -> tuple[bool, str]:
+    """One browser window made of several pieces (discontinuity runs, separate
+    audio): remux each piece, join video pieces, then mux the audio track."""
+    base = os.path.splitext(out_mp4)[0]
+    temps: list[str] = []
+    video: list[str] = []
+    audio: list[str] = []
+    try:
+        with open(raw_path, 'rb') as src:
+            for k, piece in enumerate(part.pieces):
+                raw_k = f'{base}_{k}{piece.kind}.bin'
+                out_k = f'{base}_{k}{piece.kind}.mp4'
+                temps += [raw_k, out_k]
+                with open(raw_k, 'wb') as fh:
+                    _copy_bytes(src, fh, piece.size)
+                ok, detail = remux_browser_payload(raw_k, out_k)
+                if not ok:
+                    label = 'Tonspur' if piece.kind == 'a' else 'Video'
+                    return False, f'{label}-Stück {k + 1}: {detail}'
+                (audio if piece.kind == 'a' else video).append(out_k)
+        video_mp4 = f'{base}_video.mp4'
+        temps.append(video_mp4)
+        ok, detail = concat_local_mp4s(video, video_mp4)
+        if not ok:
+            return False, detail
+        if not audio:
+            os.replace(video_mp4, out_mp4)
+            return True, f'ok (browser-hls, {len(video)} Abschnitte)'
+        audio_mp4 = f'{base}_audio.mp4'
+        temps.append(audio_mp4)
+        ok, detail = concat_local_mp4s(audio, audio_mp4)
+        if not ok:
+            return False, f'Tonspur: {detail}'
+        audio_start = next(
+            (p.timeline_start for p in part.pieces if p.kind == 'a' and p.timeline_start is not None),
+            part.timeline_start,
+        )
+        ok, detail = mux_video_audio(video_mp4, audio_mp4, out_mp4, audio_start - part.timeline_start)
+        if not ok:
+            return False, detail
+        return True, 'ok (browser-hls + separate audio)'
+    finally:
+        for path in temps:
+            _remove_quiet(path)

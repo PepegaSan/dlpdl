@@ -9,7 +9,13 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
-from .clip_parse import ClipParseError, optional_clip_field, parse_clips_list, validate_job_media_url
+from .clip_parse import (
+    ClipParseError,
+    optional_clip_field,
+    parse_clips_list,
+    parse_ingest_parts,
+    validate_job_media_url,
+)
 from .downloader import JobRunner, JobSpec, OverridesError, parse_ytdl_overrides
 from .filename import sanitize_title
 from .smart_clip import is_hls_url
@@ -335,16 +341,7 @@ async def api_job_ingest(request: web.Request) -> web.Response:
             timeline_start = float(raw_tl)
         except (TypeError, ValueError):
             timeline_start = None
-    parts: list[tuple[float, int]] = []
-    for chunk in (request.query.get('parts') or '').split(';'):
-        piece = chunk.strip()
-        if not piece or ':' not in piece:
-            continue
-        tl_s, _, len_s = piece.partition(':')
-        try:
-            parts.append((float(tl_s), int(len_s)))
-        except (TypeError, ValueError):
-            continue
+    parts = parse_ingest_parts(request.query.get('parts') or '')
     # Remux/trim/re-render can take minutes; never block the event loop with it.
     runner.start_ingest(
         job_id,

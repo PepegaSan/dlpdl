@@ -1,11 +1,63 @@
 """Parse clip timestamps from API / extension payloads."""
 
 import re
+from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 
 class ClipParseError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class IngestPiece:
+    """Self-contained media inside one uploaded window: 'v' video (+muxed audio) or 'a' audio."""
+    kind: str
+    size: int
+    timeline_start: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class IngestPart:
+    timeline_start: float
+    size: int
+    pieces: tuple[IngestPiece, ...] = ()
+
+
+_PIECE_RE = re.compile(r'([va])(\d+)(?:@(-?[\d.]+))?')
+
+
+def parse_ingest_parts(raw: str) -> list[IngestPart]:
+    """`timeline:bytes[:v<bytes>,a<bytes>@<timeline>,…]` per window, `;`-separated.
+
+    Malformed windows are skipped; pieces must add up to the window size.
+    """
+    parts: list[IngestPart] = []
+    for chunk in (raw or '').split(';'):
+        fields = chunk.strip().split(':')
+        if len(fields) < 2:
+            continue
+        try:
+            timeline, size = float(fields[0]), int(fields[1])
+        except ValueError:
+            continue
+        pieces: list[IngestPiece] = []
+        if len(fields) > 2 and fields[2]:
+            for token in fields[2].split(','):
+                match = _PIECE_RE.fullmatch(token.strip())
+                if not match:
+                    pieces = []
+                    break
+                pieces.append(IngestPiece(
+                    match.group(1),
+                    int(match.group(2)),
+                    float(match.group(3)) if match.group(3) else None,
+                ))
+            if sum(p.size for p in pieces) != size or not any(p.kind == 'v' for p in pieces):
+                continue
+        parts.append(IngestPart(timeline, size, tuple(pieces)))
+    return parts
 
 
 _EMBED_SHELL_SUFFIXES = (

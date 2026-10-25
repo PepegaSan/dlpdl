@@ -2319,6 +2319,29 @@ def _clip_rendition(
     return False, f'{segment_error} | {err_direct if not ok_direct else too_short(expected_span)}', start_sec
 
 
+def mux_video_audio(video_mp4: str, audio_mp4: str, output_mp4: str, audio_offset: float) -> tuple[bool, str]:
+    """Video of the first file + audio of the second; audio_offset = audio start − video start.
+
+    Audio segment boundaries rarely match video ones, so the result is cut to the video length.
+    """
+    args = ['ffmpeg', '-y', '-loglevel', 'error', '-i', video_mp4]
+    # Audio that starts early is dropped, not shifted below zero: an edit list
+    # would hide it, but concat of merge parts ignores edit lists.
+    if audio_offset < -0.01:
+        args += ['-ss', f'{-audio_offset:.3f}']
+    elif audio_offset > 0.01:
+        args += ['-itsoffset', f'{audio_offset:.3f}']
+    args += ['-i', audio_mp4, '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy']
+    video_duration = probe_duration_seconds(video_mp4)
+    if video_duration:
+        args += ['-t', f'{video_duration:.3f}']
+    args += ['-movflags', '+faststart', output_mp4]
+    proc = run_ffmpeg(args)
+    if proc.returncode != 0 or not _output_usable(output_mp4):
+        return False, f'Video+Ton zusammenführen fehlgeschlagen: {(proc.stderr or "").strip()[:300]}'
+    return True, 'ok (video+audio)'
+
+
 def _clip_with_audio_rendition(
     media_url: str,
     parsed: ParsedPlaylist,
@@ -2356,18 +2379,9 @@ def _clip_with_audio_rendition(
         )
         if not ok:
             return False, f'Tonspur: {audio_msg}'
-        offset = audio_start - video_start
-        args = ['ffmpeg', '-y', '-loglevel', 'error', '-i', video_tmp]
-        if abs(offset) > 0.01:
-            args += ['-itsoffset', f'{offset:.3f}']
-        args += [
-            '-i', audio_tmp,
-            '-map', '0:v:0', '-map', '1:a:0',
-            '-c', 'copy', '-movflags', '+faststart', output_mp4,
-        ]
-        proc = run_ffmpeg(args)
-        if proc.returncode != 0 or not _output_usable(output_mp4):
-            return False, f'Video+Ton zusammenführen fehlgeschlagen: {(proc.stderr or "").strip()[:300]}'
+        ok, mux_msg = mux_video_audio(video_tmp, audio_tmp, output_mp4, audio_start - video_start)
+        if not ok:
+            return False, mux_msg
         if progress:
             progress(build_progress_event(fraction=progress_base + progress_scale, msg='Done'))
         return True, f'{msg} + separate audio'

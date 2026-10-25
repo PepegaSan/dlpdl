@@ -23,24 +23,65 @@ function resolveHlsUri(baseUrl, ref) {
   return joined.toString();
 }
 
+function parseAttrs(line) {
+  const body = line.slice(line.indexOf(':') + 1);
+  const out = {};
+  const re = /([A-Z0-9-]+)=("([^"]*)"|[^,]*)/gi;
+  let match;
+  while ((match = re.exec(body))) {
+    out[match[1].toUpperCase()] = (match[3] ?? match[2]).trim();
+  }
+  return out;
+}
+
+const VIDEO_CODEC_HINTS = ['avc', 'hvc', 'hev', 'av01', 'vp09', 'vp9', 'mp4v', 'dvh'];
+
+/** Best video variant (resolution, then bandwidth) and its separate audio rendition. */
 function parseMasterVariant(text, baseUrl) {
-  let bestUri = null;
-  let bestBw = -1;
-  let pendingBw = null;
+  const audioGroups = new Map();
+  const variants = [];
+  let pending = null;
   for (const raw of String(text).split(/\r?\n/)) {
     const line = raw.trim();
-    if (line.startsWith('#EXT-X-STREAM-INF')) {
-      const match = line.match(/BANDWIDTH=(\d+)/i);
-      pendingBw = match ? Number(match[1]) : 0;
-    } else if (line && !line.startsWith('#')) {
-      if (pendingBw != null && pendingBw > bestBw) {
-        bestBw = pendingBw;
-        bestUri = resolveHlsUri(baseUrl, line);
+    if (line.startsWith('#EXT-X-MEDIA:')) {
+      const attrs = parseAttrs(line);
+      if ((attrs.TYPE || '').toUpperCase() === 'AUDIO' && attrs.URI) {
+        const group = audioGroups.get(attrs['GROUP-ID'] || '') || [];
+        group.push({
+          isDefault: (attrs.DEFAULT || '').toUpperCase() === 'YES',
+          uri: resolveHlsUri(baseUrl, attrs.URI),
+        });
+        audioGroups.set(attrs['GROUP-ID'] || '', group);
       }
-      pendingBw = null;
+    } else if (line.startsWith('#EXT-X-STREAM-INF')) {
+      pending = parseAttrs(line);
+    } else if (line && !line.startsWith('#') && pending) {
+      variants.push({ attrs: pending, uri: resolveHlsUri(baseUrl, line) });
+      pending = null;
     }
   }
-  return bestUri;
+  if (!variants.length) return { video: null, audio: null };
+  const hasVideo = ({ attrs }) => {
+    const codecs = (attrs.CODECS || '').toLowerCase();
+    return Boolean(attrs.RESOLUTION) || !codecs || VIDEO_CODEC_HINTS.some((h) => codecs.includes(h));
+  };
+  const rank = ({ attrs }) => {
+    const res = (attrs.RESOLUTION || '').match(/(\d+)x(\d+)/);
+    return [res ? Number(res[1]) * Number(res[2]) : 0, Number(attrs.BANDWIDTH || attrs['AVERAGE-BANDWIDTH'] || 0)];
+  };
+  const pool = variants.filter(hasVideo).length ? variants.filter(hasVideo) : variants;
+  const best = pool.reduce((a, b) => {
+    const [ra, rb] = [rank(a), rank(b)];
+    return rb[0] > ra[0] || (rb[0] === ra[0] && rb[1] > ra[1]) ? b : a;
+  });
+  const group = audioGroups.get(best.attrs.AUDIO || '');
+  const audio = group ? (group.find((g) => g.isDefault) || group[0]).uri : null;
+  return { video: best.uri, audio };
+}
+
+function parseIv(hex) {
+  const clean = String(hex).replace(/^0x/i, '').padStart(32, '0').slice(-32);
+  return Uint8Array.from(clean.match(/../g).map((b) => parseInt(b, 16)));
 }
 
 /** `length[@offset]` → { length, offset }; offset null = continue after the previous range. */
@@ -55,20 +96,39 @@ function parseMediaPlaylist(text, baseUrl) {
   let pendingDuration = null;
   let pendingRange = null;
   let timeline = 0;
+  let mediaSequence = 0;
+  let discontinuity = 0;
+  let unsupportedKey = '';
   const rangeEnd = new Map();
-  /** fMP4/CMAF HLS: #EXT-X-MAP init segment (moov) every fragment needs. */
+  /** fMP4/CMAF HLS: #EXT-X-MAP init segment (moov) the following fragments need. */
   let init = null;
+  let key = null;
   for (const raw of String(text).split(/\r?\n/)) {
     const line = raw.trim();
-    if (line.startsWith('#EXT-X-MAP:') && !init) {
-      const uri = line.match(/URI="([^"]+)"/i);
-      if (uri) {
-        const range = line.match(/BYTERANGE="(\d+)(?:@(\d+))?"/i);
+    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+      mediaSequence = Number(line.split(':')[1]) || 0;
+    } else if (line.startsWith('#EXT-X-KEY:')) {
+      const attrs = parseAttrs(line);
+      const method = (attrs.METHOD || 'NONE').toUpperCase();
+      if (method === 'NONE') {
+        key = null;
+      } else if (method === 'AES-128' && attrs.URI) {
+        key = { uri: resolveHlsUri(baseUrl, attrs.URI), iv: attrs.IV ? parseIv(attrs.IV) : null };
+      } else {
+        unsupportedKey = method;
+        key = null;
+      }
+    } else if (line.startsWith('#EXT-X-MAP:')) {
+      const attrs = parseAttrs(line);
+      if (attrs.URI) {
+        const range = parseByteRange(attrs.BYTERANGE);
         init = {
-          uri: resolveHlsUri(baseUrl, uri[1]),
-          range: range ? { length: Number(range[1]), offset: Number(range[2] || 0) } : null,
+          uri: resolveHlsUri(baseUrl, attrs.URI),
+          range: range ? { length: range.length, offset: range.offset || 0 } : null,
         };
       }
+    } else if (line === '#EXT-X-DISCONTINUITY') {
+      discontinuity += 1;
     } else if (line.startsWith('#EXT-X-BYTERANGE:')) {
       pendingRange = parseByteRange(line.slice('#EXT-X-BYTERANGE:'.length));
     } else if (line.startsWith('#EXTINF:')) {
@@ -85,13 +145,22 @@ function parseMediaPlaylist(text, baseUrl) {
         range = { length: pendingRange.length, offset };
         rangeEnd.set(uri, offset + pendingRange.length);
       }
-      segments.push({ uri, range, duration, start: timeline });
+      segments.push({
+        uri,
+        range,
+        duration,
+        start: timeline,
+        init,
+        key,
+        sequence: mediaSequence + segments.length,
+        discontinuity,
+      });
       timeline += duration;
       pendingDuration = null;
       pendingRange = null;
     }
   }
-  return { segments, duration: timeline, init };
+  return { segments, duration: timeline, unsupportedKey };
 }
 
 async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS, headers = undefined) {
@@ -196,25 +265,82 @@ async function fetchInitSegment(init, signal, files) {
   return fetchSegment(init.uri, signal, init.range, files);
 }
 
+async function importAesKey(uri, signal, keys) {
+  if (!keys.has(uri)) {
+    keys.set(uri, (async () => {
+      const raw = await (await fetchSegment(uri, signal)).arrayBuffer();
+      if (raw.byteLength !== 16) {
+        throw new Error(`HLS key has ${raw.byteLength} bytes instead of 16 (login/token needed?)`);
+      }
+      return crypto.subtle.importKey('raw', raw, 'AES-CBC', false, ['decrypt']);
+    })());
+  }
+  return keys.get(uri);
+}
+
+/** Segment bytes ready for the backend: byte range applied, AES-128 decrypted. */
+async function fetchMediaSegment(seg, signal, ctx) {
+  const blob = await fetchSegment(seg.uri, signal, seg.range, ctx.files);
+  if (!seg.key) return blob;
+  const cryptoKey = await importAesKey(seg.key.uri, signal, ctx.keys);
+  const iv = seg.key.iv || new Uint8Array(16);
+  if (!seg.key.iv) new DataView(iv.buffer).setUint32(12, seg.sequence);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, cryptoKey, await blob.arrayBuffer());
+  return new Blob([plain]);
+}
+
 async function resolveMediaPlaylist(playlistUrl) {
   let url = playlistUrl;
+  let audioUrl = null;
   for (let depth = 0; depth < 5; depth += 1) {
     const text = await fetchText(url);
     if (text.includes('#EXT-X-STREAM-INF')) {
       const variant = parseMasterVariant(text, url);
-      if (!variant) {
+      if (!variant.video) {
         throw new Error('no variant in master playlist');
       }
-      url = variant;
+      url = variant.video;
+      audioUrl = audioUrl || variant.audio;
       continue;
     }
     const parsed = parseMediaPlaylist(text, url);
     if (!parsed.segments.length) {
       throw new Error('empty media playlist');
     }
-    return parsed;
+    if (parsed.unsupportedKey) {
+      throw new Error(`stream is encrypted with ${parsed.unsupportedKey} (DRM) — only AES-128 can be clipped`);
+    }
+    return { ...parsed, audioUrl };
   }
   throw new Error('too many nested HLS playlists');
+}
+
+/**
+ * Download picked segments as self-contained pieces: one per
+ * (discontinuity, init) run, each fMP4 run prefixed with its own init.
+ */
+async function downloadPieces(picked, kind, signal, ctx, onSegment) {
+  const blobs = await mapPool(picked, SEGMENT_CONCURRENCY, async (seg) => {
+    const data = await fetchMediaSegment(seg, signal, ctx);
+    onSegment();
+    return data;
+  });
+  throwIfAborted(signal);
+  const pieces = [];
+  let current = null;
+  for (let i = 0; i < picked.length; i += 1) {
+    const seg = picked[i];
+    if (!current || current.discontinuity !== seg.discontinuity || current.init !== seg.init) {
+      current = { kind, discontinuity: seg.discontinuity, init: seg.init, blobs: [] };
+      if (seg.init) current.blobs.push(await fetchInitSegment(seg.init, signal, ctx.files));
+      pieces.push(current);
+    }
+    current.blobs.push(blobs[i]);
+  }
+  return pieces.map((p) => ({
+    kind: p.kind,
+    blob: new Blob(p.blobs, { type: p.init ? 'video/mp4' : 'video/mp2t' }),
+  }));
 }
 
 function segmentsForWindow(parsed, startSec, endSec) {
@@ -250,9 +376,12 @@ async function mapPool(items, limit, worker) {
  */
 
 /**
+ * One window. Usually a single piece (plain TS or init + fMP4 fragments).
+ * Discontinuities and a separate audio rendition yield several pieces, which
+ * the backend remuxes one by one and joins (`pieces` in the ingest `parts`).
  * @param {string} playlistUrl
  * @param {{ start?: number, end?: number, onProgress?: HlsProgress, signal?: AbortSignal }} [opts]
- * @returns {Promise<{ blob: Blob, timelineStart: number }>}
+ * @returns {Promise<{ blob: Blob, timelineStart: number, pieces: IngestPiece[] | null }>}
  */
 export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
   const onProgress = opts.onProgress || (() => {});
@@ -264,32 +393,65 @@ export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
   if (!picked.length) {
     throw new Error('no segments in time window');
   }
-  const total = picked.length;
+  let audio = null;
+  if (parsed.audioUrl) {
+    const audioParsed = await resolveMediaPlaylist(parsed.audioUrl);
+    const audioPicked = segmentsForWindow(audioParsed, opts.start, opts.end);
+    if (audioPicked.length) audio = { picked: audioPicked, timelineStart: audioPicked[0].start };
+  }
+  const total = picked.length + (audio?.picked.length || 0);
   onProgress(0.06, `HLS: ${total} segments via browser…`, {
     key: 'progress.hlsSegments',
     params: { done: 0, total },
   });
   let done = 0;
-  const fullFiles = new Map();
-  // Blobs stay out of the JS heap; the final Blob is assembled without copying.
-  const chunks = await mapPool(picked, SEGMENT_CONCURRENCY, async (seg) => {
-    const data = await fetchSegment(seg.uri, signal, seg.range, fullFiles);
+  const onSegment = () => {
     done += 1;
     onProgress(0.06 + 0.9 * (done / total), `HLS: ${done}/${total} segments`, {
       key: 'progress.hlsSegments',
       params: { done, total },
     });
-    return data;
-  });
-  throwIfAborted(signal);
-  // Each window gets its own init so merged parts stay independently decodable.
-  const initBlob = await fetchInitSegment(parsed.init, signal, fullFiles);
-  return {
-    blob: initBlob
-      ? new Blob([initBlob, ...chunks], { type: 'video/mp4' })
-      : new Blob(chunks, { type: 'video/mp2t' }),
-    timelineStart: picked[0].start,
   };
+  // Per window: each piece gets its own init so merged parts stay decodable.
+  const ctx = { files: new Map(), keys: new Map() };
+  const pieces = await downloadPieces(picked, 'v', signal, ctx, onSegment);
+  if (audio) {
+    const audioPieces = await downloadPieces(audio.picked, 'a', signal, ctx, onSegment);
+    audioPieces[0].timelineStart = audio.timelineStart;
+    pieces.push(...audioPieces);
+  }
+  // Blobs stay out of the JS heap; the final Blob is assembled without copying.
+  const blob = pieces.length === 1
+    ? pieces[0].blob
+    : new Blob(pieces.map((p) => p.blob), { type: 'application/octet-stream' });
+  return {
+    blob,
+    timelineStart: picked[0].start,
+    pieces: pieces.length === 1
+      ? null
+      : pieces.map((p) => ({ kind: p.kind, size: p.blob.size, timelineStart: p.timelineStart })),
+  };
+}
+
+/**
+ * @typedef {{ kind: 'v' | 'a', size: number, timelineStart?: number }} IngestPiece
+ * `parts` query for POST /ingest: `timeline:bytes` per window, plus
+ * `:v<bytes>,a<bytes>@<timeline>,…` when a window consists of several pieces.
+ */
+export function encodeIngestParts(parts) {
+  return parts.map((p) => {
+    const head = `${p.timelineStart}:${p.size}`;
+    if (!p.pieces) return head;
+    const pieces = p.pieces.map((piece) => (
+      `${piece.kind}${piece.size}${piece.timelineStart != null ? `@${piece.timelineStart}` : ''}`
+    ));
+    return `${head}:${pieces.join(',')}`;
+  }).join(';');
+}
+
+/** Whether the backend needs the `parts` query (merge or multi-piece window). */
+export function needsIngestParts(parts) {
+  return Array.isArray(parts) && (parts.length > 1 || parts.some((p) => p.pieces));
 }
 
 /**
@@ -298,7 +460,7 @@ export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
  * @param {{ start: number, end: number }[]} windows
  * @param {HlsProgress} [onProgress]
  * @param {AbortSignal} [signal]
- * @returns {Promise<{ blob: Blob, timelineStart: number, parts: { size: number, timelineStart: number }[] }>}
+ * @returns {Promise<{ blob: Blob, timelineStart: number, parts: { size: number, timelineStart: number, pieces: IngestPiece[] | null }[] }>}
  */
 export async function downloadHlsWindows(playlistUrl, windows, onProgress, signal) {
   const ranges = (windows || []).filter((w) => w && Number.isFinite(w.start));
@@ -309,7 +471,11 @@ export async function downloadHlsWindows(playlistUrl, windows, onProgress, signa
       onProgress,
       signal,
     });
-    return { ...one, parts: [{ size: one.blob.size, timelineStart: one.timelineStart }] };
+    return {
+      blob: one.blob,
+      timelineStart: one.timelineStart,
+      parts: [{ size: one.blob.size, timelineStart: one.timelineStart, pieces: one.pieces }],
+    };
   }
   const parts = [];
   for (let i = 0; i < ranges.length; i += 1) {
@@ -327,6 +493,6 @@ export async function downloadHlsWindows(playlistUrl, windows, onProgress, signa
   return {
     blob: new Blob(parts.map((p) => p.blob), { type: 'video/mp2t' }),
     timelineStart: parts[0].timelineStart,
-    parts: parts.map((p) => ({ size: p.blob.size, timelineStart: p.timelineStart })),
+    parts: parts.map((p) => ({ size: p.blob.size, timelineStart: p.timelineStart, pieces: p.pieces })),
   };
 }

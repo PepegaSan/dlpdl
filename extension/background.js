@@ -25,7 +25,7 @@ import {
   usableStreams,
 } from './lib/media-sniffer.js';
 import { parseClockTime } from './lib/format-time.js';
-import { downloadHlsWindows } from './lib/hls-browser-fetch.js';
+import { downloadHlsWindows, encodeIngestParts, needsIngestParts } from './lib/hls-browser-fetch.js';
 import {
   clearAllStreamFetchHeaders,
   clearStreamFetchHeaders,
@@ -372,8 +372,8 @@ async function ingestBrowserJob(settings, jobId, blob, timelineStart, parts) {
   if (Number.isFinite(timelineStart)) {
     params.set('timeline_start', String(timelineStart));
   }
-  if (Array.isArray(parts) && parts.length > 1) {
-    params.set('parts', parts.map((p) => `${p.timelineStart}:${p.size}`).join(';'));
+  if (needsIngestParts(parts)) {
+    params.set('parts', encodeIngestParts(parts));
   }
   const query = params.toString();
   const res = await apiFetch(settings, `api/jobs/${jobId}/ingest${query ? `?${query}` : ''}`, {
