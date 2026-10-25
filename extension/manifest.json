@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Clip-Direct",
-  "version": "1.3.21",
+  "version": "1.3.23",
   "description": "Mark clip times on video pages and send them to Clip-Direct for download to your PC.",
   "permissions": ["storage", "activeTab", "scripting", "webRequest", "tabs", "cookies", "declarativeNetRequestWithHostAccess"],
   "host_permissions": ["<all_urls>"],
@@ -32,17 +32,29 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["lib/locales/en.json", "lib/locales/de.json"],
+      "resources": ["lib/locales/en.json", "lib/locales/de.json", "lib/keep-playback.js"],
       "matches": ["<all_urls>"]
     }
   ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["lib/keep-playback.js"],
+      "exclude_matches": [
+        "*://*.youtube.com/*",
+        "*://youtube.com/*",
+        "*://youtu.be/*",
+        "*://*.youtu.be/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.vimeo.com/*",
+        "*://vimeo.com/*",
+        "*://*.netflix.com/*",
+        "*://*.twitch.tv/*",
+        "*://localhost/*",
+        "*://127.0.0.1/*"
+      ],
+      "js": ["lib/keep-playback-boot.js"],
       "run_at": "document_start",
-      "all_frames": true,
-      "world": "MAIN"
+      "all_frames": true
     },
     {
       "matches": ["<all_urls>"],

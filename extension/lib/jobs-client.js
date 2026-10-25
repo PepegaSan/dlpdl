@@ -2,6 +2,7 @@
  * Clip-Direct REST job payloads (clean-room).
  */
 
+import { parseClockTime } from './format-time.js';
 import { isHlsPlaylistUrl } from './media-sniffer.js';
 import { httpHeadersForStream } from './stream-headers.js';
 
@@ -45,9 +46,14 @@ export function clipHasTimes(c) {
   return true;
 }
 
-/** Clips the user kept selected (checkbox on) and that have valid times. */
+/** End after start — the backend rejects the whole job otherwise. */
+export function clipHasRange(c) {
+  return clipHasTimes(c) && parseClockTime(c.end) > parseClockTime(c.start);
+}
+
+/** Clips the user kept selected (checkbox on) and that have a valid range. */
 export function selectedClips(clips) {
-  return (clips || []).filter((c) => clipHasTimes(c) && c.includeInMerge !== false);
+  return (clips || []).filter((c) => clipHasRange(c) && c.includeInMerge !== false);
 }
 
 /** Clips checked for merge (exclude includeInMerge === false). */

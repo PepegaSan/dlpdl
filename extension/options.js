@@ -12,10 +12,11 @@ const fields = [
   'clipEncodeMode',
   'postRender',
   'openUiAfterQueue',
+  'keepPlayback',
   'apiToken',
 ];
 
-const boolFields = new Set(['openUiAfterQueue', 'postRender']);
+const boolFields = new Set(['openUiAfterQueue', 'postRender', 'keepPlayback']);
 
 async function init() {
   const s = await loadSettings();

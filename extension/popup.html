@@ -7,44 +7,73 @@
   <title>Clip-Direct</title>
 </head>
 <body>
-  <header>
-    <h1>Clip-Direct</h1>
+  <header class="top">
+    <div class="brand">
+      <h1>Clip-Direct</h1>
+      <p id="pageUrl" class="page-host" hidden></p>
+    </div>
     <div class="header-actions">
-      <button type="button" id="btnOpenUi" class="btn-open-ui" data-i18n="popup.openUiTitle" data-i18n-attr="title">Web-UI</button>
-      <a href="#" id="optionsLink" data-i18n="popup.optionsTitle" data-i18n-attr="title">⚙</a>
+      <button type="button" id="btnOpenUi" class="btn btn-sm btn-ghost" data-i18n-title="popup.openUiTitle">Web-UI</button>
+      <a href="#" id="optionsLink" class="icon-link" data-i18n-title="popup.optionsTitle">⚙</a>
     </div>
   </header>
-  <p id="status" class="status">…</p>
-  <p class="hint-top" data-i18n="popup.hintTop"></p>
-  <button type="button" id="btnShowBar" class="btn-show-bar" data-i18n="popup.showBar"></button>
-  <p id="pageUrl" class="url" hidden></p>
-  <div class="markers">
-    <button type="button" id="btnStart" disabled data-i18n="popup.btnStart"></button>
-    <button type="button" id="btnEnd" disabled data-i18n="popup.btnEnd"></button>
-    <button type="button" id="btnCancelPending" class="btn-cancel-pending" data-i18n="popup.btnCancelPending"></button>
-  </div>
-  <p id="pending" class="pending"></p>
-  <ul id="clipList" class="clips"></ul>
-  <div class="clip-transfer" id="clipTransfer">
-    <button type="button" id="btnCopyClips" class="clip-transfer-btn" data-i18n="popup.clip.copyTimes"></button>
-    <button type="button" id="btnPasteClips" class="clip-transfer-btn" data-i18n="popup.clip.pasteTimes"></button>
-    <p id="clipClipboardHint" class="clip-transfer-hint" hidden></p>
-  </div>
-  <div class="actions">
-    <button type="button" id="btnQueueEach" class="primary" disabled data-i18n="popup.queueEach"></button>
-    <button type="button" id="btnQueueMerge" disabled data-i18n="popup.queueMerge"></button>
-  </div>
-  <section id="streamSection" class="streams" hidden>
-    <div class="streams-head">
-      <h2 data-i18n="popup.streamsTitle"></h2>
-      <button type="button" id="btnClearStreams" data-i18n="popup.clearStreams" data-i18n-attr="title"></button>
+
+  <p id="status" class="status" role="status" aria-live="polite" hidden></p>
+
+  <section class="card">
+    <div class="card-head">
+      <h2 data-i18n="popup.markTitle"></h2>
+      <span class="now"><span data-i18n="popup.now"></span> <strong id="nowTime">--:--</strong></span>
     </div>
-    <p class="streams-hint" data-i18n="popup.streamsHint"></p>
-    <p id="streamPasteHint" class="streams-paste-hint" hidden></p>
-    <ul id="streamClipList" class="clips stream-clips"></ul>
+    <div class="markers">
+      <button type="button" id="btnStart" class="btn btn-mark" disabled>
+        <span data-i18n="popup.btnStart"></span>
+        <kbd id="kbdStart" hidden></kbd>
+      </button>
+      <button type="button" id="btnEnd" class="btn btn-mark" disabled>
+        <span data-i18n="popup.btnEnd"></span>
+        <kbd id="kbdEnd" hidden></kbd>
+      </button>
+    </div>
+    <div id="pendingRow" class="pending" hidden>
+      <span class="pending-dot" aria-hidden="true"></span>
+      <span id="pending" class="pending-text"></span>
+      <button type="button" id="btnCancelPending" class="btn-link" data-i18n="popup.btnCancelPending"></button>
+    </div>
+    <p id="hintTop" class="tip" data-i18n="popup.hintTop" hidden></p>
+    <button type="button" id="btnShowBar" class="btn-link mark-foot" data-i18n="popup.showBar"></button>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2><span data-i18n="popup.clipsTitle"></span> <span id="clipCount" class="count" hidden></span></h2>
+      <button type="button" id="btnToggleAll" class="btn-link" hidden></button>
+    </div>
+    <p id="clipEmpty" class="empty" data-i18n="popup.clip.empty"></p>
+    <ul id="clipList" class="clips"></ul>
+    <p id="clipSummary" class="clip-summary" hidden></p>
+    <div class="clip-transfer">
+      <button type="button" id="btnCopyClips" class="btn btn-sm" data-i18n="popup.clip.copyTimes"></button>
+      <button type="button" id="btnPasteClips" class="btn btn-sm" data-i18n="popup.clip.pasteTimes"></button>
+    </div>
+    <p id="clipClipboardHint" class="note note-info" hidden></p>
+    <div id="actions" class="actions" hidden>
+      <button type="button" id="btnQueueEach" class="btn btn-primary" data-i18n-title="popup.queueEachTitle" disabled></button>
+      <button type="button" id="btnQueueMerge" class="btn btn-merge" data-i18n-title="popup.queueMergeTitle" disabled></button>
+    </div>
+  </section>
+
+  <section id="streamSection" class="card" hidden>
+    <div class="card-head">
+      <h2><span data-i18n="popup.streamsTitle"></span> <span id="streamCount" class="count"></span></h2>
+      <button type="button" id="btnClearStreams" class="btn-link" data-i18n="popup.clearStreams" data-i18n-title="popup.clearStreamsTitle"></button>
+    </div>
+    <p class="muted-hint" data-i18n="popup.streamsHint"></p>
+    <p id="streamPasteHint" class="note note-ok" hidden></p>
     <ul id="streamList" class="streams-list"></ul>
   </section>
-  <p class="hint" data-i18n="popup.hintFooter"></p>
+
+  <p class="footer-hint" data-i18n="popup.hintFooter"></p>
   <script type="module" src="popup.js"></script>
 </body>
 </html>

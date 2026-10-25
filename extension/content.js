@@ -96,6 +96,7 @@ const IS_TOP_FRAME = (() => {
 let contextTeardownDone = false;
 let navIntervalId = null;
 let syncIntervalId = null;
+let barTickId = null;
 
 /**
  * Tell the background which clips belong to this tab. Used so the popup can
@@ -145,6 +146,7 @@ function handleInvalidExtensionContext() {
     clearInterval(syncIntervalId);
     syncIntervalId = null;
   }
+  stopBarTick();
   if (overlayRoot) {
     try {
       overlayRoot.remove();
@@ -531,48 +533,86 @@ async function replaceClipsForPage(clips) {
   return { ok: true, clips: list, pageKey: key };
 }
 
-function updateOverlayUiNow() {
+/** Same rule as selectedClips() in the extension: checked and end after start. */
+function clipIsSendable(clip) {
+  return !!clip && clip.includeInMerge !== false
+    && parseClockTime(clip.end) > parseClockTime(clip.start);
+}
+
+/** Markers, pending row and send label from the pending start + this frame's clips. */
+function renderBar(clips) {
   if (!overlayRoot) return;
-  const statusEl = overlayRoot.querySelector('[data-role="status"]');
+  const btnStart = overlayRoot.querySelector('[data-action="start"]');
   const btnEnd = overlayRoot.querySelector('[data-action="end"]');
-  const btnClear = overlayRoot.querySelector('[data-action="clear"]');
-  if (!statusEl || !btnEnd || !btnClear) return;
+  const btnSend = overlayRoot.querySelector('[data-action="send"]');
+  const pendingRow = overlayRoot.querySelector('[data-role="pending"]');
+  if (!btnStart || !btnEnd || !btnSend || !pendingRow) return;
   btnEnd.disabled = !pendingStart;
-  btnClear.hidden = !pendingStart;
-  const key = storageKey();
-  const clipCount = sessionClipsByKey[key]?.length ?? 0;
-  if (pendingStart) {
-    statusEl.textContent = cdT('bar.status.pending', { start: pendingStart });
-  } else if (clipCount > 0) {
-    statusEl.textContent = cdT('bar.status.clips', { count: clipCount });
-  } else {
-    const v = getActiveVideo();
-    statusEl.textContent = v
-      ? cdT('bar.status.now', { time: formatClockTime(safeVideoTime(v)) })
-      : cdT('bar.status.noVideo');
+  // Highlight whichever marker comes next, like the popup.
+  btnStart.classList.toggle('clip-direct-next', !pendingStart);
+  btnEnd.classList.toggle('clip-direct-next', !!pendingStart);
+  pendingRow.hidden = !pendingStart;
+  const sendable = clips.filter(clipIsSendable).length;
+  // No clips sends the whole video; clips that are all unchecked/invalid send nothing.
+  btnSend.textContent = clips.length
+    ? cdT('bar.sendClips', { count: sendable })
+    : cdT('bar.sendFull');
+  btnSend.disabled = clips.length > 0 && sendable === 0;
+  btnSend.title = btnSend.disabled ? cdT('bar.sendNoneTitle') : '';
+  btnSend.classList.toggle('clip-direct-primary', sendable > 0);
+  tickBar();
+}
+
+/** Live clock + time since the pending start; runs only while the bar is shown. */
+function tickBar() {
+  if (!overlayRoot) return;
+  const nowEl = overlayRoot.querySelector('[data-role="now"]');
+  const pendingEl = overlayRoot.querySelector('[data-role="pending-text"]');
+  const video = getActiveVideo();
+  const now = video ? safeVideoTime(video) : null;
+  if (nowEl) nowEl.textContent = now != null ? formatClockTime(now) : '--:--';
+  if (pendingEl && pendingStart) {
+    const elapsed = now != null ? now - parseClockTime(pendingStart) : NaN;
+    pendingEl.textContent = elapsed >= 1
+      ? cdT('bar.pendingRunning', { start: pendingStart, elapsed: formatClockTime(elapsed) })
+      : cdT('bar.pending', { start: pendingStart });
   }
 }
 
+let barStatusTimer = null;
+
+/** tone: busy | ok | warn | error — ok messages fade after a few seconds. */
+function setBarStatus(text, tone = '') {
+  const el = overlayRoot?.querySelector('[data-role="status"]');
+  if (!el) return;
+  clearTimeout(barStatusTimer);
+  el.textContent = text;
+  el.hidden = !text;
+  el.dataset.tone = tone;
+  if (tone === 'ok') {
+    barStatusTimer = setTimeout(() => setBarStatus(''), 5000);
+  }
+}
+
+function updateOverlayUiNow() {
+  renderBar(sessionClipsByKey[storageKey()] || []);
+}
+
 function sendFromBar() {
-  const statusEl = overlayRoot?.querySelector('[data-role="status"]');
-  if (statusEl) statusEl.textContent = cdT('bar.status.sending');
+  setBarStatus(cdT('bar.status.sending'), 'busy');
   return chrome.runtime.sendMessage({
     action: 'queueFromPage',
     pageUrl: submitUrlForHref(location.href),
   }).then((res) => {
     if (res?.ok) {
-      if (statusEl) statusEl.textContent = cdT('bar.status.sent');
+      setBarStatus(cdT('bar.status.sent'), 'ok');
       return res;
     }
     const err = res?.errorKey ? cdT(res.errorKey) : (res?.error || 'error');
-    if (statusEl) statusEl.textContent = cdT('bar.status.sendFailed', { error: err });
+    setBarStatus(cdT('bar.status.sendFailed', { error: err }), 'error');
     return res;
   }).catch((err) => {
-    if (statusEl) {
-      statusEl.textContent = cdT('bar.status.sendFailed', {
-        error: err?.message || String(err),
-      });
-    }
+    setBarStatus(cdT('bar.status.sendFailed', { error: err?.message || String(err) }), 'error');
     return { ok: false, error: String(err?.message || err) };
   });
 }
@@ -581,12 +621,10 @@ function applyBarI18n(bar) {
   const start = bar.querySelector('[data-action="start"]');
   const end = bar.querySelector('[data-action="end"]');
   const clear = bar.querySelector('[data-action="clear"]');
-  const send = bar.querySelector('[data-action="send"]');
   const hide = bar.querySelector('[data-action="hide"]');
   if (start) start.textContent = cdT('bar.start');
   if (end) end.textContent = cdT('bar.end');
   if (clear) clear.textContent = cdT('bar.cancel');
-  if (send) send.textContent = cdT('bar.send');
   if (hide) hide.title = cdT('bar.hideTitle');
 }
 
@@ -680,6 +718,7 @@ function injectOverlayStyles() {
   if (document.getElementById('clip-direct-clip-bar-style')) return;
   const style = document.createElement('style');
   style.id = 'clip-direct-clip-bar-style';
+  // Colours follow the popup's dark theme — the bar always sits on top of video.
   style.textContent = `
     #clip-direct-clip-bar {
       position: fixed;
@@ -688,63 +727,168 @@ function injectOverlayStyles() {
       z-index: 2147483647;
       isolation: isolate;
       display: flex;
-      flex-wrap: wrap;
-      align-items: center;
+      flex-direction: column;
       gap: 6px;
       width: 248px;
       max-width: min(248px, calc(100vw - 24px));
       box-sizing: border-box;
-      padding: 8px 10px;
-      border-radius: 10px;
-      background: rgba(20, 20, 24, 0.92);
-      color: #f2f2f2;
+      margin: 0;
+      padding: 8px;
+      border: 1px solid #33383f;
+      border-radius: 8px;
+      background: rgba(30, 33, 38, 0.94);
+      color: #e8eaed;
       font: 12px/1.3 system-ui, sans-serif;
+      text-align: left;
       box-shadow: 0 4px 20px rgba(0,0,0,0.45);
       pointer-events: auto;
       user-select: none;
     }
+    #clip-direct-clip-bar * {
+      box-sizing: border-box;
+    }
+    #clip-direct-clip-bar [hidden] {
+      display: none !important;
+    }
     #clip-direct-clip-bar button {
       cursor: pointer;
-      border: 1px solid #555;
+      margin: 0;
+      border: 1px solid #464c55;
       border-radius: 6px;
       padding: 6px 10px;
-      background: #2d2d35;
-      color: #fff;
+      background: #272b31;
+      color: #e8eaed;
       font: inherit;
+      font-weight: 600;
       pointer-events: auto;
       position: relative;
       z-index: 1;
     }
     #clip-direct-clip-bar button:hover:not(:disabled) {
-      background: #3d3d48;
+      border-color: #9aa2ad;
     }
     #clip-direct-clip-bar button:disabled {
       opacity: 0.45;
       cursor: not-allowed;
     }
+    #clip-direct-clip-bar button.clip-direct-next,
     #clip-direct-clip-bar button.clip-direct-primary {
-      background: #0d6efd;
-      border-color: #0d6efd;
+      background: #4b83f0;
+      border-color: #4b83f0;
+      color: #fff;
+    }
+    #clip-direct-clip-bar button.clip-direct-next:hover:not(:disabled),
+    #clip-direct-clip-bar button.clip-direct-primary:hover:not(:disabled) {
+      background: #6595f3;
+      border-color: #6595f3;
+    }
+    #clip-direct-clip-bar .clip-direct-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    #clip-direct-clip-bar .clip-direct-title {
+      flex: 1;
+      color: #9aa2ad;
+      font-size: 10px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    #clip-direct-clip-bar .clip-direct-now {
+      font-size: 14px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    #clip-direct-clip-bar button.clip-direct-hide {
+      width: 20px;
+      height: 20px;
+      padding: 0;
+      border: 0;
+      background: none;
+      color: #9aa2ad;
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 20px;
+    }
+    #clip-direct-clip-bar button.clip-direct-hide:hover {
+      background: #33383f;
+      color: #e8eaed;
+    }
+    #clip-direct-clip-bar .clip-direct-marks {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+    #clip-direct-clip-bar .clip-direct-pending {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 7px;
+      border-radius: 6px;
+      background: #3a2d17;
+      color: #e0a347;
+    }
+    #clip-direct-clip-bar .clip-direct-dot {
+      flex-shrink: 0;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #e0a347;
+      animation: clip-direct-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes clip-direct-pulse {
+      50% { opacity: 0.3; }
+    }
+    #clip-direct-clip-bar .clip-direct-pending-text {
+      flex: 1;
+      min-width: 0;
+      font-variant-numeric: tabular-nums;
+    }
+    #clip-direct-clip-bar button.clip-direct-link {
+      padding: 0 2px;
+      border: 0;
+      background: none;
+      color: inherit;
+      font-size: 11px;
+      font-weight: 400;
+      text-decoration: underline;
     }
     #clip-direct-clip-bar .clip-direct-status {
-      flex: 1 1 100%;
-      width: 100%;
-      color: #9ecbff;
-      min-height: 1.2em;
-      max-height: 2.4em;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      line-height: 1.2;
+      max-height: 7.5em;
+      overflow-y: auto;
+      padding: 5px 7px;
+      border-radius: 6px;
+      background: #272b31;
+      color: #9aa2ad;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
     }
-    #clip-direct-clip-bar .clip-direct-hide {
-      padding: 4px 8px;
-      font-size: 11px;
+    #clip-direct-clip-bar .clip-direct-status[data-tone="busy"] {
+      background: #1f2c44;
+      color: #8fb2f7;
+    }
+    #clip-direct-clip-bar .clip-direct-status[data-tone="ok"] {
+      background: #1a3125;
+      color: #5fd08b;
+    }
+    #clip-direct-clip-bar .clip-direct-status[data-tone="warn"] {
+      background: #3a2d17;
+      color: #e0a347;
+    }
+    #clip-direct-clip-bar .clip-direct-status[data-tone="error"] {
+      background: #3d1f20;
+      color: #f06464;
     }
   `;
   (document.head || document.documentElement).appendChild(style);
+}
+
+function stopBarTick() {
+  if (barTickId != null) {
+    clearInterval(barTickId);
+    barTickId = null;
+  }
 }
 
 function ensureOverlay() {
@@ -753,12 +897,22 @@ function ensureOverlay() {
   const bar = document.createElement('div');
   bar.id = 'clip-direct-clip-bar';
   bar.innerHTML = `
-    <button type="button" class="clip-direct-primary" data-action="start"></button>
-    <button type="button" data-action="end" disabled></button>
-    <button type="button" data-action="clear" hidden></button>
+    <div class="clip-direct-head">
+      <span class="clip-direct-title">Clip-Direct</span>
+      <span class="clip-direct-now" data-role="now">--:--</span>
+      <button type="button" class="clip-direct-hide" data-action="hide" title="">✕</button>
+    </div>
+    <div class="clip-direct-marks">
+      <button type="button" data-action="start"></button>
+      <button type="button" data-action="end" disabled></button>
+    </div>
+    <div class="clip-direct-pending" data-role="pending" hidden>
+      <span class="clip-direct-dot"></span>
+      <span class="clip-direct-pending-text" data-role="pending-text"></span>
+      <button type="button" class="clip-direct-link" data-action="clear"></button>
+    </div>
     <button type="button" data-action="send"></button>
-    <span class="clip-direct-status" data-role="status"></span>
-    <button type="button" class="clip-direct-hide" data-action="hide" title="">✕</button>
+    <div class="clip-direct-status" data-role="status" hidden></div>
   `;
   applyBarI18n(bar);
 
@@ -782,10 +936,12 @@ function ensureOverlay() {
   }
 
   bindBarButton('[data-action="start"]', () => {
+    setBarStatus('');
     doMarkStart().catch(() => updateOverlayUiNow());
   });
 
   bindBarButton('[data-action="end"]', () => {
+    setBarStatus('');
     doMarkEnd().catch(() => updateOverlayUiNow());
   });
 
@@ -797,6 +953,7 @@ function ensureOverlay() {
 
   bindBarButton('[data-action="hide"]', () => {
     sessionBarHidden = true;
+    stopBarTick();
     bar.remove();
     overlayRoot = null;
     storageLocalSet({ [BAR_HIDDEN_KEY]: true });
@@ -804,34 +961,17 @@ function ensureOverlay() {
 
   document.documentElement.appendChild(bar);
   overlayRoot = bar;
+  barTickId = setInterval(tickBar, 500);
   syncOverlayState();
 }
 
 function syncOverlayState() {
   if (!overlayRoot) return;
   try {
-    const statusEl = overlayRoot.querySelector('[data-role="status"]');
-    const btnEnd = overlayRoot.querySelector('[data-action="end"]');
-    const btnClear = overlayRoot.querySelector('[data-action="clear"]');
     ensurePendingLoaded()
-      .then(async (pending) => {
-        const clips = await loadClipsForPage();
-        btnEnd.disabled = !pending;
-        btnClear.hidden = !pending;
-        if (pending) {
-          statusEl.textContent = cdT('bar.status.pending', { start: pending });
-        } else if (clips.length) {
-          statusEl.textContent = cdT('bar.status.clips', { count: clips.length });
-        } else {
-          const v = getActiveVideo();
-          statusEl.textContent = v
-            ? cdT('bar.status.now', { time: formatClockTime(safeVideoTime(v)) })
-            : cdT('bar.status.noVideo');
-        }
-      })
-      .catch(() => {
-        if (statusEl) statusEl.textContent = cdT('bar.status.videoNotReady');
-      });
+      .then(() => loadClipsForPage())
+      .then((clips) => renderBar(clips))
+      .catch(() => setBarStatus(cdT('bar.status.videoNotReady'), 'warn'));
   } catch {
     /* ignore — some players break DOM access */
   }

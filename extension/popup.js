@@ -1,22 +1,31 @@
 import { applyI18n, initI18n, t } from './lib/i18n.js';
 import { clipsForMerge, selectedClips } from './lib/jobs-client.js';
 import { openClipDirectUi } from './lib/open-ui.js';
-import { normalizeClockTime, parseClockTime } from './lib/format-time.js';
+import { formatClockTime, normalizeClockTime, parseClockTime } from './lib/format-time.js';
 import { loadSettings, saveClipDraft } from './lib/storage.js';
 const statusEl = document.getElementById('status');
 const pageUrlEl = document.getElementById('pageUrl');
+const nowTimeEl = document.getElementById('nowTime');
+const pendingRowEl = document.getElementById('pendingRow');
 const pendingEl = document.getElementById('pending');
+const hintTopEl = document.getElementById('hintTop');
 const clipListEl = document.getElementById('clipList');
+const clipCountEl = document.getElementById('clipCount');
+const clipEmptyEl = document.getElementById('clipEmpty');
+const clipSummaryEl = document.getElementById('clipSummary');
+const clipTransferEl = document.querySelector('.clip-transfer');
+const actionsEl = document.getElementById('actions');
 const btnStart = document.getElementById('btnStart');
 const btnEnd = document.getElementById('btnEnd');
 const btnQueueEach = document.getElementById('btnQueueEach');
 const btnQueueMerge = document.getElementById('btnQueueMerge');
 const btnCancelPending = document.getElementById('btnCancelPending');
 const btnShowBar = document.getElementById('btnShowBar');
+const btnToggleAll = document.getElementById('btnToggleAll');
 const optionsLink = document.getElementById('optionsLink');
 const streamSection = document.getElementById('streamSection');
+const streamCountEl = document.getElementById('streamCount');
 const streamListEl = document.getElementById('streamList');
-const streamClipListEl = document.getElementById('streamClipList');
 const btnClearStreams = document.getElementById('btnClearStreams');
 const btnOpenUi = document.getElementById('btnOpenUi');
 const btnCopyClips = document.getElementById('btnCopyClips');
@@ -24,13 +33,23 @@ const btnPasteClips = document.getElementById('btnPasteClips');
 const clipClipboardHint = document.getElementById('clipClipboardHint');
 const streamPasteHint = document.getElementById('streamPasteHint');
 
+const NO_TIME = '--:--';
+const OK_STATUS = new Set(['sent', 'mergeQueued', 'cutQueued', 'streamQueued', 'clipsCopied', 'clipsPasted', 'webUiOpened', 'barShown']);
+const BUSY_STATUS = new Set(['connecting', 'sending', 'sendingMerge', 'sendingCut', 'sendingStream']);
+const WARN_STATUS = new Set(['noVideo', 'reloadExtension', 'noClips', 'mergeNeedTwo', 'clipboardEmpty']);
+
 let pageUrl = null;
 let pageKey = null;
 let clips = [];
 let pendingStart = null;
+let nowSeconds = null;
 let activeTabId = null;
 let streams = [];
-let streamTimer = null;
+let pollTimer = null;
+let polling = false;
+let statusKey = '';
+let statusTimer = null;
+let clipboardCount = 0;
 let tabClips = [];
 let tabPageKey = null;
 
@@ -69,8 +88,17 @@ function hostLabelFromUrl(url) {
   }
 }
 
+function setPageUrl(url) {
+  if (!url) return;
+  pageUrl = url;
+  pageUrlEl.hidden = false;
+  pageUrlEl.textContent = hostLabelFromUrl(url) || url;
+  pageUrlEl.title = url;
+}
+
 function updateClipboardUi(clipboard) {
   const count = clipboard?.clips?.length || 0;
+  clipboardCount = count;
   if (btnPasteClips) {
     btnPasteClips.disabled = count === 0;
   }
@@ -87,6 +115,7 @@ function updateClipboardUi(clipboard) {
     }
   }
   updateStreamPasteHint(clipboard);
+  updateButtons();
 }
 
 function updateStreamPasteHint(clipboard) {
@@ -175,21 +204,49 @@ function clipTimeErrorMessage(error) {
   return error || '?';
 }
 
-function buildClipRow(clip, index, { onToggleMerge, onRemove, onUpdateTimes }) {
+function isSelected(clip) {
+  return clip.includeInMerge !== false;
+}
+
+/** Start/end in seconds, or null when the clip has no usable range. */
+function clipRange(clip) {
+  const start = parseClockTime(clip.start);
+  const end = parseClockTime(clip.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  return { start, end };
+}
+
+/** Index of another selected clip whose range overlaps clip `index`, or -1. */
+function overlappingClip(list, ranges, index) {
+  const range = ranges[index];
+  if (!range || !isSelected(list[index])) return -1;
+  return list.findIndex((other, j) => (
+    j !== index
+    && isSelected(other)
+    && ranges[j]
+    && ranges[j].start < range.end
+    && range.start < ranges[j].end
+  ));
+}
+
+function buildClipRow(clip, index, { range, overlapWith }) {
   const li = document.createElement('li');
-  if (clip.includeInMerge === false) {
-    li.classList.add('clip-merge-off');
-  }
+  li.classList.toggle('clip-off', !isSelected(clip));
+  li.classList.toggle('clip-bad', !range);
+  li.classList.toggle('clip-overlap', !!range && overlapWith >= 0);
 
-  const row = document.createElement('div');
-  row.className = 'clip-row';
-
-  const mergeCb = document.createElement('input');
-  mergeCb.type = 'checkbox';
-  mergeCb.className = 'clip-merge-cb';
-  mergeCb.checked = clip.includeInMerge !== false;
-  mergeCb.title = t('popup.clip.includeMergeTitle');
-  mergeCb.addEventListener('change', () => onToggleMerge(index, mergeCb.checked));
+  const pick = document.createElement('label');
+  pick.className = 'clip-pick';
+  pick.title = t('popup.clip.selectTitle');
+  const selectCb = document.createElement('input');
+  selectCb.type = 'checkbox';
+  selectCb.checked = isSelected(clip);
+  selectCb.addEventListener('change', () => setClipMergeIncluded(index, selectCb.checked));
+  const num = document.createElement('span');
+  num.className = 'clip-index';
+  num.textContent = `#${index + 1}`;
+  pick.appendChild(selectCb);
+  pick.appendChild(num);
 
   const times = document.createElement('div');
   times.className = 'clip-times';
@@ -222,7 +279,7 @@ function buildClipRow(clip, index, { onToggleMerge, onRemove, onUpdateTimes }) {
   }
 
   async function commitTimes() {
-    const res = await onUpdateTimes(index, startInput.value, endInput.value);
+    const res = await updateTabClipTimes(index, startInput.value, endInput.value);
     if (res?.ok) {
       clip.start = res.clips[index]?.start ?? startInput.value;
       clip.end = res.clips[index]?.end ?? endInput.value;
@@ -264,14 +321,28 @@ function buildClipRow(clip, index, { onToggleMerge, onRemove, onUpdateTimes }) {
   times.appendChild(sep);
   times.appendChild(endInput);
 
-  row.appendChild(mergeCb);
-  row.appendChild(times);
-  li.appendChild(row);
+  const dur = document.createElement('span');
+  dur.className = 'clip-dur';
+  if (!range) {
+    dur.textContent = '!';
+    dur.title = t('popup.clip.endBeforeStart');
+  } else {
+    dur.textContent = formatClockTime(range.end - range.start);
+    dur.title = overlapWith >= 0
+      ? t('popup.clip.overlap', { other: overlapWith + 1 })
+      : t('popup.clip.durationTitle');
+  }
 
   const del = document.createElement('button');
   del.type = 'button';
+  del.className = 'clip-del';
   del.textContent = '×';
-  del.addEventListener('click', () => onRemove(index));
+  del.title = t('popup.clip.removeTitle');
+  del.addEventListener('click', () => removeTabClip(index));
+
+  li.appendChild(pick);
+  li.appendChild(times);
+  li.appendChild(dur);
   li.appendChild(del);
   return li;
 }
@@ -315,6 +386,40 @@ async function setClipMergeIncluded(index, includeInMerge) {
     setStatus('popup.status.error', { error: res?.error || '?' });
   }
 }
+
+async function removeTabClip(index) {
+  const tabId = await getActiveTabId();
+  const res = await chrome.runtime.sendMessage({
+    action: 'removeTabClip',
+    tabId,
+    pageKey: tabPageKey || pageKey,
+    index,
+  });
+  if (res?.ok) {
+    syncClipsFromResult(res);
+    renderClips();
+    renderStreams();
+    updateButtons();
+  } else {
+    setStatus('popup.status.error', { error: res?.error || '?' });
+  }
+}
+
+/** One message per clip that differs; sequential so the session updates don't race. */
+async function setAllSelected(checked) {
+  const source = activeClipSource().map((c) => ({ ...c }));
+  for (let i = 0; i < source.length; i += 1) {
+    if (isSelected(source[i]) !== checked) {
+      await setClipMergeIncluded(i, checked);
+    }
+  }
+}
+
+btnToggleAll?.addEventListener('click', () => {
+  const source = activeClipSource();
+  void setAllSelected(!source.every(isSelected));
+});
+
 async function getActiveTabId() {
   if (activeTabId != null) return activeTabId;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -322,13 +427,13 @@ async function getActiveTabId() {
   return activeTabId;
 }
 
-function shortenUrl(url) {
+function streamParts(url) {
   try {
     const u = new URL(url);
     const file = u.pathname.split('/').filter(Boolean).pop() || u.pathname;
-    return `${u.hostname}/…/${file}`;
+    return { host: u.hostname, file };
   } catch {
-    return url.length > 60 ? `${url.slice(0, 57)}…` : url;
+    return { host: '', file: url };
   }
 }
 
@@ -386,104 +491,79 @@ async function sendStream(stream, withClips, button, mergeClips = false) {
   }
 }
 
-function renderTabClips() {
-  if (!streamClipListEl) return;
-  streamClipListEl.innerHTML = '';
-  tabClips.forEach((clip, index) => {
-    streamClipListEl.appendChild(buildClipRow(clip, index, {
-      onToggleMerge: (i, checked) => setClipMergeIncluded(i, checked),
-      onRemove: (i) => removeTabClip(i),
-      onUpdateTimes: (i, start, end) => updateTabClipTimes(i, start, end),
-    }));
-  });
+function streamButton(className, label, title, onClick) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `btn ${className}`;
+  btn.textContent = label;
+  if (title) btn.title = title;
+  btn.addEventListener('click', () => onClick(btn));
+  return btn;
 }
 
-async function removeTabClip(index) {
-  const tabId = await getActiveTabId();
-  const res = await chrome.runtime.sendMessage({
-    action: 'removeTabClip',
-    tabId,
-    pageKey: tabPageKey || pageKey,
-    index,
-  });
-  if (res?.ok) {
-    syncClipsFromResult(res);
-    renderClips();
-    renderStreams();
-    updateButtons();
-  } else {
-    setStatus('popup.status.error', { error: res?.error || '?' });
-  }
-}
 function renderStreams() {
-  renderTabClips();
   streamListEl.innerHTML = '';
-  if (!streams.length && !tabClips.length) {
-    streamSection.hidden = true;
-    return;
-  }
-  streamSection.hidden = false;
-  const hasCuts = tabClips.length > 0;
-  const mergeCount = clipsForMerge(tabClips).length;
+  streamSection.hidden = !streams.length;
+  streamCountEl.textContent = String(streams.length);
+  const source = activeClipSource();
+  const selectedCount = selectedClips(source).length;
+  const mergeCount = clipsForMerge(source).length;
   streams.forEach((stream) => {
     const li = document.createElement('li');
+    const { host, file } = streamParts(stream.url);
 
-    const info = document.createElement('div');
-    info.className = 'stream-info';
+    const head = document.createElement('div');
+    head.className = 'stream-head';
     const kind = document.createElement('span');
     kind.className = `stream-kind ${stream.kind || ''}`;
     kind.textContent = stream.kind || 'media';
-    const urlSpan = document.createElement('span');
-    urlSpan.className = 'stream-url';
-    urlSpan.textContent = shortenUrl(stream.url);
-    urlSpan.title = stream.url;
-    const refSpan = document.createElement('div');
-    refSpan.className = 'stream-ref';
-    refSpan.textContent = refererLabel(stream);
-    info.appendChild(kind);
-    info.appendChild(urlSpan);
-    info.appendChild(refSpan);
-    li.appendChild(info);
+    const fileSpan = document.createElement('span');
+    fileSpan.className = 'stream-file';
+    fileSpan.textContent = file;
+    fileSpan.title = stream.url;
+    head.appendChild(kind);
+    head.appendChild(fileSpan);
+
+    const meta = document.createElement('div');
+    meta.className = 'stream-meta';
+    meta.textContent = host ? `${host} · ${refererLabel(stream)}` : refererLabel(stream);
 
     const btnGroup = document.createElement('div');
     btnGroup.className = 'stream-btns';
-    if (hasCuts) {
-      const selectedCount = selectedClips(tabClips).length;
+    if (source.length) {
       if (selectedCount > 0) {
-        const cut = document.createElement('button');
-        cut.type = 'button';
-        cut.className = 'stream-send';
-        cut.textContent = t('popup.stream.cutOne', { count: selectedCount });
-        cut.title = t('popup.stream.cutOneTitle');
-        cut.addEventListener('click', () => sendStream(stream, true, cut, false));
-        btnGroup.appendChild(cut);
+        btnGroup.appendChild(streamButton(
+          'btn-primary',
+          t('popup.stream.cutOne', { count: selectedCount }),
+          t('popup.stream.cutOneTitle'),
+          (btn) => sendStream(stream, true, btn, false),
+        ));
       }
-
       if (mergeCount >= 2) {
-        const merge = document.createElement('button');
-        merge.type = 'button';
-        merge.className = 'stream-merge';
-        merge.textContent = t('popup.stream.merge', { count: mergeCount });
-        merge.title = t('popup.stream.mergeTitle');
-        merge.addEventListener('click', () => sendStream(stream, true, merge, true));
-        btnGroup.appendChild(merge);
+        btnGroup.appendChild(streamButton(
+          'btn-merge',
+          t('popup.stream.merge', { count: mergeCount }),
+          t('popup.stream.mergeTitle'),
+          (btn) => sendStream(stream, true, btn, true),
+        ));
       }
-
-      const full = document.createElement('button');
-      full.type = 'button';
-      full.className = 'stream-full';
-      full.textContent = t('popup.stream.full');
-      full.title = t('popup.stream.fullTitle');
-      full.addEventListener('click', () => sendStream(stream, false, full));
-      btnGroup.appendChild(full);
+      btnGroup.appendChild(streamButton(
+        '',
+        t('popup.stream.full'),
+        t('popup.stream.fullTitle'),
+        (btn) => sendStream(stream, false, btn),
+      ));
     } else {
-      const send = document.createElement('button');
-      send.type = 'button';
-      send.className = 'stream-send';
-      send.textContent = t('popup.stream.send');
-      send.addEventListener('click', () => sendStream(stream, false, send));
-      btnGroup.appendChild(send);
+      btnGroup.appendChild(streamButton(
+        'btn-primary',
+        t('popup.stream.send'),
+        t('popup.stream.fullTitle'),
+        (btn) => sendStream(stream, false, btn),
+      ));
     }
+
+    li.appendChild(head);
+    li.appendChild(meta);
     li.appendChild(btnGroup);
     streamListEl.appendChild(li);
   });
@@ -499,21 +579,58 @@ async function refreshStreams() {
     chrome.runtime.sendMessage({ action: 'getDetectedStreams', tabId }),
     chrome.runtime.sendMessage({ action: 'getTabClips', tabId }),
   ]);
-  streams = Array.isArray(streamRes?.streams) ? streamRes.streams : [];
+  const nextStreams = Array.isArray(streamRes?.streams) ? streamRes.streams : [];
   const nextClips = Array.isArray(clipsRes?.tabClips?.clips) ? clipsRes.tabClips.clips : [];
   tabPageKey = clipsRes?.tabClips?.pageKey || null;
   const cbRes = await sendBg('getClipClipboard');
-  updateClipboardUi(cbRes?.clipboard || null);
+  const clipboard = cbRes?.clipboard || null;
   if (isEditingClipTime()) {
+    updateClipboardUi(clipboard);
     return;
   }
+  // Rebuilding the lists every poll would steal hover/focus from their buttons.
+  const changed = JSON.stringify(nextStreams) !== JSON.stringify(streams)
+    || JSON.stringify(nextClips) !== JSON.stringify(tabClips);
+  streams = nextStreams;
   tabClips = nextClips;
   if (tabClips.length) {
     clips = [...tabClips];
   }
-  renderClips();
-  renderStreams();
+  if (changed) {
+    renderClips();
+    renderStreams();
+  }
+  updateClipboardUi(clipboard);
+  if (statusKey === 'popup.status.noVideo' && (streams.length || activeClipSource().length)) {
+    // Embed pages: the player lives in an iframe, so the top frame has no video of its own.
+    clearStatus();
+  }
+}
+
+/** Keeps the "now" clock and a start set via shortcut in sync while the popup is open. */
+async function refreshLive() {
+  const state = await sendBg('getVideoState');
+  if (!state || state.error === 'context_invalidated' || state.hint === 'reload_tab') return;
+  setPageUrl(state.pageUrl);
+  if ('pendingStart' in state) pendingStart = state.pendingStart || null;
+  nowSeconds = state.ok && Number.isFinite(state.currentTime) ? state.currentTime : null;
+  if (state.ok) {
+    btnStart.disabled = false;
+    if (statusKey === 'popup.status.noVideo' || statusKey === 'popup.status.connecting') {
+      clearStatus();
+    }
+  }
   updateButtons();
+}
+
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    await Promise.all([refreshLive(), refreshStreams()]);
+  } finally {
+    polling = false;
+  }
 }
 
 btnClearStreams?.addEventListener('click', async () => {
@@ -523,48 +640,110 @@ btnClearStreams?.addEventListener('click', async () => {
   renderStreams();
 });
 
+function statusTone(key) {
+  const name = key.replace(/^popup\.status\./, '');
+  if (OK_STATUS.has(name)) return 'ok';
+  if (BUSY_STATUS.has(name)) return 'busy';
+  if (WARN_STATUS.has(name)) return 'warn';
+  return 'error';
+}
+
 function setStatus(keyOrText, params) {
+  clearTimeout(statusTimer);
+  statusKey = keyOrText;
   if (keyOrText.includes('.')) {
     statusEl.textContent = t(keyOrText, params);
   } else {
     statusEl.textContent = keyOrText;
   }
+  const tone = statusTone(keyOrText);
+  statusEl.className = `status tone-${tone}`;
+  statusEl.hidden = false;
+  if (tone === 'ok') {
+    statusTimer = setTimeout(clearStatus, 5000);
+  }
+}
+
+function clearStatus() {
+  clearTimeout(statusTimer);
+  statusKey = '';
+  statusEl.hidden = true;
+  statusEl.textContent = '';
 }
 
 function renderClips() {
   clipListEl.innerHTML = '';
-  clips.forEach((clip, index) => {
+  const source = activeClipSource();
+  const ranges = source.map(clipRange);
+  source.forEach((clip, index) => {
     clipListEl.appendChild(buildClipRow(clip, index, {
-      onToggleMerge: (i, checked) => setClipMergeIncluded(i, checked),
-      onRemove: (i) => removeTabClip(i),
-      onUpdateTimes: (i, start, end) => updateTabClipTimes(i, start, end),
+      range: ranges[index],
+      overlapWith: overlappingClip(source, ranges, index),
     }));
   });
 }
 
+function updateClipSummary(source) {
+  // Same list the send buttons use, so the numbers match what actually goes out.
+  const sendable = selectedClips(source);
+  const invalid = source.filter((clip) => !clipRange(clip)).length;
+  const total = sendable.reduce((sum, clip) => {
+    const range = clipRange(clip);
+    return range ? sum + (range.end - range.start) : sum;
+  }, 0);
+  clipCountEl.hidden = !source.length;
+  clipCountEl.textContent = String(source.length);
+  clipEmptyEl.hidden = source.length > 0;
+  clipSummaryEl.hidden = !source.length;
+  let summary = t('popup.clip.summary', {
+    selected: sendable.length,
+    total: source.length,
+    duration: formatClockTime(total),
+  });
+  if (invalid) summary += ` · ${t('popup.clip.summaryInvalid', { count: invalid })}`;
+  clipSummaryEl.textContent = summary;
+  btnToggleAll.hidden = source.length < 2;
+  btnToggleAll.textContent = source.every(isSelected)
+    ? t('popup.selectNone')
+    : t('popup.selectAll');
+}
+
+function updatePending() {
+  pendingRowEl.hidden = !pendingStart;
+  if (!pendingStart) return;
+  const elapsed = nowSeconds != null ? nowSeconds - parseClockTime(pendingStart) : NaN;
+  pendingEl.textContent = elapsed >= 1
+    ? t('popup.pendingRunning', { start: pendingStart, elapsed: formatClockTime(elapsed) })
+    : t('popup.pendingLabel', { start: pendingStart });
+}
+
 function updateButtons() {
-  const hasAnyClips = activeClipSource().length > 0;
-  const selectedCount = selectedClips(activeClipSource()).length;
-  const mergeCount = clipsForMerge(activeClipSource()).length;
+  const source = activeClipSource();
+  const selectedCount = selectedClips(source).length;
+  const mergeCount = clipsForMerge(source).length;
   btnQueueEach.disabled = !pageUrl || selectedCount < 1;
   btnQueueMerge.disabled = !pageUrl || mergeCount < 2;
+  btnQueueEach.textContent = t('popup.queueEach', { count: selectedCount });
+  btnQueueMerge.textContent = t('popup.queueMerge', { count: mergeCount });
+  actionsEl.hidden = !source.length;
   if (btnCopyClips) {
-    btnCopyClips.disabled = !hasAnyClips;
+    btnCopyClips.disabled = !source.length;
   }
-  if (btnCancelPending) {
-    btnCancelPending.classList.toggle('is-visible', !!pendingStart);
-    btnCancelPending.disabled = !pendingStart;
-  }
+  clipTransferEl.hidden = !source.length && !clipboardCount;
+  // Embed pages: no video in the top frame, so the page URL rarely works — favour the stream buttons.
+  actionsEl.classList.toggle('is-muted', nowSeconds == null && streams.length > 0);
   if (btnEnd) btnEnd.disabled = !pendingStart;
-  pendingEl.textContent = pendingStart ? t('popup.pendingLabel', { start: pendingStart }) : '';
+  // Highlight whichever marker the user needs next.
+  btnStart.classList.toggle('is-next', !pendingStart && !btnStart.disabled && nowSeconds != null);
+  btnEnd.classList.toggle('is-next', !!pendingStart);
+  nowTimeEl.textContent = nowSeconds != null ? formatClockTime(nowSeconds) : NO_TIME;
+  hintTopEl.hidden = source.length > 0 || !!pendingStart;
+  updatePending();
+  updateClipSummary(source);
 }
 
 function applyFromState(state) {
-  if (state?.pageUrl) {
-    pageUrl = state.pageUrl;
-    pageUrlEl.hidden = false;
-    pageUrlEl.textContent = pageUrl;
-  }
+  setPageUrl(state?.pageUrl);
   if (state?.pageKey) pageKey = state.pageKey;
   if (state?.pendingStart) pendingStart = state.pendingStart;
   else if (state && 'pendingStart' in state) pendingStart = null;
@@ -582,15 +761,9 @@ async function refresh() {
   }
 
   applyFromState(state);
+  nowSeconds = state?.ok && Number.isFinite(state.currentTime) ? state.currentTime : null;
 
-  if (state?.ok) {
-    setStatus('popup.status.current', { time: state.formatted });
-    btnStart.disabled = false;
-  } else if (pendingStart) {
-    setStatus('popup.status.pending');
-    btnStart.disabled = false;
-  } else if (clips.length) {
-    setStatus('popup.status.clipsReady', { count: clips.length });
+  if (state?.ok || pendingStart || clips.length) {
     btnStart.disabled = false;
   } else {
     setStatus(state?.error === 'no_video' ? 'popup.status.noVideo' : 'popup.status.connecting');
@@ -599,6 +772,20 @@ async function refresh() {
 
   renderClips();
   updateButtons();
+}
+
+async function showShortcuts() {
+  try {
+    const commands = await chrome.commands.getAll();
+    const byName = Object.fromEntries(commands.map((c) => [c.name, c.shortcut]));
+    for (const [id, name] of [['kbdStart', 'mark-start'], ['kbdEnd', 'mark-end']]) {
+      const el = document.getElementById(id);
+      el.textContent = byName[name] || '';
+      el.hidden = !byName[name];
+    }
+  } catch {
+    /* shortcuts are only a hint */
+  }
 }
 
 btnStart?.addEventListener('mousedown', (e) => {
@@ -641,19 +828,16 @@ btnQueueMerge.addEventListener('click', () => sendQueue(true));
 
 function applyVisibleTimes(source) {
   const next = (source || []).map((c) => ({ ...c }));
-  for (const list of [clipListEl, streamClipListEl]) {
-    if (!list) continue;
-    list.querySelectorAll(':scope > li').forEach((li, index) => {
-      const inputs = li.querySelectorAll('.clip-time-input');
-      const orig = source[index];
-      if (inputs.length < 2 || !orig) return;
-      const start = normalizeClockTime(inputs[0].value);
-      const end = normalizeClockTime(inputs[1].value);
-      if (!start || !end || parseClockTime(end) <= parseClockTime(start)) return;
-      if (start === orig.start && end === orig.end) return;
-      next[index] = { ...next[index], start, end };
-    });
-  }
+  clipListEl.querySelectorAll(':scope > li').forEach((li, index) => {
+    const inputs = li.querySelectorAll('.clip-time-input');
+    const orig = source[index];
+    if (inputs.length < 2 || !orig) return;
+    const start = normalizeClockTime(inputs[0].value);
+    const end = normalizeClockTime(inputs[1].value);
+    if (!start || !end || parseClockTime(end) <= parseClockTime(start)) return;
+    if (start === orig.start && end === orig.end) return;
+    next[index] = { ...next[index], start, end };
+  });
   return next;
 }
 
@@ -689,7 +873,7 @@ async function sendQueue(mergeClips) {
   } else if (Array.isArray(state?.clips) && state.clips.length) {
     clips = [...state.clips];
   }
-  if (state?.pageUrl) pageUrl = state.pageUrl;
+  setPageUrl(state?.pageUrl);
   const source = await clipsReadyToSend();
   const payload = mergeClips ? clipsForMerge(source) : selectedClips(source);
   if (!pageUrl || !payload.length) {
@@ -706,7 +890,8 @@ async function sendQueue(mergeClips) {
     pageUrl,
     clips: payload,
     mergeClips,
-  });  if (result?.ok) {
+  });
+  if (result?.ok) {
     setStatus('popup.status.sent');
   } else if (result?.errorKey) {
     setStatus('popup.status.error', { error: t(result.errorKey) });
@@ -718,14 +903,15 @@ async function sendQueue(mergeClips) {
 async function boot() {
   await initI18n();
   applyI18n();
+  void showShortcuts();
   await refreshClipboardUi();
   await refresh();
   await refreshStreams();
-  streamTimer = setInterval(refreshStreams, 1500);
+  pollTimer = setInterval(poll, 1000);
 }
 
 boot();
 
 window.addEventListener('unload', () => {
-  if (streamTimer) clearInterval(streamTimer);
+  if (pollTimer) clearInterval(pollTimer);
 });

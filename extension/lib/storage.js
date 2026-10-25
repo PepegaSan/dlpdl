@@ -12,6 +12,7 @@ import { draftKeyForHref } from './page-url.js';
  * @property {string} folder
  * @property {string} customNamePrefix
  * @property {boolean} openUiAfterQueue
+ * @property {boolean} keepPlayback keep CDN videos playing in background tabs
  * @property {string} uiLocale en | de
  * @property {string} apiToken optional CLIP_DIRECT_TOKEN of the backend
  */
@@ -29,6 +30,7 @@ export const DEFAULT_SETTINGS = {
   folder: '',
   customNamePrefix: '',
   openUiAfterQueue: false,
+  keepPlayback: true,
   apiToken: '',
 };
 

@@ -2,6 +2,7 @@ import {
   apiFetch,
   buildPageJobPayload,
   buildStreamJobPayload,
+  clipHasTimes,
   clipsForMerge,
   errorKeyForStatus,
   selectedClips,
@@ -816,6 +817,10 @@ async function queueFromPage(pageUrl, tabHint) {
   }
   const clips = session.clipEntry(tabId)?.clips || [];
   const valid = selectedClips(clips);
+  // Checked clips that are all invalid (end <= start) must not fall through to a full download.
+  if (!valid.length && clips.some((c) => clipHasTimes(c) && c.includeInMerge !== false)) {
+    return { ok: false, errorKey: 'error.invalidClipRange' };
+  }
 
   // Same split as popup Queue: YouTube & Co. use the page URL; embed/CDN
   // pages must use the sniffed stream.

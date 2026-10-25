@@ -42,7 +42,7 @@ export function t(key, params) {
   return interpolate(template, params);
 }
 
-/** Apply data-i18n and data-i18n-attr="title" on static markup. */
+/** Apply data-i18n (+ data-i18n-attr), data-i18n-placeholder and data-i18n-title on static markup. */
 export function applyI18n(root = document) {
   root.querySelectorAll('[data-i18n]').forEach((el) => {
     const key = el.getAttribute('data-i18n');
@@ -56,5 +56,8 @@ export function applyI18n(root = document) {
   });
   root.querySelectorAll('[data-i18n-placeholder]').forEach((el) => {
     el.placeholder = t(el.getAttribute('data-i18n-placeholder'));
+  });
+  root.querySelectorAll('[data-i18n-title]').forEach((el) => {
+    el.title = t(el.getAttribute('data-i18n-title'));
   });
 }
