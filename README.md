@@ -109,6 +109,7 @@ Default port: **8090**. Map `downloads` volume as needed (see `deploy/SYNOLOGY.m
 | No autostart wanted | answer `n`, or `setup-pc.bat -NoAutostart`; use the Start-menu entry instead |
 | Task Scheduler reports an error | the account name is taken from `WindowsIdentity` (`PC-NAME\User`), which also works when the PC is named like the user; if it still fails, copy the Start-menu shortcut *PC Render starten* into `shell:startup` |
 | Re-run or change settings | just run `setup-pc.bat` again with the new parameters — it overwrites the configuration and restarts the instance |
+| Updated the code (`git pull`) | click *PC Render starten* once — a new instance stops the previous one and takes over the port; the running process never reloads code by itself |
 
 The NAS address stays the main server in the extension. Each job probes the PC (`GET /api/jobs`, 1.5 s, cached 10 s); if it answers, download *and* encode run there (also with the browser's IP, which helps CDNs that bind tokens to it), otherwise the job goes to the NAS as before. The popup and the on-page bar show `→ PC`, the PC dot turns orange when the instance is preferred but silent, and the Web-UI button opens the instance that took the last job. Both instances keep their own job list.
 

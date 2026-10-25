@@ -32,6 +32,26 @@ def test_config_maps_onto_backend_environment_without_overriding_explicit_values
     assert 'CLIP_DIRECT_TOKEN' not in env
 
 
+NETSTAT = '''
+Aktive Verbindungen
+
+  Proto  Lokale Adresse         Remoteadresse          Status           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              ABHÖREN          1234
+  TCP    127.0.0.1:8090         127.0.0.1:52011        HERGESTELLT      97208
+  TCP    127.0.0.1:8090         0.0.0.0:0              ABHÖREN          97208
+  TCP    127.0.0.1:52011        127.0.0.1:8090         HERGESTELLT      4321
+  TCP    [::1]:8091             [::]:0                 LISTENING        555
+'''
+
+
+def test_netstat_listener_is_found_by_address_not_by_localized_state():
+    assert pc_render.parse_netstat_listener(NETSTAT, 8090) == 97208
+    assert pc_render.parse_netstat_listener(NETSTAT, 8091) == 555
+    # an established connection to the port is not the listener
+    assert pc_render.parse_netstat_listener(NETSTAT, 52011) is None
+    assert pc_render.parse_netstat_listener(NETSTAT, 9999) is None
+
+
 def test_config_path_can_be_overridden_for_tests(tmp_path, monkeypatch):
     path = tmp_path / 'pc.json'
     # written like Windows PowerShell 5.1 does it: with a UTF-8 BOM
