@@ -21,9 +21,10 @@
     try {
       const stored = await chrome.storage.sync.get({ uiLocale: DEFAULT_LOCALE });
       locale = stored.uiLocale === 'de' ? 'de' : 'en';
-      const url = chrome.runtime.getURL(`lib/locales/${locale}.json`);
-      const res = await fetch(url);
-      dict = res.ok ? await res.json() : {};
+      // Sandboxed / opaque-origin frames (YouTube) block fetch() of
+      // chrome-extension:// URLs, so the service worker hands us the dict.
+      const res = await chrome.runtime.sendMessage({ action: 'getLocaleDict', locale });
+      dict = res?.ok && res.dict ? res.dict : {};
       try {
         document.documentElement.lang = locale;
       } catch {

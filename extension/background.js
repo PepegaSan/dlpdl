@@ -903,7 +903,26 @@ chrome.commands?.onCommand.addListener(async (command, tab) => {
   await forwardToTab(tabId, { action });
 });
 
+const localeDicts = new Map();
+
+async function localeDict(locale) {
+  const key = locale === 'de' ? 'de' : 'en';
+  if (!localeDicts.has(key)) {
+    const res = await fetch(chrome.runtime.getURL(`lib/locales/${key}.json`));
+    if (!res.ok) throw new Error(`locale ${key}: HTTP ${res.status}`);
+    localeDicts.set(key, await res.json());
+  }
+  return localeDicts.get(key);
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.action === 'getLocaleDict') {
+    localeDict(msg.locale)
+      .then((dict) => sendResponse({ ok: true, dict }))
+      .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+    return true;
+  }
+
   if (msg?.action === 'queueClips') {
     queueClips(msg.pageUrl, msg.clips, msg.mergeClips, sender?.tab?.id ?? msg.tabId)
       .then(sendResponse)
