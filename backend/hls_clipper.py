@@ -45,7 +45,6 @@ SEGMENT_FETCH_DELAY_SEC = 0.5
 SEGMENT_FETCH_RETRY_MAX = 6
 SEGMENT_FETCH_RETRY_BASE_SEC = 2.5
 SEGMENT_READ_CHUNK = 64 * 1024
-MIN_USABLE_SEGMENT_BYTES = 24 * 1024
 FFMPEG_TIMEOUT_SEC = float(os.environ.get('FFMPEG_TIMEOUT_SEC', '1800'))
 FFPROBE_TIMEOUT_SEC = 60.0
 
@@ -226,13 +225,19 @@ class HttpFetcher:
         self.key_cache: dict[str, bytes] = {}
         self.init_cache: dict[InitSection, bytes] = {}
         self.prefetched: dict[MediaSegment, bytes] = {}
+        self.last_final_url = ''
 
     @property
     def header_names(self) -> list[str]:
         return sorted(self._headers)
 
     def get_text(self, url: str) -> str:
-        return self.get_bytes(url).decode('utf-8', 'ignore')
+        return self.get_text_final(url)[0]
+
+    def get_text_final(self, url: str) -> tuple[str, str]:
+        """Text plus the URL it was actually served from (after redirects)."""
+        text = self.get_bytes(url).decode('utf-8', 'ignore').lstrip('﻿')
+        return text, self.last_final_url or url
 
     def _throttle(self) -> None:
         if self._segment_delay <= 0:
@@ -258,52 +263,64 @@ class HttpFetcher:
         req = urllib.request.Request(url, headers=headers)
         return urllib.request.urlopen(req, timeout=self._timeout)
 
-    def _read_body(self, resp) -> bytes:
+    def _read_body(self, resp) -> tuple[bytes, bool]:
+        """Body bytes and whether the server delivered all of it (no dropped connection)."""
         chunks: list[bytes] = []
+        complete = True
         while True:
             try:
                 chunk = resp.read(SEGMENT_READ_CHUNK)
             except http.client.IncompleteRead as inc:
                 if inc.partial:
                     chunks.append(inc.partial)
+                complete = False
                 break
             if not chunk:
                 break
             chunks.append(chunk)
-        return b''.join(chunks)
+        return b''.join(chunks), complete
 
-    def _resume_range(self, url: str, got: bytes, declared: Optional[int]) -> bytes:
-        """Append remaining bytes after a dropped connection. No-op if CDN ignores Range."""
+    def _resume_range(self, url: str, got: bytes, declared: int) -> tuple[bytes, bool]:
+        """Append remaining bytes after a dropped connection.
+
+        Returns (data, complete). A 416 means nothing exists beyond `got`: the
+        Content-Length was wrong and the body is complete as it is.
+        """
         data = got
         for _ in range(3):
-            if declared is not None and len(data) >= declared:
-                return data
+            if len(data) >= declared:
+                return data, True
             if not data:
-                return data
+                return data, False
             self._throttle()
             try:
                 with self._open(url, {'Range': f'bytes={len(data)}-'}) as resp:
-                    extra = self._read_body(resp)
+                    extra, _ = self._read_body(resp)
                     status = getattr(resp, 'status', None) or resp.getcode()
             except urllib.error.HTTPError as exc:
-                if exc.code in (416, 200):
-                    return data
+                if exc.code == 416:
+                    log.warning('CDN Content-Length lie (%d/%d) for %s', len(data), declared, url[:96])
+                    return data, True
                 raise
             self._last_fetch_at = time.monotonic()
             if not extra:
-                return data
+                return data, False
             if status == 206:
                 data += extra
                 continue
+            # CDN ignored Range and re-sent the whole file.
             if len(extra) > len(data):
-                return extra
-            return data
-        return data
+                return extra, len(extra) >= declared
+            return data, False
+        return data, len(data) >= declared
 
     def get_bytes(self, url: str, byte_range: Optional[tuple[int, int]] = None) -> bytes:
-        """GET a resource; byte_range=(length, offset) for #EXT-X-BYTERANGE segments."""
+        """GET a resource; byte_range=(length, offset) for #EXT-X-BYTERANGE segments.
+
+        A body shorter than announced is retried, never returned: a truncated
+        segment would show up as a glitch in the clip instead of an error.
+        """
         last_exc: Optional[BaseException] = None
-        best = b''
         range_header = None
         if byte_range:
             length, offset = byte_range
@@ -314,6 +331,7 @@ class HttpFetcher:
             try:
                 with self._open(url, range_header) as resp:
                     status = getattr(resp, 'status', None) or resp.getcode()
+                    final_url = resp.geturl() or url
                     declared = None
                     raw_len = resp.headers.get('Content-Length')
                     if raw_len:
@@ -321,34 +339,38 @@ class HttpFetcher:
                             declared = int(raw_len)
                         except ValueError:
                             declared = None
-                    data = self._read_body(resp)
+                    data, complete = self._read_body(resp)
                 self._last_fetch_at = time.monotonic()
+                self.last_final_url = final_url
                 diagnostics.count(f'http_{status}')
+                expected = declared
+                if byte_range and status == 206 and expected is None:
+                    expected = byte_range[0]
+                if expected is not None and 0 < len(data) < expected:
+                    if byte_range and status == 206:
+                        complete = False
+                    else:
+                        try:
+                            data, complete = self._resume_range(url, data, expected)
+                        except Exception as resume_exc:
+                            log.warning('range resume failed for %s: %s', url[:96], resume_exc)
+                            complete = False
                 if byte_range and status != 206:
                     length, offset = byte_range
+                    whole = data
                     data = data[offset:offset + length]
-                    declared = None
-                elif byte_range:
-                    declared = None
-                if declared is not None and 0 < len(data) < declared:
-                    try:
-                        data = self._resume_range(url, data, declared)
-                    except Exception as resume_exc:
-                        log.warning('range resume failed for %s: %s', url[:96], resume_exc)
-                if data and (declared is None or len(data) >= declared or _segment_payload_usable(data)):
-                    if declared is not None and len(data) < declared:
-                        log.warning(
-                            'CDN Content-Length lie (%d/%d) — keeping body for %s',
-                            len(data),
-                            declared,
-                            url[:96],
-                        )
+                    # A drop behind our range leaves the range itself intact.
+                    if len(whole) >= offset + length:
+                        complete = True
+                if data and complete:
                     return data
-                if len(data) > len(best):
-                    best = data
+                diagnostics.note(
+                    'truncated', url=url, got=len(data), expected=expected, attempt=attempt + 1,
+                )
                 last_exc = RuntimeError(
-                    f'IncompleteRead({len(data)} bytes read, '
-                    f'{(declared or 0) - len(data)} more expected)'
+                    f'Segment unvollständig ({len(data)} von '
+                    f'{expected if expected is not None else "?"} Bytes) nach '
+                    f'{SEGMENT_FETCH_RETRY_MAX} Versuchen — CDN bricht die Verbindung ab',
                 )
             except urllib.error.HTTPError as exc:
                 last_exc = exc
@@ -374,18 +396,7 @@ class HttpFetcher:
                 continue
             except Exception as exc:
                 last_exc = exc
-                partial = _incomplete_partial(exc)
-                if len(partial) > len(best):
-                    best = partial
                 if not _is_retryable_network_error(exc) or attempt >= SEGMENT_FETCH_RETRY_MAX - 1:
-                    if _segment_payload_usable(best):
-                        log.warning(
-                            'using truncated segment (%d bytes) for %s after %s',
-                            len(best),
-                            url[:96],
-                            exc,
-                        )
-                        return best
                     raise
             wait = self._retry_wait(attempt)
             log.warning(
@@ -397,35 +408,9 @@ class HttpFetcher:
                 last_exc,
             )
             time.sleep(wait)
-        if _segment_payload_usable(best):
-            log.warning('using truncated segment (%d bytes) for %s', len(best), url[:96])
-            return best
         if last_exc:
             raise last_exc
         raise RuntimeError('segment fetch failed')
-
-
-def _incomplete_partial(exc: BaseException) -> bytes:
-    cur: Optional[BaseException] = exc
-    for _ in range(6):
-        if cur is None:
-            break
-        if isinstance(cur, http.client.IncompleteRead):
-            return bytes(cur.partial or b'')
-        partial = getattr(cur, 'partial', None)
-        if isinstance(partial, (bytes, bytearray)) and partial:
-            return bytes(partial)
-        nxt = getattr(cur, 'reason', None)
-        cur = nxt if isinstance(nxt, BaseException) else None
-    return b''
-
-
-def _segment_payload_usable(data: bytes) -> bool:
-    if not data or len(data) < MIN_USABLE_SEGMENT_BYTES:
-        return False
-    if b'ftyp' in data[:64] or b'moof' in data[:256]:
-        return True
-    return b'\x47' in data[:PREFIX_SCAN_BYTES]
 
 
 def align_transport_stream(payload: bytes) -> bytes:
@@ -465,7 +450,10 @@ def resolve_hls_uri(base_url: str, ref: str) -> str:
         return joined
     if ref_p.query or out.query:
         return joined
-    if ref_p.scheme and ref_p.netloc and ref_p.netloc.lower() != (base.netloc or '').lower():
+    # Other hosts (also protocol-relative //cdn/…) and data:/skd: URIs keep their own form.
+    if out.scheme.lower() not in ('http', 'https'):
+        return joined
+    if (out.netloc or '').lower() != (base.netloc or '').lower():
         return joined
     return urllib.parse.urlunsplit(
         (out.scheme, out.netloc, out.path, base.query, out.fragment),
@@ -496,7 +484,7 @@ def select_master_variant(text: str, base_url: str) -> tuple[Optional[str], Opti
     audio_groups: dict[str, list[tuple[bool, str]]] = {}
     variants: list[tuple[dict[str, str], str]] = []
     pending: Optional[dict[str, str]] = None
-    for line in text.splitlines():
+    for line in text.lstrip('﻿').splitlines():
         stripped = line.strip()
         if stripped.startswith('#EXT-X-MEDIA:'):
             attrs = _hls_attrs(stripped)
@@ -540,6 +528,9 @@ def resolve_master_playlist(text: str, base_url: str) -> Optional[str]:
 
 
 def parse_media_playlist(text: str, base_url: str) -> ParsedPlaylist:
+    # str.strip() keeps U+FEFF, so a BOM would turn "#EXTM3U" into segment 0
+    # and shift every AES sequence-number IV by one.
+    text = text.lstrip('﻿')
     segments: list[MediaSegment] = []
     timeline = 0.0
     pending_duration: Optional[float] = None
@@ -568,7 +559,13 @@ def parse_media_playlist(text: str, base_url: str) -> ParsedPlaylist:
                 iv_hex = attrs.get('IV', '')
                 iv = None
                 if iv_hex:
-                    iv = bytes.fromhex(iv_hex[2:] if iv_hex.lower().startswith('0x') else iv_hex).rjust(16, b'\0')
+                    try:
+                        iv = bytes.fromhex(iv_hex[2:] if iv_hex.lower().startswith('0x') else iv_hex)
+                    except ValueError:
+                        raise ValueError(f'#EXT-X-KEY: ungültiger IV {iv_hex!r}') from None
+                    if len(iv) > 16:
+                        raise ValueError(f'#EXT-X-KEY: IV länger als 16 Bytes ({iv_hex!r})')
+                    iv = iv.rjust(16, b'\0')
                 key = SegmentKey('AES-128', resolve_hls_uri(base_url, attrs['URI']), iv)
                 key_method = key_method or 'AES-128'
             else:
@@ -692,11 +689,13 @@ def _fetch_resolved_media_playlist(
 ) -> tuple[str, ParsedPlaylist]:
     if depth > 4:
         raise ValueError('too many nested HLS playlists')
-    body = fetcher.get_text(playlist_url)
-    diagnostics.note('playlist', url=playlist_url, depth=depth, text=body[:3000])
-    media_url = playlist_url
+    body, final_url = fetcher.get_text_final(playlist_url)
+    diagnostics.note('playlist', url=playlist_url, depth=depth, text=body[:3000], final_url=final_url)
+    # Relative URIs resolve against the URL the playlist was served from; a
+    # redirect that dropped the signed query still passes it on to the children.
+    media_url = _redirected_base(playlist_url, final_url)
     if '#EXT-X-STREAM-INF' in body:
-        variant, audio_url = select_master_variant(body, playlist_url)
+        variant, audio_url = select_master_variant(body, media_url)
         if not variant:
             raise ValueError('no variant in master playlist')
         diagnostics.note('variant', video=variant, audio=audio_url or '')
@@ -710,6 +709,16 @@ def _fetch_resolved_media_playlist(
         if all(_segment_uri_looks_like_playlist(seg.uri) for seg in sample):
             return _fetch_resolved_media_playlist(fetcher, sample[0].uri, depth + 1)
     return media_url, parsed
+
+
+def _redirected_base(requested: str, final: str) -> str:
+    if not final or final == requested:
+        return requested
+    req_q = urllib.parse.urlsplit(requested).query
+    fin = urllib.parse.urlsplit(final)
+    if req_q and not fin.query:
+        return urllib.parse.urlunsplit((fin.scheme, fin.netloc, fin.path, req_q, ''))
+    return final
 
 
 def resolve_hls_playlist(
@@ -927,8 +936,27 @@ def run_ffmpeg_with_progress(
             elif line == 'progress=end':
                 out_us = int(max(duration_sec, 0.1) * 1_000_000)
 
+    # stderr has to be drained live as well: a corrupt TS yields thousands of
+    # "non monotonically increasing dts" lines, the pipe fills up and ffmpeg
+    # blocks until the timeout. Keep the head and the tail for the report.
+    err_head: list[str] = []
+    err_tail: list[str] = []
+
+    def read_stderr() -> None:
+        if not proc.stderr:
+            return
+        for line in proc.stderr:
+            if len(err_head) < 50:
+                err_head.append(line)
+                continue
+            err_tail.append(line)
+            if len(err_tail) > 400:
+                del err_tail[:200]
+
     reader = threading.Thread(target=read_stdout, daemon=True)
     reader.start()
+    err_reader = threading.Thread(target=read_stderr, daemon=True)
+    err_reader.start()
 
     try:
         while proc.poll() is None:
@@ -949,11 +977,12 @@ def run_ffmpeg_with_progress(
     finally:
         stop.set()
         reader.join(timeout=2)
+        err_reader.join(timeout=2)
         if token is not None:
             token.unregister(proc)
 
     raise_if_cancelled()
-    stderr = proc.stderr.read() if proc.stderr else ''
+    stderr = ''.join(err_head) + ('…\n' if len(err_tail) > 200 else '') + ''.join(err_tail[-200:])
     proc.wait(timeout=5)
     code = proc.returncode if proc.returncode is not None else 1
     if code != 0:
@@ -1106,6 +1135,9 @@ def _format_playlist_error(exc: BaseException, headers: Optional[dict]) -> str:
     has_referer = bool(_header_value(headers, 'Referer'))
     code = getattr(exc, 'code', None)
     detail = str(exc)
+    if isinstance(exc, ValueError) and code is None:
+        # Parse errors (bad IV, no variant, nesting): replaying the page won't help.
+        return f'Playlist nicht verarbeitbar: {detail}'
     if code == 403:
         if not has_cookie or not has_referer:
             return (
@@ -1463,7 +1495,8 @@ def trim_media_to_duration(
         log.info('trimmed %s: %.2fs -> %.2fs (copy)', path, actual, duration_sec)
         return True, 'trim copy'
 
-    if encode_mode == 'exact' or encode_mode == 'preserve':
+    # preserve promises untouched frames: a long container beats a re-encode.
+    if encode_mode == 'exact':
         encode_cmd = [
             *base,
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
@@ -2239,6 +2272,9 @@ def _clip_rendition(
             progress(build_progress_event(fraction=overall, msg=message))
 
     end_eff = end_sec if end_sec != float('inf') else parsed.duration
+    if parsed.duration > 0:
+        # A typed end past the stream end must not make a correct clip "too short".
+        end_eff = min(end_eff, parsed.duration)
     expected_span = max(end_eff - start_sec, 0.1)
     too_short = (
         lambda expected: f'nur {probe_duration_seconds(output_mp4) or 0:.1f}s von '
@@ -2312,7 +2348,7 @@ def _clip_rendition(
     diagnostics.note('attempt', path='ffmpeg-direct', ok=ok_direct, error='' if ok_direct else err_direct)
     if ok_direct and _output_usable(output_mp4) and _output_covers_expected(output_mp4, expected_span):
         if end_sec != float('inf'):
-            trim_media_to_duration(output_mp4, max(end_sec - start_sec, 0.1), encode_mode=mode)
+            trim_media_to_duration(output_mp4, expected_span, encode_mode=mode)
         report(1.0, 'Done')
         return True, err_direct, start_sec
     _remove_quiet(output_mp4)
@@ -2360,18 +2396,26 @@ def _clip_with_audio_rendition(
     stem = os.path.splitext(output_mp4)[0]
     video_tmp, audio_tmp = f'{stem}.video.mp4', f'{stem}.audio.mp4'
     try:
-        ok, msg, video_start = _clip_rendition(
-            media_url, parsed, fetcher, headers, start_sec, end_sec,
-            raw_ts_path, video_tmp, progress, progress_base, progress_scale * 0.75, mode,
-        )
-        if not ok:
-            return False, msg
+        # Audio playlist first: a DRM'd or empty rendition must not cost a video download.
         try:
             audio_url, audio_parsed = _fetch_resolved_media_playlist(fetcher, parsed.audio_url or '')
         except JobCancelled:
             raise
         except Exception as exc:
             return False, f'Tonspur-Playlist nicht ladbar: {exc}'
+        if audio_parsed.encrypted:
+            return False, (
+                f'Tonspur ist mit {audio_parsed.key_method or "DRM"} verschlüsselt — '
+                'nur AES-128 wird unterstützt'
+            )
+        if not audio_parsed.segments:
+            return False, 'Tonspur: empty media playlist'
+        ok, msg, video_start = _clip_rendition(
+            media_url, parsed, fetcher, headers, start_sec, end_sec,
+            raw_ts_path, video_tmp, progress, progress_base, progress_scale * 0.75, mode,
+        )
+        if not ok:
+            return False, msg
         ok, audio_msg, audio_start = _clip_rendition(
             audio_url, audio_parsed, fetcher, headers, start_sec, end_sec,
             os.path.splitext(raw_ts_path)[0] + '_audio.ts', audio_tmp,

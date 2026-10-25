@@ -72,7 +72,13 @@ export class TabSessionStore {
     } else {
       list.unshift(entry);
     }
-    this.streamsByTab[tabId] = list.slice(0, MAX_STREAMS);
+    // Fragment floods (.mp4 CMAF chunks, signed segment URLs) must not push the playlist out.
+    while (list.length > MAX_STREAMS) {
+      let victim = list.length - 1;
+      while (victim >= 0 && list[victim].kind === 'hls') victim -= 1;
+      list.splice(victim >= 0 ? victim : list.length - 1, 1);
+    }
+    this.streamsByTab[tabId] = list;
     this.#scheduleStreams();
   }
 

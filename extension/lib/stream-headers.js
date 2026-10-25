@@ -74,8 +74,9 @@ function pickReferer(stream, pageUrl, tabUrl) {
     return normalizeReferer(pageUrl || tabUrl || candidates[0] || '');
   }
 
-  // KVS / tnmr-style: the CDN host as Referer is rejected — prefer the HTML page.
-  if (streamHost || isTokenizedHlsCdnUrl(stream?.url)) {
+  // KVS / tnmr-style only: the CDN host as Referer is rejected — prefer the HTML page.
+  // Everywhere else the Referer the player actually sent is the one that works.
+  if (isTokenizedHlsCdnUrl(stream?.url)) {
     for (const ref of candidates) {
       const host = hostOf(ref);
       if (host && !hostsRelated(host, streamHost)) {

@@ -1,12 +1,42 @@
+import pytest
+
 from backend.hls_clipper import (
     InitSection,
     parse_media_playlist,
+    resolve_hls_uri,
     segments_with_preroll,
     segments_for_window,
     select_master_variant,
 )
 
 BASE = 'https://cdn.example/path/index.m3u8'
+
+
+def test_bom_and_crlf_do_not_create_a_phantom_segment():
+    parsed = parse_media_playlist(
+        '﻿#EXTM3U\r\n#EXT-X-KEY:METHOD=AES-128,URI="k.key"\r\n'
+        '#EXTINF:2,\r\na.ts\r\n#EXTINF:2,\r\nb.ts\r\n',
+        BASE,
+    )
+    assert [s.uri.rsplit('/', 1)[1] for s in parsed.segments] == ['a.ts', 'b.ts']
+    # the sequence number is the AES IV: a phantom segment 0 would shift every IV
+    assert [s.sequence for s in parsed.segments] == [0, 1]
+    video, _ = select_master_variant('﻿#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n', BASE)
+    assert video == 'https://cdn.example/path/v.m3u8'
+
+
+def test_malformed_iv_is_a_clear_parse_error():
+    with pytest.raises(ValueError, match='IV'):
+        parse_media_playlist(
+            '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k.key",IV=0xABC\n#EXTINF:2,\na.ts\n', BASE,
+        )
+
+
+def test_signed_query_stays_on_the_playlist_host():
+    signed = f'{BASE}?t=1&s=2'
+    assert resolve_hls_uri(signed, 'seg1.ts') == 'https://cdn.example/path/seg1.ts?t=1&s=2'
+    assert resolve_hls_uri(signed, '//other.cdn/seg1.ts') == 'https://other.cdn/seg1.ts'
+    assert resolve_hls_uri(signed, 'data:text/plain;base64,AAAA') == 'data:text/plain;base64,AAAA'
 
 
 def test_signed_query_is_inherited_by_relative_uris():

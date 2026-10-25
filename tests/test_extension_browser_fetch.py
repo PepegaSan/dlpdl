@@ -89,6 +89,13 @@ def test_browser_fetch_merge_windows(hls_server, tmp_path, stream):
     assert abs(duration - 4.0) < 0.6, (duration, msg)
 
 
+def test_browser_fetch_follows_playlist_redirect(hls_server, tmp_path):
+    raw = tmp_path / 'browser.bin'
+    info = _browser_fetch(f'{hls_server}/redirect/ts/index.m3u8', [{'start': 5, 'end': 11}], raw)
+    assert info['timelineStart'] == pytest.approx(4.0, abs=0.1)
+    assert raw.stat().st_size > 100_000
+
+
 def test_discontinuity_window_is_split_into_pieces(hls_server, tmp_path):
     info = _browser_fetch(
         f'{hls_server}/range/discontinuity/index.m3u8', [{'start': 8, 'end': 12}], tmp_path / 'b.bin',

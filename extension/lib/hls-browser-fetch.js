@@ -16,12 +16,24 @@ function resolveHlsUri(baseUrl, ref) {
   if (!base.search || refHasQuery || joined.search) {
     return joined.toString();
   }
-  if (/^https?:/i.test(trimmed) && joined.host.toLowerCase() !== base.host.toLowerCase()) {
+  // Other hosts (also protocol-relative //cdn/…) and data:/skd: URIs keep their own form.
+  if (!/^https?:$/i.test(joined.protocol) || joined.host.toLowerCase() !== base.host.toLowerCase()) {
     return joined.toString();
   }
   joined.search = base.search;
   return joined.toString();
 }
+
+/** Base for relative URIs after a redirect; a dropped signed query is passed on. */
+function redirectedBase(requested, served) {
+  if (!served || served === requested) return requested;
+  const req = new URL(requested);
+  const fin = new URL(served);
+  if (req.search && !fin.search) fin.search = req.search;
+  return fin.toString();
+}
+
+const backoff = (attempt, baseMs) => new Promise((r) => setTimeout(r, baseMs * (attempt + 1)));
 
 function parseAttrs(line) {
   const body = line.slice(line.indexOf(':') + 1);
@@ -163,9 +175,11 @@ function parseMediaPlaylist(text, baseUrl) {
   return { segments, duration: timeline, unsupportedKey };
 }
 
-async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS, headers = undefined) {
+async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS, headers = undefined, signal = null) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  // A cancelled job must also stop requests that are already in flight.
+  if (signal) signal.addEventListener('abort', () => ctrl.abort(), { once: true });
   try {
     const res = await fetch(url, {
       cache: 'no-store',
@@ -179,24 +193,41 @@ async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS, headers = und
   }
 }
 
+/**
+ * Only network errors and 429/5xx are retried. A 403/404 will not change,
+ * and hammering a CDN that is already blocking us just gets us rate-limited.
+ */
+function retryableStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+/** Playlist text plus the URL it was served from: redirects move the base for relative URIs. */
 async function fetchText(url) {
   let lastErr = `HTTP error for ${url}`;
   for (let attempt = 0; attempt < RETRIES; attempt += 1) {
+    let res;
     try {
-      const res = await fetchWithTimeout(url);
-      if (res.status === 429 || res.status >= 500) {
-        lastErr = `HTTP ${res.status}`;
-        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
-        continue;
-      }
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
-      }
-      return await res.text();
+      res = await fetchWithTimeout(url);
     } catch (err) {
       lastErr = err?.message || String(err);
       if (attempt >= RETRIES - 1) break;
-      await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+      await backoff(attempt, 600);
+      continue;
+    }
+    if (retryableStatus(res.status)) {
+      lastErr = `HTTP ${res.status}`;
+      await backoff(attempt, 800);
+      continue;
+    }
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
+    }
+    try {
+      return { text: await res.text(), url: res.url || url };
+    } catch (err) {
+      lastErr = err?.message || String(err);
+      if (attempt >= RETRIES - 1) break;
+      await backoff(attempt, 600);
     }
   }
   throw new Error(lastErr);
@@ -216,21 +247,31 @@ async function fetchSegmentResponse(url, signal, range) {
   let lastErr = `HTTP error for ${url}`;
   for (let attempt = 0; attempt < RETRIES; attempt += 1) {
     throwIfAborted(signal);
+    let res;
     try {
-      const res = await fetchWithTimeout(url, FETCH_TIMEOUT_MS, headers);
-      if (res.status === 429 || res.status >= 500) {
-        lastErr = `HTTP ${res.status}`;
-        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
-        continue;
-      }
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
-      }
-      return { blob: await res.blob(), partial: res.status === 206 };
+      res = await fetchWithTimeout(url, FETCH_TIMEOUT_MS, headers, signal);
     } catch (err) {
+      throwIfAborted(signal);
       lastErr = err?.message || String(err);
       if (attempt >= RETRIES - 1) break;
-      await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+      await backoff(attempt, 600);
+      continue;
+    }
+    if (retryableStatus(res.status)) {
+      lastErr = `HTTP ${res.status}`;
+      await backoff(attempt, 800);
+      continue;
+    }
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
+    }
+    try {
+      return { blob: await res.blob(), partial: res.status === 206 };
+    } catch (err) {
+      throwIfAborted(signal);
+      lastErr = err?.message || String(err);
+      if (attempt >= RETRIES - 1) break;
+      await backoff(attempt, 600);
     }
   }
   throw new Error(lastErr);
@@ -293,9 +334,10 @@ async function resolveMediaPlaylist(playlistUrl) {
   let url = playlistUrl;
   let audioUrl = null;
   for (let depth = 0; depth < 5; depth += 1) {
-    const text = await fetchText(url);
+    const { text, url: servedFrom } = await fetchText(url);
+    const base = redirectedBase(url, servedFrom);
     if (text.includes('#EXT-X-STREAM-INF')) {
-      const variant = parseMasterVariant(text, url);
+      const variant = parseMasterVariant(text, base);
       if (!variant.video) {
         throw new Error('no variant in master playlist');
       }
@@ -303,7 +345,7 @@ async function resolveMediaPlaylist(playlistUrl) {
       audioUrl = audioUrl || variant.audio;
       continue;
     }
-    const parsed = parseMediaPlaylist(text, url);
+    const parsed = parseMediaPlaylist(text, base);
     if (!parsed.segments.length) {
       throw new Error('empty media playlist');
     }
@@ -357,11 +399,18 @@ function segmentsForWindow(parsed, startSec, endSec) {
 async function mapPool(items, limit, worker) {
   const out = new Array(items.length);
   let next = 0;
+  let failed = false;
   async function run() {
-    while (next < items.length) {
+    // Once one item failed for good, the others finish their current item and stop.
+    while (next < items.length && !failed) {
       const index = next;
       next += 1;
-      out[index] = await worker(items[index], index);
+      try {
+        out[index] = await worker(items[index], index);
+      } catch (err) {
+        failed = true;
+        throw err;
+      }
     }
   }
   const n = Math.max(1, Math.min(limit, items.length));

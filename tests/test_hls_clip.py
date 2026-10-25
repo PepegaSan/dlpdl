@@ -38,6 +38,52 @@ def test_clip_variants(hls_server, tmp_path, stream, mode):
         assert END - START - 0.3 <= duration <= END - START + 4.5, (duration, msg)
 
 
+def test_redirected_playlist_resolves_segments_against_final_url(hls_server, tmp_path):
+    ok, msg, out = _clip(hls_server, tmp_path, 'ts', 'preserve', prefix='redirect')
+    assert ok, msg
+    assert 'ffmpeg' not in msg, f'segments must come from the redirect target, not the fallback: {msg}'
+    assert probe(out)[1] == {'video', 'audio'}
+
+
+def test_bom_crlf_playlist_clips_like_a_plain_one(hls_server, tmp_path):
+    ok, msg, out = _clip(hls_server, tmp_path, 'bom', 'exact')
+    assert ok, msg
+    assert 'ffmpeg' not in msg, msg
+    duration, kinds = probe(out)
+    assert kinds == {'video', 'audio'}
+    assert abs(duration - (END - START)) < 0.5, (duration, msg)
+
+
+def test_exact_end_past_stream_end_is_not_reported_too_short(hls_server, tmp_path):
+    out = str(tmp_path / 'tail.mp4')
+    ok, msg = clip_hls_to_file(
+        f'{hls_server}/range/ts/index.m3u8', {}, 15.0, 40.0,
+        str(tmp_path / 'raw.ts'), out, encode_mode='exact',
+    )
+    assert ok, msg
+    duration, _ = probe(out)
+    assert 4.0 <= duration <= 5.6, (duration, msg)
+
+
+def test_encrypted_audio_rendition_fails_clearly(hls_server, tmp_path):
+    ok, msg, out = _clip(hls_server, tmp_path, 'separate_audio_drm', 'preserve')
+    assert not ok
+    assert 'Tonspur' in msg and 'SAMPLE-AES' in msg, msg
+    assert not os.path.exists(out)
+
+
+def test_truncated_segment_is_retried_not_kept(hls_server):
+    fetcher = HttpFetcher({})
+    full = fetcher.get_bytes(f'{hls_server}/range/ts/seg_002.ts')
+    assert fetcher.get_bytes(f'{hls_server}/flaky/ts/seg_002.ts') == full
+
+
+def test_persistently_truncated_segment_raises(hls_server):
+    fetcher = HttpFetcher({})
+    with pytest.raises(RuntimeError, match='unvollständig'):
+        fetcher.get_bytes(f'{hls_server}/truncated/ts/seg_002.ts')
+
+
 def test_byterange_works_when_cdn_ignores_range(hls_server, tmp_path):
     ok, msg, out = _clip(hls_server, tmp_path, 'byterange', 'preserve', prefix='plain')
     assert ok, msg

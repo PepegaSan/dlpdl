@@ -486,6 +486,8 @@ async function runBrowserFetch(job) {
     }
   } catch (err) {
     if (abort.signal.aborted) return;
+    // Stop the segment workers that are still running for this job.
+    abort.abort();
     const detail = err?.message || String(err);
     await failBrowserJob(settings, jobId, t('progress.browserFailed', { error: detail }));
   } finally {

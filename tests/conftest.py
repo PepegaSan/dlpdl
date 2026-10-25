@@ -5,6 +5,9 @@ server whose behaviour per URL prefix mimics hoster quirks:
   /range/...      honours Range with 206
   /needrange/...  media without a Range header -> 410 (phncdn vs. Python)
   /html/...       media requests return an HTML error page
+  /redirect/...   .m3u8 -> 302 to /range/..., media 404 (relative URIs must follow the redirect)
+  /flaky/...      first media response per URL is cut short, Range -> 403, then complete
+  /truncated/...  every media response is cut short, Range -> 403
 """
 
 from __future__ import annotations
@@ -91,6 +94,12 @@ def _build_streams(root: str) -> None:
         fh.write('\n'.join(['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:2',
                             '#EXT-X-PLAYLIST-TYPE:VOD', *body, '#EXT-X-ENDLIST', '']))
 
+    # Windows-made playlist: UTF-8 BOM and CRLF line endings.
+    bom_dir = os.path.join(root, 'bom')
+    os.makedirs(bom_dir)
+    with open(os.path.join(bom_dir, 'index.m3u8'), 'w', encoding='utf-8-sig', newline='\r\n') as fh:
+        fh.write('\n'.join(line if line.startswith('#') else f'../ts/{line}' for line in ts_lines) + '\n')
+
     audio_dir = os.path.join(root, 'separate_audio')
     os.makedirs(audio_dir)
     _ffmpeg(
@@ -103,12 +112,41 @@ def _build_streams(root: str) -> None:
         cwd=audio_dir,
     )
 
+    # Same video, but the audio rendition is SAMPLE-AES (DRM) encrypted.
+    drm_dir = os.path.join(root, 'separate_audio_drm')
+    os.makedirs(drm_dir)
+    master = open(os.path.join(audio_dir, 'index.m3u8'), encoding='utf-8').read()
+    master = master.replace('stream_0/media.m3u8', '../separate_audio/stream_0/media.m3u8')
+    master = master.replace('stream_1/media.m3u8', 'audio_drm.m3u8')
+    with open(os.path.join(drm_dir, 'index.m3u8'), 'w', encoding='utf-8') as fh:
+        fh.write(master)
+    audio_lines = open(os.path.join(audio_dir, 'stream_1', 'media.m3u8'), encoding='utf-8').read().splitlines()
+    drm_audio: list[str] = []
+    for line in audio_lines:
+        drm_audio.append(line if line.startswith('#') else f'../separate_audio/stream_1/{line}')
+        if line == '#EXTM3U':
+            drm_audio.append('#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://drm"')
+    with open(os.path.join(drm_dir, 'audio_drm.m3u8'), 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(drm_audio) + '\n')
+
 
 class _Handler(BaseHTTPRequestHandler):
     root = ''
+    hits: dict[str, int] = {}
 
     def log_message(self, *_args) -> None:
         pass
+
+    def _send_cut_short(self, file_path: str) -> None:
+        """Announce the full length, deliver half, drop the connection."""
+        with open(file_path, 'rb') as fh:
+            data = fh.read()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data[: len(data) // 2])
+        self.close_connection = True
 
     def _send(self, status: int, data: bytes, ctype: str = 'application/octet-stream', extra=None) -> None:
         self.send_response(status)
@@ -122,12 +160,29 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urllib.parse.urlsplit(self.path).path.lstrip('/')
         mode, _, rel = path.partition('/')
+        if mode == 'redirect':
+            if rel.endswith('.m3u8'):
+                self.send_response(302)
+                self.send_header('Location', f'/range/{rel}')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+            else:
+                self._send(404, b'not found', 'text/plain')
+            return
         file_path = os.path.normpath(os.path.join(self.root, rel))
         if not file_path.startswith(self.root) or not os.path.isfile(file_path):
             self._send(404, b'not found', 'text/plain')
             return
         is_media = not rel.endswith(('.m3u8', '.key'))
         rng = self.headers.get('Range')
+        if mode in ('flaky', 'truncated') and is_media:
+            if rng:
+                self._send(403, b'no ranges', 'text/plain')
+                return
+            self.hits[path] = self.hits.get(path, 0) + 1
+            if mode == 'truncated' or self.hits[path] == 1:
+                self._send_cut_short(file_path)
+                return
         if mode == 'html' and is_media:
             self._send(200, b'<!DOCTYPE html><html><body>Access denied</body></html>' + b' ' * 4096, 'text/html')
             return
@@ -165,6 +220,7 @@ def hls_server(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def _no_fetch_delay(monkeypatch):
     monkeypatch.setattr(hls_clipper.HttpFetcher, '_throttle', lambda self: None)
+    monkeypatch.setattr(hls_clipper.HttpFetcher, '_retry_wait', lambda self, attempt, exc=None: 0.0)
 
 
 def probe(path: str) -> tuple[float, set[str]]:
