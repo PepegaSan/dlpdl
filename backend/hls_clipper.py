@@ -118,6 +118,9 @@ class ParsedPlaylist:
     segments: list[MediaSegment]
     duration: float
     encrypted: bool
+    # fMP4 / CMAF HLS: #EXT-X-MAP init segment (moov) that every fragment needs.
+    init_uri: Optional[str] = None
+    init_byterange: Optional[tuple[int, int]] = None  # (length, offset)
 
 
 def url_looks_like_hls(url: Optional[str]) -> bool:
@@ -445,11 +448,20 @@ def parse_media_playlist(text: str, base_url: str) -> ParsedPlaylist:
     timeline = 0.0
     pending_duration: Optional[float] = None
     encrypted = False
+    init_uri: Optional[str] = None
+    init_byterange: Optional[tuple[int, int]] = None
 
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith('#EXT-X-KEY') and 'METHOD=NONE' not in stripped.upper():
             encrypted = True
+        elif stripped.startswith('#EXT-X-MAP:') and init_uri is None:
+            uri_match = re.search(r'URI="([^"]+)"', stripped)
+            if uri_match:
+                init_uri = resolve_hls_uri(base_url, uri_match.group(1))
+                range_match = re.search(r'BYTERANGE="(\d+)(?:@(\d+))?"', stripped)
+                if range_match:
+                    init_byterange = (int(range_match.group(1)), int(range_match.group(2) or 0))
         elif stripped.startswith('#EXTINF:'):
             try:
                 pending_duration = float(stripped[len('#EXTINF:'):].split(',')[0])
@@ -467,7 +479,24 @@ def parse_media_playlist(text: str, base_url: str) -> ParsedPlaylist:
             timeline += duration
             pending_duration = None
 
-    return ParsedPlaylist(segments=segments, duration=timeline, encrypted=encrypted)
+    return ParsedPlaylist(
+        segments=segments,
+        duration=timeline,
+        encrypted=encrypted,
+        init_uri=init_uri,
+        init_byterange=init_byterange,
+    )
+
+
+def fetch_init_segment(fetcher: 'HttpFetcher', parsed: ParsedPlaylist) -> bytes:
+    """Bytes of the #EXT-X-MAP init segment, or b'' for plain MPEG-TS playlists."""
+    if not parsed.init_uri:
+        return b''
+    data = fetcher.get_bytes(parsed.init_uri)
+    if parsed.init_byterange:
+        length, offset = parsed.init_byterange
+        data = data[offset:offset + length]
+    return data
 
 
 def _needs_turboviplay_cookies(url: str) -> bool:
@@ -1661,6 +1690,7 @@ def _download_segments_to_list(
     progress: Optional[Callable[[dict], None]],
     progress_base: float,
     progress_scale: float,
+    init_bytes: bytes = b'',
 ) -> tuple[Optional[str], list[str]]:
     total = len(picked)
     bytes_done = 0
@@ -1671,26 +1701,31 @@ def _download_segments_to_list(
             msg=f'Segments 0/{total}…',
         ))
 
-    segment_paths: list[str] = []
-    for index, seg in enumerate(picked):
-        part_path = os.path.join(parts_dir, f'seg_{index:04d}.ts')
-        chunk = align_transport_stream(fetcher.get_bytes(seg.uri))
-        with open(part_path, 'wb') as fh:
-            fh.write(chunk)
-        segment_paths.append(part_path)
-        bytes_done += len(chunk)
-        if progress:
-            elapsed = time.monotonic() - t0
-            speed = bytes_done / max(elapsed, 0.25)
-            dl_frac = ((index + 1) / total) * (1.0 - ENCODE_SHARE_OF_PROGRESS)
-            overall = progress_base + progress_scale * max(0.0, min(1.0, dl_frac))
-            eta = (max(total * BYTES_PER_SEGMENT_GUESS - bytes_done, 0) / speed) if speed > 0 else None
-            progress(build_progress_event(
-                fraction=overall,
-                msg=f'Segments {index + 1}/{total}',
-                speed=speed,
-                eta=eta,
-            ))
+    # fMP4 fragments are not standalone files: write init + all fragments into
+    # one fragmented MP4 (what a player does) instead of one file per segment.
+    fmp4_path = os.path.join(parts_dir, 'segments.mp4') if init_bytes else None
+    fmp4 = open(fmp4_path, 'wb') if fmp4_path else None
+    segment_paths: list[str] = [fmp4_path] if fmp4_path else []
+    try:
+        if fmp4:
+            fmp4.write(init_bytes)
+        for index, seg in enumerate(picked):
+            if fmp4:
+                chunk = fetcher.get_bytes(seg.uri)
+                fmp4.write(chunk)
+            else:
+                part_path = os.path.join(parts_dir, f'seg_{index:04d}.ts')
+                chunk = align_transport_stream(fetcher.get_bytes(seg.uri))
+                with open(part_path, 'wb') as fh:
+                    fh.write(chunk)
+                segment_paths.append(part_path)
+            bytes_done += len(chunk)
+            _report_segment_progress(
+                progress, index, total, bytes_done, t0, progress_base, progress_scale,
+            )
+    finally:
+        if fmp4:
+            fmp4.close()
 
     list_path = os.path.join(parts_dir, 'concat.txt')
     with open(list_path, 'w', encoding='utf-8') as fh:
@@ -1698,6 +1733,30 @@ def _download_segments_to_list(
             escaped = path.replace('\\', '/').replace("'", "'\\''")
             fh.write(f"file '{escaped}'\n")
     return list_path, segment_paths
+
+
+def _report_segment_progress(
+    progress: Optional[Callable[[dict], None]],
+    index: int,
+    total: int,
+    bytes_done: int,
+    t0: float,
+    progress_base: float,
+    progress_scale: float,
+) -> None:
+    if not progress:
+        return
+    elapsed = time.monotonic() - t0
+    speed = bytes_done / max(elapsed, 0.25)
+    dl_frac = ((index + 1) / total) * (1.0 - ENCODE_SHARE_OF_PROGRESS)
+    overall = progress_base + progress_scale * max(0.0, min(1.0, dl_frac))
+    eta = (max(total * BYTES_PER_SEGMENT_GUESS - bytes_done, 0) / speed) if speed > 0 else None
+    progress(build_progress_event(
+        fraction=overall,
+        msg=f'Segments {index + 1}/{total}',
+        speed=speed,
+        eta=eta,
+    ))
 
 
 def clip_hls_preserve_copy(
@@ -1708,14 +1767,17 @@ def clip_hls_preserve_copy(
     progress: Optional[Callable[[dict], None]] = None,
     progress_base: float = 0.0,
     progress_scale: float = 1.0,
+    parsed: Optional[ParsedPlaylist] = None,
 ) -> tuple[bool, str]:
     """Download whole TS segments and remux with stream copy (forensic / pixel-stable)."""
     parts_dir = os.path.splitext(raw_ts_path)[0] + '_parts'
     shutil.rmtree(parts_dir, ignore_errors=True)
     os.makedirs(parts_dir, exist_ok=True)
     try:
+        init_bytes = fetch_init_segment(fetcher, parsed) if parsed else b''
         list_path, _paths = _download_segments_to_list(
             fetcher, picked, parts_dir, progress, progress_base, progress_scale,
+            init_bytes=init_bytes,
         )
         if not list_path:
             return False, 'no segments downloaded'
@@ -1791,6 +1853,7 @@ def clip_hls_segment_fallback(
             progress,
             progress_base,
             progress_scale,
+            init_bytes=fetch_init_segment(fetcher, parsed),
         )
         if not list_path:
             return False, 'no segments downloaded'
@@ -1964,6 +2027,7 @@ def clip_hls_to_file(
             progress=progress,
             progress_base=progress_base,
             progress_scale=progress_scale,
+            parsed=parsed,
         )
         if ok:
             expected = max(eff_end - eff_start, 0.1)

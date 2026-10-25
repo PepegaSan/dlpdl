@@ -47,9 +47,21 @@ function parseMediaPlaylist(text, baseUrl) {
   const segments = [];
   let pendingDuration = null;
   let timeline = 0;
+  /** fMP4/CMAF HLS: #EXT-X-MAP init segment (moov) every fragment needs. */
+  let init = null;
   for (const raw of String(text).split(/\r?\n/)) {
     const line = raw.trim();
-    if (line.startsWith('#EXTINF:')) {
+    if (line.startsWith('#EXT-X-MAP:') && !init) {
+      const uri = line.match(/URI="([^"]+)"/i);
+      if (uri) {
+        const range = line.match(/BYTERANGE="(\d+)(?:@(\d+))?"/i);
+        init = {
+          uri: resolveHlsUri(baseUrl, uri[1]),
+          length: range ? Number(range[1]) : null,
+          offset: range ? Number(range[2] || 0) : 0,
+        };
+      }
+    } else if (line.startsWith('#EXTINF:')) {
       const match = line.match(/#EXTINF:([\d.]+)/i);
       pendingDuration = match ? Number(match[1]) : 0;
     } else if (line && !line.startsWith('#')) {
@@ -65,7 +77,14 @@ function parseMediaPlaylist(text, baseUrl) {
       pendingDuration = null;
     }
   }
-  return { segments, duration: timeline };
+  return { segments, duration: timeline, init };
+}
+
+async function fetchInitSegment(init, signal) {
+  if (!init) return null;
+  const blob = await fetchSegment(init.uri, signal);
+  if (init.length == null) return blob;
+  return blob.slice(init.offset, init.offset + init.length);
 }
 
 async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -221,8 +240,12 @@ export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
     return data;
   });
   throwIfAborted(signal);
+  // Each window gets its own init so merged parts stay independently decodable.
+  const initBlob = await fetchInitSegment(parsed.init, signal);
   return {
-    blob: new Blob(chunks, { type: 'video/mp2t' }),
+    blob: initBlob
+      ? new Blob([initBlob, ...chunks], { type: 'video/mp4' })
+      : new Blob(chunks, { type: 'video/mp2t' }),
     timelineStart: picked[0].start,
   };
 }
