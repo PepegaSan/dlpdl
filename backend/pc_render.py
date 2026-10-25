@@ -76,9 +76,27 @@ def _setup_logging(log_path: Path) -> None:
         sys.stderr = stream
 
 
+def _suppress_child_error_dialogs() -> None:
+    """A crashing ffmpeg/ffprobe must fail the job, not block it with a modal
+    "Application Error" box nobody sees behind a windowless instance. The error
+    mode is inherited by child processes."""
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+
+        sem_failcriticalerrors = 0x0001
+        sem_nogpfaulterrorbox = 0x0002
+        sem_noopenfileerrorbox = 0x8000
+        ctypes.windll.kernel32.SetErrorMode(sem_failcriticalerrors | sem_nogpfaulterrorbox | sem_noopenfileerrorbox)
+    except Exception:  # pragma: no cover - best effort
+        pass
+
+
 def main() -> None:
     path = config_path()
     _setup_logging(path.with_name(LOG_NAME))
+    _suppress_child_error_dialogs()
     if not path.is_file():
         logging.getLogger('clip_direct').error('no PC-render config at %s — run setup-pc.ps1 first', path)
         sys.exit(2)

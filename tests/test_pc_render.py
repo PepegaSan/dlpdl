@@ -1,6 +1,17 @@
 import json
+import subprocess
+import sys
 
-from backend import pc_render
+from backend import hls_clipper, pc_render
+
+
+def test_ffmpeg_children_get_no_console_window_and_no_inherited_stdin():
+    kwargs = hls_clipper.spawn_kwargs()
+    assert kwargs['stdin'] is subprocess.DEVNULL
+    if sys.platform == 'win32':
+        assert kwargs['creationflags'] & subprocess.CREATE_NO_WINDOW
+    else:
+        assert 'creationflags' not in kwargs
 
 
 def test_config_maps_onto_backend_environment_without_overriding_explicit_values():

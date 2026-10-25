@@ -15,6 +15,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -843,6 +844,18 @@ def segments_with_preroll(
     return [*preroll, *picked]
 
 
+def spawn_kwargs() -> dict:
+    """Popen options for ffmpeg/ffprobe children.
+
+    Under pythonw (PC render instance) Windows would open a console window for
+    every child — a flash per call, and with many calls in a row the loader
+    fails with 0xc0000142. No window and no inherited stdin fix both.
+    """
+    if sys.platform != 'win32':
+        return {'stdin': subprocess.DEVNULL}
+    return {'stdin': subprocess.DEVNULL, 'creationflags': subprocess.CREATE_NO_WINDOW}
+
+
 def run_ffmpeg(args: list[str], timeout: float = FFMPEG_TIMEOUT_SEC) -> subprocess.CompletedProcess:
     """Run ffmpeg/ffprobe with a hard timeout; killed when the job is cancelled."""
     raise_if_cancelled()
@@ -852,6 +865,7 @@ def run_ffmpeg(args: list[str], timeout: float = FFMPEG_TIMEOUT_SEC) -> subproce
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        **spawn_kwargs(),
     )
     if token is not None:
         token.register(proc)
@@ -940,6 +954,7 @@ def run_ffmpeg_with_progress(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        **spawn_kwargs(),
     )
     if token is not None:
         token.register(proc)
@@ -1283,6 +1298,7 @@ def ffmpeg_http_input_extras() -> list[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            **spawn_kwargs(),
         )
         help_text = (proc.stdout or '') + (proc.stderr or '')
         if 'max_http_redirections' in help_text:
