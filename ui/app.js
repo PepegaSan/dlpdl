@@ -47,17 +47,56 @@ function hideApiError() {
   if (el) el.hidden = true;
 }
 
+const TOKEN_KEY = 'clipDirectToken';
+const TOKEN_HEADER = 'X-Clip-Direct-Token';
+let tokenPromptOpen = false;
+let tokenPromptDismissed = false;
+
+function apiToken() {
+  return localStorage.getItem(TOKEN_KEY) || '';
+}
+
+/** Ask for the server's CLIP_DIRECT_TOKEN; returns true when one was entered. */
+function promptForToken() {
+  if (tokenPromptOpen || tokenPromptDismissed) return false;
+  tokenPromptOpen = true;
+  try {
+    const entered = window.prompt(t('ui.tokenPrompt'), '');
+    if (entered == null || !entered.trim()) {
+      tokenPromptDismissed = true;
+      return false;
+    }
+    localStorage.setItem(TOKEN_KEY, entered.trim());
+    return true;
+  } finally {
+    tokenPromptOpen = false;
+  }
+}
+
+async function api(path, init = {}, retried = false) {
+  const headers = new Headers(init.headers || {});
+  const token = apiToken();
+  if (token) headers.set(TOKEN_HEADER, token);
+  const res = await fetch(path, { cache: 'no-store', ...init, headers });
+  if (res.status === 401 && !retried && promptForToken()) {
+    return api(path, init, true);
+  }
+  return res;
+}
+
 async function fetchJobs() {
-  const res = await fetch('/api/jobs', { cache: 'no-store' });
+  const res = await api('/api/jobs');
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new Error(res.status === 401 ? t('ui.tokenRequired') : `HTTP ${res.status}`);
   }
   const data = await res.json();
   return Array.isArray(data.jobs) ? data.jobs : [];
 }
 
 function fileUrl(id) {
-  return `/api/jobs/${encodeURIComponent(id)}/file`;
+  const base = `/api/jobs/${encodeURIComponent(id)}/file`;
+  const token = apiToken();
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 }
 
 function basename(path) {
@@ -104,7 +143,8 @@ function triggerPcDownload(job) {
 
   inFlightDownloads.add(id);
   const name = downloadFilename(job);
-  const url = `${fileUrl(id)}?t=${Date.now()}`;
+  const base = fileUrl(id);
+  const url = `${base}${base.includes('?') ? '&' : '?'}t=${Date.now()}`;
 
   try {
     const a = document.createElement('a');
@@ -178,13 +218,20 @@ function statusLabelFor(job) {
     return t('ui.status.running');
   }
   if (job.status === 'ready') return t('ui.status.ready');
+  if (job.status === 'cancelled') return t('ui.status.cancelled');
   return job.status || '';
+}
+
+function forgetAutoClaim(jobId) {
+  const claimed = loadIdSet(AUTO_CLAIMED_KEY);
+  claimed.delete(jobId);
+  saveIdSet(AUTO_CLAIMED_KEY, claimed);
 }
 
 function renderJob(job) {
   const pct = Math.round((job.progress || 0) * 100);
   const isReady = job.status === 'ready';
-  const isError = job.status === 'error';
+  const isError = job.status === 'error' || job.status === 'cancelled';
   const isRunning = job.status === 'running' || job.status === 'pending';
   const statusText = statusLabelFor(job);
   const progressLabel = isRunning && pct > 0 ? `${pct}%` : '';
@@ -222,15 +269,28 @@ function renderJob(job) {
     });
     actions.appendChild(dl);
   }
+  if (isRunning) {
+    const cancel = document.createElement('button');
+    cancel.className = 'secondary';
+    cancel.textContent = t('ui.cancel');
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      await api(`/api/jobs/${encodeURIComponent(job.id)}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      }).catch(() => {});
+      refresh();
+    });
+    actions.appendChild(cancel);
+  }
   if (isReady || isError) {
     const rm = document.createElement('button');
     rm.className = 'secondary';
     rm.textContent = t('ui.remove');
     rm.addEventListener('click', async () => {
-      await fetch(`/api/jobs/${job.id}`, { method: 'DELETE' });
-      const claimed = loadIdSet(AUTO_CLAIMED_KEY);
-      claimed.delete(job.id);
-      saveIdSet(AUTO_CLAIMED_KEY, claimed);
+      await api(`/api/jobs/${encodeURIComponent(job.id)}`, { method: 'DELETE' }).catch(() => {});
+      forgetAutoClaim(job.id);
       refresh();
     });
     actions.appendChild(rm);
@@ -267,7 +327,7 @@ async function refresh() {
       pollMs = 5000;
     } else {
       empty.hidden = true;
-      jobs.sort((a, b) => (a.id < b.id ? 1 : -1));
+      jobs.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
       for (const job of jobs) {
         root.appendChild(renderJob(job));
       }

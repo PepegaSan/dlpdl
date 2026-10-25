@@ -88,5 +88,9 @@
   "ui.saveToPc": "Auf PC speichern",
   "ui.downloadFailed": "Download fehlgeschlagen ({code}). Seite neu laden; bei großen HLS-Dateien kurz warten bis „Bereit“.",
   "ui.fileMissing": "Datei auf dem Server nicht gefunden — Job erneut senden oder Docker prüfen.",
-  "ui.remove": "Entfernen"
+  "ui.remove": "Entfernen",
+  "ui.cancel": "Abbrechen",
+  "ui.status.cancelled": "Abgebrochen",
+  "ui.tokenPrompt": "Dieser Clip-Direct-Server ist mit einem API-Token geschützt (CLIP_DIRECT_TOKEN). Token eingeben:",
+  "ui.tokenRequired": "Token erforderlich — Seite neu laden und Token eingeben"
 }

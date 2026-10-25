@@ -12,6 +12,7 @@ const fields = [
   'clipEncodeMode',
   'postRender',
   'openUiAfterQueue',
+  'apiToken',
 ];
 
 const boolFields = new Set(['openUiAfterQueue', 'postRender']);

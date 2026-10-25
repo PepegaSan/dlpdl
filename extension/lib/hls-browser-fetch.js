@@ -106,9 +106,16 @@ async function fetchText(url) {
   throw new Error(lastErr);
 }
 
-async function fetchBytes(url) {
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw new Error('cancelled');
+  }
+}
+
+async function fetchSegment(url, signal) {
   let lastErr = `HTTP error for ${url}`;
   for (let attempt = 0; attempt < RETRIES; attempt += 1) {
+    throwIfAborted(signal);
     try {
       const res = await fetchWithTimeout(url);
       if (res.status === 429 || res.status >= 500) {
@@ -119,7 +126,7 @@ async function fetchBytes(url) {
       if (!res.ok) {
         throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
       }
-      return new Uint8Array(await res.arrayBuffer());
+      return await res.blob();
     } catch (err) {
       lastErr = err?.message || String(err);
       if (attempt >= RETRIES - 1) break;
@@ -176,45 +183,46 @@ async function mapPool(items, limit, worker) {
   return out;
 }
 
-function concatBytes(chunks) {
-  let total = 0;
-  for (const chunk of chunks) {
-    total += chunk.byteLength;
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
+/**
+ * Progress messages carry a stable `{ key, params }` so the caller can
+ * translate them; `msg` is the English fallback.
+ * @typedef {(frac: number, msg: string, info?: { key: string, params?: object }) => void} HlsProgress
+ */
 
 /**
  * @param {string} playlistUrl
- * @param {{ start?: number, end?: number, onProgress?: (frac: number, msg: string) => void }} [opts]
- * @returns {Promise<{ bytes: Uint8Array, timelineStart: number }>}
+ * @param {{ start?: number, end?: number, onProgress?: HlsProgress, signal?: AbortSignal }} [opts]
+ * @returns {Promise<{ blob: Blob, timelineStart: number }>}
  */
 export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
   const onProgress = opts.onProgress || (() => {});
-  onProgress(0.02, 'HLS: loading playlist in browser…');
+  const { signal } = opts;
+  onProgress(0.02, 'HLS: loading playlist in browser…', { key: 'progress.hlsPlaylist' });
   const parsed = await resolveMediaPlaylist(playlistUrl);
+  throwIfAborted(signal);
   const picked = segmentsForWindow(parsed, opts.start, opts.end);
   if (!picked.length) {
     throw new Error('no segments in time window');
   }
-  onProgress(0.06, `HLS: ${picked.length} segments via browser…`);
-  const chunks = await mapPool(picked, SEGMENT_CONCURRENCY, async (seg, index) => {
-    const data = await fetchBytes(seg.uri);
-    onProgress(
-      0.06 + 0.9 * ((index + 1) / picked.length),
-      `HLS: ${index + 1}/${picked.length} segments`,
-    );
+  const total = picked.length;
+  onProgress(0.06, `HLS: ${total} segments via browser…`, {
+    key: 'progress.hlsSegments',
+    params: { done: 0, total },
+  });
+  let done = 0;
+  // Blobs stay out of the JS heap; the final Blob is assembled without copying.
+  const chunks = await mapPool(picked, SEGMENT_CONCURRENCY, async (seg) => {
+    const data = await fetchSegment(seg.uri, signal);
+    done += 1;
+    onProgress(0.06 + 0.9 * (done / total), `HLS: ${done}/${total} segments`, {
+      key: 'progress.hlsSegments',
+      params: { done, total },
+    });
     return data;
   });
-  onProgress(0.97, 'HLS: assembling…');
+  throwIfAborted(signal);
   return {
-    bytes: concatBytes(chunks),
+    blob: new Blob(chunks, { type: 'video/mp2t' }),
     timelineStart: picked[0].start,
   };
 }
@@ -223,38 +231,37 @@ export async function downloadHlsInBrowser(playlistUrl, opts = {}) {
  * One window, or several windows concatenated (merged clips).
  * @param {string} playlistUrl
  * @param {{ start: number, end: number }[]} windows
- * @param {(frac: number, msg: string) => void} [onProgress]
- * @returns {Promise<{ bytes: Uint8Array, timelineStart: number, parts: { bytes: Uint8Array, timelineStart: number }[] }>}
+ * @param {HlsProgress} [onProgress]
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{ blob: Blob, timelineStart: number, parts: { size: number, timelineStart: number }[] }>}
  */
-export async function downloadHlsWindows(playlistUrl, windows, onProgress) {
+export async function downloadHlsWindows(playlistUrl, windows, onProgress, signal) {
   const ranges = (windows || []).filter((w) => w && Number.isFinite(w.start));
-  if (!ranges.length) {
-    const one = await downloadHlsInBrowser(playlistUrl, { onProgress });
-    return { ...one, parts: [one] };
-  }
-  if (ranges.length === 1) {
+  if (ranges.length <= 1) {
     const one = await downloadHlsInBrowser(playlistUrl, {
-      start: ranges[0].start,
-      end: ranges[0].end,
+      start: ranges[0]?.start,
+      end: ranges[0]?.end,
       onProgress,
+      signal,
     });
-    return { ...one, parts: [one] };
+    return { ...one, parts: [{ size: one.blob.size, timelineStart: one.timelineStart }] };
   }
   const parts = [];
   for (let i = 0; i < ranges.length; i += 1) {
     const part = await downloadHlsInBrowser(playlistUrl, {
       start: ranges[i].start,
       end: ranges[i].end,
-      onProgress: (frac, msg) => {
+      signal,
+      onProgress: (frac, msg, info) => {
         const overall = (i + Math.max(0, Math.min(1, frac))) / ranges.length;
-        if (onProgress) onProgress(overall, msg);
+        if (onProgress) onProgress(overall, msg, info);
       },
     });
     parts.push(part);
   }
   return {
-    bytes: concatBytes(parts.map((p) => p.bytes)),
+    blob: new Blob(parts.map((p) => p.blob), { type: 'video/mp2t' }),
     timelineStart: parts[0].timelineStart,
-    parts,
+    parts: parts.map((p) => ({ size: p.blob.size, timelineStart: p.timelineStart })),
   };
 }

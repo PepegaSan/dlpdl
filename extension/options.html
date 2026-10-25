@@ -23,6 +23,9 @@
   <label data-i18n="options.serverUrl"></label>
   <input type="url" id="clipDirectBaseUrl" placeholder="http://192.168.178.27:8090/" />
   <p class="note" data-i18n="options.serverNote"></p>
+  <label data-i18n="options.apiToken"></label>
+  <input type="password" id="apiToken" autocomplete="off" />
+  <p class="note" data-i18n="options.apiTokenNote"></p>
   <label data-i18n="options.saveTarget"></label>
   <select id="saveTarget">
     <option value="browser" data-i18n="options.saveBrowser"></option>
@@ -54,6 +57,7 @@
     <option value="false" data-i18n="options.openUiNo"></option>
     <option value="true" data-i18n="options.openUiYes"></option>
   </select>
+  <p class="note" data-i18n="options.shortcutsNote"></p>
   <button type="button" id="save" data-i18n="options.save"></button><span id="saved" class="saved" hidden data-i18n="options.saved"></span>
   <button type="button" id="openUi" style="margin-left:8px" data-i18n="options.openWebUi"></button>
   <script type="module" src="options.js"></script>

@@ -88,7 +88,24 @@ Default port: **8090**. Map `downloads` volume as needed (see `deploy/SYNOLOGY.m
 | `GET` | `/api/jobs` | List jobs |
 | `GET` | `/api/jobs/{id}` | Job status |
 | `GET` | `/api/jobs/{id}/file` | Download finished file |
-| `DELETE` | `/api/jobs/{id}` | Remove job |
+| `POST` | `/api/jobs/{id}/cancel` | Stop a pending/running job (kills ffmpeg/yt-dlp) |
+| `DELETE` | `/api/jobs/{id}` | Remove job (cancels it if still running) |
+
+`POST` bodies must be `application/json` (except the extension's `/ingest` upload). Only `http(s)` URLs are accepted; `ytdl_options_overrides` is limited to a whitelist (headers, HLS/downloader options).
+
+### Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DOWNLOAD_DIR` | `./downloads` | Finished files (`folder` from the extension stays inside it) |
+| `PORT` / `HOST` | `8090` / `0.0.0.0` | Listen address (`127.0.0.1` = this PC only) |
+| `CLIP_DIRECT_TOKEN` | empty | Optional shared secret. Set it in the extension options; the web UI asks once |
+| `MAX_PARALLEL_JOBS` | `2` | Jobs processed at the same time |
+| `MAX_INGEST_MB` | `4096` | Max browser-HLS upload size |
+| `BROWSER_FETCH_IDLE_SEC` | `600` | Fail browser jobs that stopped reporting (tab closed / extension reloaded) |
+| `FFMPEG_TIMEOUT_SEC` | `1800` | Hard limit per ffmpeg call |
+
+Requests from other websites (foreign `Origin`) are rejected; the extension and the bundled UI are allowed.
 
 ## Publishing your own repository
 

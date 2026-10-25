@@ -10,6 +10,33 @@ export function jobsEndpoint(baseUrl, path = 'api/jobs') {
   return new URL(path.replace(/^\/+/, ''), base).toString();
 }
 
+export const TOKEN_HEADER = 'X-Clip-Direct-Token';
+
+/**
+ * fetch() against the Clip-Direct backend with the optional API token.
+ * Network failures become `err.code === 'backend_unreachable'`.
+ * @param {import('./storage.js').ExtensionSettings} settings
+ */
+export async function apiFetch(settings, path, init = {}) {
+  const headers = new Headers(init.headers || {});
+  const token = String(settings.apiToken || '').trim();
+  if (token) headers.set(TOKEN_HEADER, token);
+  try {
+    return await fetch(jobsEndpoint(settings.clipDirectBaseUrl, path), { ...init, headers });
+  } catch (err) {
+    const wrapped = new Error(`Clip-Direct backend unreachable (${err?.message || err})`);
+    wrapped.code = 'backend_unreachable';
+    throw wrapped;
+  }
+}
+
+/** Map a failed backend response to an i18n error key where we have one. */
+export function errorKeyForStatus(status) {
+  if (status === 401) return 'error.tokenRequired';
+  if (status === 403) return 'error.originBlocked';
+  return '';
+}
+
 export function clipHasTimes(c) {
   if (!c || typeof c !== 'object') return false;
   const { start, end } = c;
@@ -125,8 +152,3 @@ export function buildStreamJobPayload(
   }
   return { ...body, ...clipFields(valid, mergeClips) };
 }
-
-/** Back-compat */
-export const apiUrl = jobsEndpoint;
-export const buildJobBody = buildPageJobPayload;
-export const buildStreamJobBody = buildStreamJobPayload;

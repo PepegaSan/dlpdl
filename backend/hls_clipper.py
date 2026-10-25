@@ -43,6 +43,67 @@ SEGMENT_FETCH_RETRY_MAX = 6
 SEGMENT_FETCH_RETRY_BASE_SEC = 2.5
 SEGMENT_READ_CHUNK = 64 * 1024
 MIN_USABLE_SEGMENT_BYTES = 24 * 1024
+FFMPEG_TIMEOUT_SEC = float(os.environ.get('FFMPEG_TIMEOUT_SEC', '1800'))
+FFPROBE_TIMEOUT_SEC = 60.0
+
+
+class JobCancelled(BaseException):
+    """Raised inside a job thread after the user cancelled it.
+
+    BaseException so the many `except Exception` fallbacks in the clip paths
+    do not turn a cancel into "try the next strategy".
+    """
+
+
+class CancelToken:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._procs: set[subprocess.Popen] = set()
+        self._lock = threading.Lock()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def cancel(self) -> None:
+        self._event.set()
+        with self._lock:
+            procs = list(self._procs)
+        for proc in procs:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def register(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.add(proc)
+        if self.cancelled:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def unregister(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+
+_job_ctx = threading.local()
+
+
+def set_cancel_token(token: Optional[CancelToken]) -> None:
+    _job_ctx.token = token
+
+
+def current_cancel_token() -> Optional[CancelToken]:
+    return getattr(_job_ctx, 'token', None)
+
+
+def raise_if_cancelled() -> None:
+    token = current_cancel_token()
+    if token is not None and token.cancelled:
+        raise JobCancelled()
 
 
 @dataclass(frozen=True)
@@ -209,6 +270,7 @@ class HttpFetcher:
         last_exc: Optional[BaseException] = None
         best = b''
         for attempt in range(SEGMENT_FETCH_RETRY_MAX):
+            raise_if_cancelled()
             self._throttle()
             try:
                 with self._open(url) as resp:
@@ -563,8 +625,31 @@ def segments_with_preroll(
     return [*preroll, *picked]
 
 
-def run_ffmpeg(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, text=True)
+def run_ffmpeg(args: list[str], timeout: float = FFMPEG_TIMEOUT_SEC) -> subprocess.CompletedProcess:
+    """Run ffmpeg/ffprobe with a hard timeout; killed when the job is cancelled."""
+    raise_if_cancelled()
+    token = current_cancel_token()
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if token is not None:
+        token.register(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        code = 124
+        err = f'{err or ""}\n{args[0]} timeout (>{int(timeout)}s)'.strip()
+    finally:
+        if token is not None:
+            token.unregister(proc)
+    raise_if_cancelled()
+    return subprocess.CompletedProcess(args, code, out or '', err or '')
 
 
 def run_ffmpeg_with_progress(
@@ -580,6 +665,8 @@ def run_ffmpeg_with_progress(
     if '-progress' not in cmd:
         cmd[insert_at:insert_at] = ['-progress', 'pipe:1', '-nostats']
 
+    raise_if_cancelled()
+    token = current_cancel_token()
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -587,6 +674,8 @@ def run_ffmpeg_with_progress(
         text=True,
         bufsize=1,
     )
+    if token is not None:
+        token.register(proc)
     out_us = 0
     started = time.monotonic()
     last_emit = 0.0
@@ -636,7 +725,10 @@ def run_ffmpeg_with_progress(
     finally:
         stop.set()
         reader.join(timeout=2)
+        if token is not None:
+            token.unregister(proc)
 
+    raise_if_cancelled()
     stderr = proc.stderr.read() if proc.stderr else ''
     proc.wait(timeout=5)
     return subprocess.CompletedProcess(cmd, proc.returncode if proc.returncode is not None else 1, '', stderr)
@@ -657,7 +749,8 @@ def run_ffmpeg_serialized(
     if not acquired:
         if on_progress:
             on_progress(0.0, 'wartet auf freien Encoder…')
-        _FFMPEG_ENCODE_SLOTS.acquire()
+        while not _FFMPEG_ENCODE_SLOTS.acquire(timeout=1.0):
+            raise_if_cancelled()
     try:
         return run_ffmpeg_with_progress(
             args,
@@ -913,15 +1006,14 @@ def ffmpeg_http_input_extras() -> list[str]:
 
 
 def probe_duration_seconds(path: str) -> Optional[float]:
-    proc = subprocess.run(
+    proc = run_ffmpeg(
         [
             'ffprobe', '-v', 'error',
             '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1',
             path,
         ],
-        capture_output=True,
-        text=True,
+        timeout=FFPROBE_TIMEOUT_SEC,
     )
     if proc.returncode != 0:
         return None
@@ -980,15 +1072,14 @@ def finalize_mp4_for_editor(path: str) -> tuple[bool, str]:
 
 
 def probe_video_fps(path: str) -> Optional[float]:
-    proc = subprocess.run(
+    proc = run_ffmpeg(
         [
             'ffprobe', '-v', 'error', '-select_streams', 'v:0',
             '-show_entries', 'stream=r_frame_rate',
             '-of', 'default=noprint_wrappers=1:nokey=1',
             path,
         ],
-        capture_output=True,
-        text=True,
+        timeout=FFPROBE_TIMEOUT_SEC,
     )
     raw = (proc.stdout or '').strip()
     if not raw:
@@ -1235,9 +1326,15 @@ def clip_local_media_window(
     return True, 'ok (exact-trim)'
 
 
-def concat_local_mp4s(paths: list[str], dest: str) -> tuple[bool, str]:
-    """Concatenate already-remuxed local MP4s with stream copy."""
-    usable = [p for p in paths if p and os.path.isfile(p) and os.path.getsize(p) > 4096]
+def concat_local_mp4s(
+    paths: list[str],
+    dest: str,
+    *,
+    allow_encode: bool = True,
+    shortest: bool = False,
+) -> tuple[bool, str]:
+    """Concatenate local media files; stream copy first, optional re-encode fallback."""
+    usable = [p for p in paths if p and os.path.isfile(p) and os.path.getsize(p) > 0]
     if not usable:
         return False, 'concat: no parts'
     if len(usable) == 1:
@@ -1249,29 +1346,33 @@ def concat_local_mp4s(paths: list[str], dest: str) -> tuple[bool, str]:
         for path in usable:
             escaped = path.replace('\\', '/').replace("'", "'\\''")
             fh.write(f"file '{escaped}'\n")
+    tail = ['-shortest'] if shortest else []
     args = [
         'ffmpeg', '-y', '-loglevel', 'error',
         '-f', 'concat', '-safe', '0', '-i', list_path,
-        '-c', 'copy',
+        '-c', 'copy', *tail,
         '-avoid_negative_ts', 'make_zero',
         '-movflags', '+faststart',
         dest,
     ]
     try:
         proc = run_ffmpeg(args)
-        if proc.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) >= 4096:
+        if proc.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
             return True, 'ok (concat copy)'
         err = (proc.stderr or '').strip()[:300]
+        if not allow_encode:
+            return False, f'concat (copy) failed: {err}'
         retry = [
             'ffmpeg', '-y', '-loglevel', 'error',
             '-f', 'concat', '-safe', '0', '-i', list_path,
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-            '-c:a', 'aac',
+            '-c:a', 'aac', *tail,
+            '-avoid_negative_ts', 'make_zero',
             '-movflags', '+faststart',
             dest,
         ]
         proc = run_ffmpeg(retry)
-        if proc.returncode != 0 or not os.path.isfile(dest) or os.path.getsize(dest) < 4096:
+        if proc.returncode != 0 or not os.path.isfile(dest) or os.path.getsize(dest) == 0:
             err2 = (proc.stderr or '').strip()[:300]
             return False, f'concat failed: {err2 or err}'
         return True, 'ok (concat encode)'

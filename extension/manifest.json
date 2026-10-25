@@ -17,6 +17,19 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "commands": {
+    "mark-start": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Mark clip start at the current video time"
+    },
+    "mark-end": {
+      "suggested_key": { "default": "Alt+Shift+E" },
+      "description": "Mark clip end at the current video time"
+    },
+    "show-bar": {
+      "description": "Show the Clip-Direct bar on the page"
+    }
+  },
   "web_accessible_resources": [
     {
       "resources": ["lib/locales/en.json", "lib/locales/de.json"],

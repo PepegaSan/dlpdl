@@ -26,6 +26,10 @@ Branding: UI strings and DOM ids use `clip-direct-*`, not `metube-*`. Reload hin
 | **HLS detection** | `_treat_as_hls()` (URL `.m3u8` or `external_downloader.m3u8`) | Extension sends overrides even if URL is opaque |
 | **Non-HLS clip** | yt-dlp `download_ranges`, then smart_clip fallback if HLS | Direct video sites keep using yt-dlp |
 | **Job status** | Status pump ignores `running` after `ready` | Prevents UI flicker and duplicate auto-downloads |
+| **Cancel / delete** | `CancelToken` per job kills registered ffmpeg/yt-dlp processes; `JobCancelled` is a `BaseException` so `except Exception` fallbacks don't swallow it | A cancelled job must not flip back to `running`/`ready` |
+| **Concurrency** | `MAX_PARALLEL_JOBS` (default 2) worker slots; filename stems reserved until the job ends | Two jobs with the same title must not write the same file |
+| **Browser ingest** | Body streamed to `<tmp>/<job>/browser.bin` (limit `MAX_INGEST_MB`), processed in a thread, `202` | Never read the upload into RAM or remux inside the aiohttp handler |
+| **Output folder** | `resolve_output_dir` keeps `folder` inside `DOWNLOAD_DIR` | No `..` escapes |
 
 Output filenames are built from the **browser tab title** (sanitized, max ~60 chars), plus optional scene/merge tags:
 
@@ -68,6 +72,8 @@ Docker dev: `deploy/docker-compose.yml` mounts `../backend` into the container s
 - Auto-save: claim job id in `localStorage` **before** fetch; `navigator.locks` so only one tab auto-downloads; skip when `document.hidden`.
 - Manual **Auf PC speichern** always works.
 - Keep a **single** tab on `http://localhost:8090/` when using auto-save.
+- Jobs sorted by `created_at` (ids are random). Running jobs get **Cancel** (`POST /api/jobs/{id}/cancel`).
+- With `CLIP_DIRECT_TOKEN` set, a 401 prompts once for the token (stored in `localStorage`, sent as header and `?token=` on file links).
 
 ## HLS implementation (`backend/hls_clipper.py`)
 
@@ -84,7 +90,11 @@ HLS clipping is implemented in **`hls_clipper.py`** (clean-room). [`smart_clip.p
 | `lib/format-time.js` | Clock formatting for markers |
 | `background.js` | Service worker wiring |
 
-Legacy filenames (`page-key.js`, `clip-direct-api.js`, `time.js`) are thin re-exports only.
+All backend calls go through `apiFetch` in `lib/jobs-client.js` (optional `X-Clip-Direct-Token`, network failure → `error.backendUnreachable`).
+
+**Browser HLS jobs** run in the service worker after the popup/bar already got "queued": one at a time, keepalive while working, active ids in `chrome.storage.session` so a restarted worker fails orphans instead of leaving them "running". DNR header rules are per job and only match extension requests (`tabIds: [-1]`).
+
+**Shortcuts** (`manifest.json` `commands`): Alt+Shift+S mark start, Alt+Shift+E mark end (changeable at `chrome://extensions/shortcuts`).
 
 Content script (`content.js`) must **not** use ES `import` — run as a classic script in `manifest.json` (no `type: "module"`). Helpers are inlined at the top of `content.js`.
 

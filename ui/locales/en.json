@@ -88,5 +88,9 @@
   "ui.saveToPc": "Save to PC",
   "ui.downloadFailed": "Download failed ({code}). Reload the page; for large HLS files wait until Ready.",
   "ui.fileMissing": "File missing on server — re-queue the job or check Docker.",
-  "ui.remove": "Remove"
+  "ui.remove": "Remove",
+  "ui.cancel": "Cancel",
+  "ui.status.cancelled": "Cancelled",
+  "ui.tokenPrompt": "This Clip-Direct server is protected by an API token (CLIP_DIRECT_TOKEN). Enter the token:",
+  "ui.tokenRequired": "Token required — reload the page and enter the token"
 }

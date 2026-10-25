@@ -118,5 +118,19 @@
   "ui.status.ready": "Ready",
   "ui.status.error": "Error",
   "ui.saveToPc": "Save to PC",
-  "ui.remove": "Remove"
+  "ui.remove": "Remove",
+  "options.apiToken": "API token (optional)",
+  "options.apiTokenNote": "Only if the server runs with CLIP_DIRECT_TOKEN. Leave empty otherwise.",
+  "options.shortcutsNote": "Keyboard shortcuts: Alt+Shift+S = mark start, Alt+Shift+E = mark end. Change them at chrome://extensions/shortcuts.",
+  "error.backendUnreachable": "Clip-Direct server not reachable — is it running? Check the address in the extension settings.",
+  "error.tokenRequired": "Server requires an API token — enter it in the extension settings.",
+  "error.originBlocked": "Server rejected the request (origin not allowed).",
+  "progress.hlsPlaylist": "HLS: loading playlist in browser…",
+  "progress.hlsSegments": "HLS: {done}/{total} segments",
+  "progress.waitingBrowser": "Waiting for the previous browser download…",
+  "progress.exactCut": "Exact cut…",
+  "progress.rerender": "Re-render (keyframe fix)…",
+  "progress.remux": "Remux…",
+  "progress.browserFailed": "Browser download failed: {error}",
+  "progress.workerRestarted": "Browser download was interrupted (extension restarted) — send again"
 }

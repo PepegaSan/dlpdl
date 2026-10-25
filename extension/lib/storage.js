@@ -13,6 +13,7 @@ import { draftKeyForHref } from './page-url.js';
  * @property {string} customNamePrefix
  * @property {boolean} openUiAfterQueue
  * @property {string} uiLocale en | de
+ * @property {string} apiToken optional CLIP_DIRECT_TOKEN of the backend
  */
 
 export const DEFAULT_SETTINGS = {
@@ -28,6 +29,7 @@ export const DEFAULT_SETTINGS = {
   folder: '',
   customNamePrefix: '',
   openUiAfterQueue: false,
+  apiToken: '',
 };
 
 export async function loadSettings() {

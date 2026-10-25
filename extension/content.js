@@ -876,6 +876,10 @@ navIntervalId = setInterval(() => {
   }
 }, 800);
 
+function failResponse(err) {
+  return { ok: false, error: String(err?.message || err) };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Clip removal must reach the frame that actually owns the clips, which may
   // be a cross-origin hoster iframe rather than the top frame. The message is
@@ -888,7 +892,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.pageKey && msg.pageKey !== storageKey()) {
       return false;
     }
-    removeClipAt(Number(msg.index)).then(sendResponse);
+    removeClipAt(Number(msg.index)).then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
 
@@ -903,7 +907,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.force && !getActiveVideo()) {
       return false;
     }
-    replaceClipsForPage(msg.clips).then(sendResponse);
+    replaceClipsForPage(msg.clips).then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
 
@@ -915,7 +919,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.pageKey && msg.pageKey !== storageKey()) {
       return false;
     }
-    setClipMergeIncludedAt(Number(msg.index), msg.includeInMerge).then(sendResponse);
+    setClipMergeIncludedAt(Number(msg.index), msg.includeInMerge).then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
 
@@ -927,7 +931,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.pageKey && msg.pageKey !== storageKey()) {
       return false;
     }
-    updateClipTimesAt(Number(msg.index), msg.start, msg.end).then(sendResponse);
+    updateClipTimesAt(Number(msg.index), msg.start, msg.end).then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
 
@@ -943,23 +947,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg?.action === 'getVideoMediaUrl') {
-    getVideoMediaUrlFromPage().then(sendResponse);
+    getVideoMediaUrlFromPage().then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
   if (msg?.action === 'getVideoState') {
-    getVideoStateResponse().then(sendResponse);
+    getVideoStateResponse().then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
   if (msg?.action === 'markStart') {
-    doMarkStart().then(sendResponse);
+    doMarkStart().then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
   if (msg?.action === 'markEnd') {
-    doMarkEnd().then(sendResponse);
+    doMarkEnd().then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
   if (msg?.action === 'clearPending') {
-    doClearPending().then(sendResponse);
+    doClearPending().then(sendResponse, (err) => sendResponse(failResponse(err)));
     return true;
   }
   if (msg?.action === 'showBar') {

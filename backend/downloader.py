@@ -22,25 +22,36 @@ from typing import Any, Callable, Optional
 
 import yt_dlp
 
-from .filename import allocate_unique_stem, build_output_stem
+from .filename import allocate_unique_stem, build_output_stem, release_stem, resolve_output_dir
 from .hls_clipper import (
     DEFAULT_USER_AGENT,
+    CancelToken,
+    JobCancelled,
     apply_page_referer,
     clip_local_media_window,
     concat_local_mp4s,
+    current_cancel_token,
     ffmpeg_header_args,
     ffmpeg_http_input_extras,
     finalize_mp4_for_editor,
     normalize_http_headers,
     probe_progressive_media_url,
+    raise_if_cancelled,
     remux_browser_payload,
     rerender_for_editing,
     run_ffmpeg_with_progress,
+    set_cancel_token,
     trim_media_to_duration,
 )
 from .smart_clip import is_hls_url, smart_clip_hls
 
 log = logging.getLogger('clip_direct')
+
+MAX_PARALLEL_JOBS = max(1, int(os.environ.get('MAX_PARALLEL_JOBS', '2')))
+# Browser-fetch jobs must report progress at least this often or they are failed.
+BROWSER_FETCH_IDLE_SEC = float(os.environ.get('BROWSER_FETCH_IDLE_SEC', '600'))
+REAPER_INTERVAL_SEC = 30.0
+ACTIVE_STATUSES = ('pending', 'running')
 
 # Media extension in a URL path, incl. trailing-slash form: `.../x_720p.mp4/?rnd=..`
 _MEDIA_FILE_EXT_RE = re.compile(r'\.(mp4|webm|mkv|mov|m4v)(?:$|/)', re.IGNORECASE)
@@ -88,6 +99,11 @@ class JobState:
     size: Optional[int] = None
     error: Optional[str] = None
     progress: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    browser_fetch: bool = False
+    ingest_started: bool = False
+    token: CancelToken = field(default_factory=CancelToken, repr=False)
 
 
 class JobRunner:
@@ -98,10 +114,51 @@ class JobRunner:
         os.makedirs(temp_dir, exist_ok=True)
         self._jobs: dict[str, JobState] = {}
         self._lock = threading.Lock()
+        self._slots = threading.Semaphore(MAX_PARALLEL_JOBS)
+        self._purge_orphan_temp()
+        threading.Thread(target=self._reap_stale_jobs, daemon=True).start()
+
+    def _purge_orphan_temp(self) -> None:
+        """Jobs live in memory only, so anything left in TEMP_DIR is from a previous run."""
+        try:
+            names = os.listdir(self.temp_dir)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.join(self.temp_dir, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def _reap_stale_jobs(self) -> None:
+        while True:
+            time.sleep(REAPER_INTERVAL_SEC)
+            now = time.time()
+            stale: list[str] = []
+            with self._lock:
+                for j in self._jobs.values():
+                    if (
+                        j.browser_fetch
+                        and not j.ingest_started
+                        and j.status in ACTIVE_STATUSES
+                        and now - j.updated_at > BROWSER_FETCH_IDLE_SEC
+                    ):
+                        stale.append(j.id)
+            for job_id in stale:
+                log.warning('job %s: browser fetch went silent, failing it', job_id)
+                self.fail_job(
+                    job_id,
+                    'Browser download stopped reporting (tab closed or extension reloaded?) — send again',
+                )
 
     def list_jobs(self) -> list[dict]:
         with self._lock:
-            return [self._job_dict(j) for j in self._jobs.values()]
+            jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+            return [self._job_dict(j) for j in jobs]
 
     def get_job(self, job_id: str) -> Optional[dict]:
         with self._lock:
@@ -135,12 +192,14 @@ class JobRunner:
             'merge_clips': j.spec.merge_clips,
             'clip_encode_mode': j.spec.clip_encode_mode,
             'post_render': j.spec.post_render,
+            'browser_fetch': j.browser_fetch,
+            'created_at': j.created_at,
             'downloadable': bool(j.status == 'ready' and file_path),
         }
 
     def create_job(self, spec: JobSpec) -> str:
-        job_id = str(uuid.uuid4())[:12]
-        state = JobState(id=job_id, spec=spec)
+        job_id = uuid.uuid4().hex
+        state = JobState(id=job_id, spec=spec, msg='Queued…')
         with self._lock:
             self._jobs[job_id] = state
         t = threading.Thread(target=self._run_job, args=(job_id,), daemon=True)
@@ -149,13 +208,14 @@ class JobRunner:
 
     def create_waiting_job(self, spec: JobSpec) -> str:
         """Job waits for the extension to POST the browser-downloaded media."""
-        job_id = str(uuid.uuid4())[:12]
+        job_id = uuid.uuid4().hex
         state = JobState(
             id=job_id,
             spec=spec,
             status='running',
             msg='Browser download…',
             progress=0.02,
+            browser_fetch=True,
         )
         with self._lock:
             self._jobs[job_id] = state
@@ -164,8 +224,11 @@ class JobRunner:
     def update_progress(self, job_id: str, msg: str, progress: float) -> bool:
         with self._lock:
             j = self._jobs.get(job_id)
-            if not j or j.status not in ('pending', 'running'):
+            if not j or j.status not in ACTIVE_STATUSES:
                 return False
+            # Fire-and-forget progress from the extension can arrive after the upload.
+            if j.ingest_started:
+                return True
         self._update(
             job_id,
             status='running',
@@ -177,10 +240,25 @@ class JobRunner:
     def fail_job(self, job_id: str, message: str) -> bool:
         with self._lock:
             j = self._jobs.get(job_id)
-            if not j or j.status == 'ready':
+            if not j or j.status in ('ready', 'cancelled'):
                 return False
         detail = (message or 'Browser download failed').strip()
         self._update(job_id, status='error', error=detail, msg=detail)
+        return True
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Stop a pending/running job: kills its ffmpeg, aborts segment and yt-dlp loops."""
+        with self._lock:
+            j = self._jobs.get(job_id)
+            if not j or j.status not in ACTIVE_STATUSES:
+                return False
+            j.status = 'cancelled'
+            j.msg = 'Cancelled'
+            j.error = ''
+            j.updated_at = time.time()
+            token = j.token
+        token.cancel()
+        log.info('job %s cancelled', job_id)
         return True
 
     def _exact_trim_local(
@@ -247,60 +325,37 @@ class JobRunner:
         self,
         job_id: str,
         spec: JobSpec,
-        payload: bytes,
+        raw_path: str,
         part_specs: list[tuple[float, int]],
         job_tmp: str,
         out_mp4: str,
     ) -> tuple[bool, str]:
         expected = sum(n for _tl, n in part_specs)
-        if expected > len(payload):
+        if expected > os.path.getsize(raw_path):
             return False, 'browser merge parts larger than payload'
-        offset = 0
         remuxed: list[str] = []
         details: list[str] = []
         ranges = list(spec.clip_ranges or [])
         total = len(part_specs)
-        for i, (tl, nbytes) in enumerate(part_specs):
-            chunk = payload[offset:offset + nbytes]
-            offset += nbytes
-            if len(chunk) < 4096:
-                return False, f'merge part {i + 1} empty'
-            raw_i = os.path.join(job_tmp, f'part_{i:03d}.bin')
-            mp4_i = os.path.join(job_tmp, f'part_{i:03d}.mp4')
-            with open(raw_i, 'wb') as fh:
-                fh.write(chunk)
-            self._update(
-                job_id,
-                status='running',
-                msg=f'Remux Teil {i + 1}/{total}…',
-                progress=0.90 + 0.02 * (i / max(total, 1)),
-            )
-            ok, detail = remux_browser_payload(raw_i, mp4_i)
-            try:
-                os.remove(raw_i)
-            except OSError:
-                pass
-            if not ok:
-                return False, f'Teil {i + 1}: {detail}'
-            if (
-                spec.clip_encode_mode == 'exact'
-                and i < len(ranges)
-                and ranges[i][1] != float('inf')
-                and ranges[i][1] > ranges[i][0]
-            ):
-                ok_t, trim_detail = self._exact_trim_local(
-                    job_id,
-                    mp4_i,
-                    float(ranges[i][0]),
-                    float(ranges[i][1]),
-                    float(tl),
-                    progress_base=0.91 + 0.02 * (i / max(total, 1)),
+        src = open(raw_path, 'rb')
+        try:
+            for i, (tl, nbytes) in enumerate(part_specs):
+                raise_if_cancelled()
+                if nbytes < 4096:
+                    return False, f'merge part {i + 1} empty'
+                raw_i = os.path.join(job_tmp, f'part_{i:03d}.bin')
+                mp4_i = os.path.join(job_tmp, f'part_{i:03d}.mp4')
+                with open(raw_i, 'wb') as fh:
+                    _copy_bytes(src, fh, nbytes)
+                ok, detail = self._ingest_one_part(
+                    job_id, spec, i, total, tl, raw_i, mp4_i, ranges,
                 )
-                if not ok_t:
-                    return False, f'Teil {i + 1}: {trim_detail}'
-                detail = f'{detail} + {trim_detail}'
-            remuxed.append(mp4_i)
-            details.append(detail)
+                if not ok:
+                    return False, detail
+                remuxed.append(mp4_i)
+                details.append(detail)
+        finally:
+            src.close()
 
         self._update(job_id, status='running', msg=f'Merge {total} Teile…', progress=0.94)
         ok, concat_detail = concat_local_mp4s(remuxed, out_mp4)
@@ -308,21 +363,135 @@ class JobRunner:
             return False, concat_detail
         return True, f'{concat_detail}; {"; ".join(details)}'
 
+    def _ingest_one_part(
+        self,
+        job_id: str,
+        spec: JobSpec,
+        i: int,
+        total: int,
+        tl: float,
+        raw_i: str,
+        mp4_i: str,
+        ranges: list[tuple[float, float]],
+    ) -> tuple[bool, str]:
+        self._update(
+            job_id,
+            status='running',
+            msg=f'Remux Teil {i + 1}/{total}…',
+            progress=0.90 + 0.02 * (i / max(total, 1)),
+        )
+        ok, detail = remux_browser_payload(raw_i, mp4_i)
+        try:
+            os.remove(raw_i)
+        except OSError:
+            pass
+        if not ok:
+            return False, f'Teil {i + 1}: {detail}'
+        if (
+            spec.clip_encode_mode == 'exact'
+            and i < len(ranges)
+            and ranges[i][1] != float('inf')
+            and ranges[i][1] > ranges[i][0]
+        ):
+            ok_t, trim_detail = self._exact_trim_local(
+                job_id,
+                mp4_i,
+                float(ranges[i][0]),
+                float(ranges[i][1]),
+                float(tl),
+                progress_base=0.91 + 0.02 * (i / max(total, 1)),
+            )
+            if not ok_t:
+                return False, f'Teil {i + 1}: {trim_detail}'
+            detail = f'{detail} + {trim_detail}'
+        return True, detail
+
+    def ingest_tmp_dir(self, job_id: str) -> str:
+        path = os.path.join(self.temp_dir, job_id)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def begin_ingest(self, job_id: str) -> tuple[bool, str]:
+        """Claim a waiting browser-fetch job for exactly one upload."""
+        with self._lock:
+            j = self._jobs.get(job_id)
+            if not j:
+                return False, 'unknown job'
+            if not j.browser_fetch:
+                return False, 'job does not accept uploads'
+            if j.ingest_started:
+                return False, 'upload already received'
+            if j.status not in ACTIVE_STATUSES:
+                return False, f'job is {j.status}'
+            j.ingest_started = True
+            j.msg = 'Upload…'
+            j.progress = max(j.progress, 0.88)
+            j.updated_at = time.time()
+        return True, 'ok'
+
+    def start_ingest(
+        self,
+        job_id: str,
+        raw_path: str,
+        *,
+        timeline_start: Optional[float] = None,
+        parts: Optional[list[tuple[float, int]]] = None,
+    ) -> None:
+        threading.Thread(
+            target=self.ingest_browser_media,
+            args=(job_id, raw_path),
+            kwargs={'timeline_start': timeline_start, 'parts': parts},
+            daemon=True,
+        ).start()
+
     def ingest_browser_media(
         self,
         job_id: str,
-        payload: bytes,
+        raw_path: str,
         *,
         timeline_start: Optional[float] = None,
         parts: Optional[list[tuple[float, int]]] = None,
     ) -> tuple[bool, str]:
         with self._lock:
             state = self._jobs.get(job_id)
+        job_tmp = os.path.dirname(raw_path)
         if not state:
+            shutil.rmtree(job_tmp, ignore_errors=True)
             return False, 'unknown job'
-        if state.status == 'ready':
-            return False, 'job already finished'
-        if not payload or len(payload) < 4096:
+        set_cancel_token(state.token)
+        out_dir = resolve_output_dir(self.download_dir, state.spec.folder)
+        stem = allocate_unique_stem(out_dir, build_output_stem(state.spec))
+        out_mp4 = os.path.join(out_dir, f'{stem}.mp4')
+        try:
+            return self._ingest_browser_media(
+                job_id, state, raw_path, job_tmp, out_mp4,
+                timeline_start=timeline_start, parts=parts,
+            )
+        except JobCancelled:
+            _remove_quiet(out_mp4)
+            return False, 'cancelled'
+        except Exception as exc:
+            log.exception('job %s browser ingest crashed', job_id)
+            self.fail_job(job_id, str(exc))
+            _remove_quiet(out_mp4)
+            return False, str(exc)
+        finally:
+            set_cancel_token(None)
+            release_stem(out_dir, stem)
+            shutil.rmtree(job_tmp, ignore_errors=True)
+
+    def _ingest_browser_media(
+        self,
+        job_id: str,
+        state: JobState,
+        raw_path: str,
+        job_tmp: str,
+        out_mp4: str,
+        *,
+        timeline_start: Optional[float],
+        parts: Optional[list[tuple[float, int]]],
+    ) -> tuple[bool, str]:
+        if not os.path.isfile(raw_path) or os.path.getsize(raw_path) < 4096:
             self.fail_job(job_id, 'Browser sent an empty download')
             return False, 'empty payload'
 
@@ -333,41 +502,24 @@ class JobRunner:
             else 'Remux…'
         )
         self._update(job_id, status='running', msg=remux_msg, progress=0.90)
-        job_tmp = os.path.join(self.temp_dir, job_id)
-        os.makedirs(job_tmp, exist_ok=True)
-
-        out_dir = self.download_dir
-        if spec.folder:
-            out_dir = os.path.join(self.download_dir, spec.folder.strip().strip('/\\'))
-            os.makedirs(out_dir, exist_ok=True)
-        stem = allocate_unique_stem(out_dir, build_output_stem(spec))
-        out_mp4 = os.path.join(out_dir, f'{stem}.mp4')
         part_specs = [p for p in (parts or []) if p[1] > 0]
 
         try:
             if len(part_specs) > 1:
                 ok, detail = self._ingest_browser_parts(
-                    job_id, spec, payload, part_specs, job_tmp, out_mp4,
+                    job_id, spec, raw_path, part_specs, job_tmp, out_mp4,
                 )
             else:
-                raw_path = os.path.join(job_tmp, 'browser.bin')
-                with open(raw_path, 'wb') as fh:
-                    fh.write(payload)
                 ok, detail = remux_browser_payload(raw_path, out_mp4)
-                try:
-                    os.remove(raw_path)
-                except OSError:
-                    pass
                 if ok:
                     ok, detail = self._maybe_exact_trim_browser(
                         job_id, spec, out_mp4, timeline_start, detail,
                     )
-        except Exception as exc:
-            log.exception('job %s browser remux crashed', job_id)
-            self.fail_job(job_id, str(exc))
-            return False, str(exc)
+        finally:
+            _remove_quiet(raw_path)
         if not ok:
             self.fail_job(job_id, detail)
+            _remove_quiet(out_mp4)
             return False, detail
 
         msg = f'Done ({detail}, {spec.clip_encode_mode})'
@@ -403,6 +555,7 @@ class JobRunner:
             if not ok2:
                 log.warning('job %s: %s', job_id, d2)
 
+        raise_if_cancelled()
         size = os.path.getsize(out_mp4) if os.path.isfile(out_mp4) else None
         self._update(
             job_id,
@@ -414,7 +567,6 @@ class JobRunner:
             progress=1.0,
             error='',
         )
-        shutil.rmtree(job_tmp, ignore_errors=True)
         return True, msg
 
     def delete_job(self, job_id: str) -> bool:
@@ -422,6 +574,7 @@ class JobRunner:
             j = self._jobs.pop(job_id, None)
         if not j:
             return False
+        j.token.cancel()
         if j.filepath and os.path.isfile(j.filepath):
             try:
                 os.remove(j.filepath)
@@ -434,17 +587,43 @@ class JobRunner:
             j = self._jobs.get(job_id)
             if not j:
                 return
-            # Late progress events must not reset a finished job to "running".
-            if j.status == 'ready' and kwargs.get('status') == 'running':
+            # Cancelled is final: running workers keep emitting progress until they notice.
+            if j.status == 'cancelled':
+                return
+            # Late progress events must not reset a finished/failed job to "running".
+            if j.status in ('ready', 'error') and kwargs.get('status') == 'running':
                 return
             for k, v in kwargs.items():
                 setattr(j, k, v)
+            j.updated_at = time.time()
 
     def _run_job(self, job_id: str) -> None:
         with self._lock:
             state = self._jobs.get(job_id)
         if not state:
             return
+        while not self._slots.acquire(timeout=1.0):
+            if state.token.cancelled:
+                return
+        set_cancel_token(state.token)
+        job_temp = os.path.join(self.temp_dir, job_id)
+        worker: Optional[_DownloadWorker] = None
+        try:
+            if state.token.cancelled:
+                return
+            worker = self._run_job_inner(job_id, state, job_temp)
+        except JobCancelled:
+            pass
+        finally:
+            set_cancel_token(None)
+            self._slots.release()
+            shutil.rmtree(job_temp, ignore_errors=True)
+            if worker is not None:
+                if state.token.cancelled:
+                    worker.remove_partial_outputs()
+                release_stem(worker._output_base, worker._file_stem)
+
+    def _run_job_inner(self, job_id: str, state: JobState, job_temp: str) -> Optional['_DownloadWorker']:
         spec = state.spec
         status_q: queue.Queue = queue.Queue()
 
@@ -489,38 +668,45 @@ class JobRunner:
             )
 
         self._update(job_id, status='running', msg='Starting download…', progress=0.0)
+        worker: Optional[_DownloadWorker] = None
+        code = 1
         try:
             worker = _DownloadWorker(
                 spec=spec,
                 job_id=job_id,
                 download_dir=self.download_dir,
-                temp_dir=os.path.join(self.temp_dir, job_id),
+                temp_dir=job_temp,
                 status_queue=status_q,
                 progress_callback=on_progress,
             )
             code = worker.run()
-            last_error = getattr(worker, '_last_error', '')
-            status_q.put(None)
-            pump.join(timeout=600)
-            with self._lock:
-                j = self._jobs.get(job_id)
-            if j and j.status == 'running':
-                if code != 0:
-                    detail = (last_error or j.msg or j.error or '').strip()
-                    if not detail or detail.lower() == 'error':
-                        detail = 'Download fehlgeschlagen'
-                    self._update(job_id, status='error', error=detail, msg=detail)
-                else:
-                    self._update(
-                        job_id,
-                        status='error',
-                        error='Keine Ausgabedatei erzeugt',
-                        msg='Keine Ausgabedatei erzeugt',
-                    )
+        except JobCancelled:
+            return worker
         except Exception as exc:
             log.exception('job %s failed', job_id)
             self._update(job_id, status='error', error=str(exc), msg=str(exc))
+            return worker
+        finally:
             status_q.put(None)
+            pump.join(timeout=600)
+
+        last_error = worker._last_error
+        with self._lock:
+            j = self._jobs.get(job_id)
+        if j and j.status == 'running':
+            if code != 0:
+                detail = (last_error or j.msg or j.error or '').strip()
+                if not detail or detail.lower() == 'error':
+                    detail = 'Download fehlgeschlagen'
+                self._update(job_id, status='error', error=detail, msg=detail)
+            else:
+                self._update(
+                    job_id,
+                    status='error',
+                    error='Keine Ausgabedatei erzeugt',
+                    msg='Keine Ausgabedatei erzeugt',
+                )
+        return worker
 
 
 class _DownloadWorker:
@@ -541,10 +727,7 @@ class _DownloadWorker:
         self._progress_callback = progress_callback
         os.makedirs(temp_dir, exist_ok=True)
 
-        base = download_dir
-        if spec.folder:
-            base = os.path.join(download_dir, spec.folder.strip().strip('/\\'))
-            os.makedirs(base, exist_ok=True)
+        base = resolve_output_dir(download_dir, spec.folder)
         self._output_base = base
         stem = build_output_stem(spec)
         self._file_stem = allocate_unique_stem(base, stem)
@@ -562,6 +745,22 @@ class _DownloadWorker:
         fraction = max(0.0, min(1.0, fraction))
         if self._progress_callback:
             self._progress_callback(msg, fraction)
+
+    def remove_partial_outputs(self) -> None:
+        """Delete anything this job wrote under its reserved stem (cancel path)."""
+        prefix = self._file_stem + '.'
+        try:
+            names = os.listdir(self._output_base)
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(prefix):
+                _remove_quiet(os.path.join(self._output_base, name))
+
+    def _cancel_hook(self, _d: dict) -> None:
+        token = current_cancel_token()
+        if token is not None and token.cancelled:
+            raise yt_dlp.utils.DownloadCancelled('cancelled by user')
 
     def _fail(self, message: str) -> int:
         text = (message or 'Download fehlgeschlagen').strip()
@@ -865,6 +1064,7 @@ class _DownloadWorker:
         self._put({'status': 'error', 'msg': 'Download abgeschlossen, aber keine Ausgabedatei gefunden', 'error': 'Download abgeschlossen, aber keine Ausgabedatei gefunden'})
 
     def _progress_hook(self, d: dict) -> None:
+        self._cancel_hook(d)
         if self._reported_finished:
             return
         if d.get('status') == 'downloading':
@@ -985,7 +1185,7 @@ class _DownloadWorker:
                 return 0
             return self._fail(err or 'direct download failed')
 
-        ytdl_params['progress_hooks'] = []
+        ytdl_params['progress_hooks'] = [self._cancel_hook]
         ytdl_params['postprocessor_hooks'] = [self._pp_hook]
 
         clip_dl_error = None
@@ -1063,7 +1263,7 @@ class _DownloadWorker:
             **ytdl_params,
             'outtmpl': {'default': part_tmpl},
             'download_ranges': yt_dlp.utils.download_range_func(None, [(float(start), float(end))]),
-            'progress_hooks': [],
+            'progress_hooks': [self._cancel_hook],
             'postprocessor_hooks': [],
         }
         produced = None
@@ -1108,12 +1308,6 @@ class _DownloadWorker:
 
             self._put(_progress_payload(fraction=0.92, msg=f'Merging {len(part_paths)} parts…', eta=10))
 
-            list_path = os.path.join(batch_dir, 'concat.txt')
-            with open(list_path, 'w', encoding='utf-8') as fh:
-                for path in part_paths:
-                    escaped = path.replace('\\', '/').replace("'", "'\\''")
-                    fh.write(f"file '{escaped}'\n")
-
             ext = os.path.splitext(part_paths[0])[1] or '.mp4'
             merged_name = self._final_clip_output_path(ext.lstrip('.') or 'mp4')
             os.makedirs(os.path.dirname(merged_name) or self.download_dir, exist_ok=True)
@@ -1122,32 +1316,16 @@ class _DownloadWorker:
                 max(float(end) - float(start), 0.1) for start, end in ranges
             )
 
-            cmd = [
-                'ffmpeg', '-y', '-loglevel', 'error',
-                '-f', 'concat', '-safe', '0', '-i', list_path,
-                '-c', 'copy', '-shortest',
-                '-avoid_negative_ts', 'make_zero',
-                '-movflags', '+faststart',
+            # Preserve must stay stream copy; only exact may fall back to re-encode.
+            ok, concat_detail = concat_local_mp4s(
+                part_paths,
                 merged_name,
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                err = (proc.stderr or '').strip()[:400]
-                if self.spec.clip_encode_mode != 'exact':
-                    log.error('merge copy failed in preserve mode: %s', err[:200])
-                    return self._fail(err or 'ffmpeg concat (copy) failed')
-                cmd = [
-                    'ffmpeg', '-y', '-loglevel', 'error',
-                    '-f', 'concat', '-safe', '0', '-i', list_path,
-                    '-c:v', 'libx264', '-c:a', 'aac', '-shortest',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-movflags', '+faststart',
-                    merged_name,
-                ]
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-                if proc.returncode != 0:
-                    err2 = (proc.stderr or '').strip()[:400]
-                    return self._fail(err2 or 'ffmpeg concat (re-encode) failed')
+                allow_encode=self.spec.clip_encode_mode == 'exact',
+                shortest=True,
+            )
+            if not ok:
+                log.error('merge concat failed: %s', concat_detail[:200])
+                return self._fail(concat_detail or 'ffmpeg concat failed')
 
             trim_ok, trim_detail = trim_media_to_duration(
                 merged_name,
@@ -1167,14 +1345,80 @@ class _DownloadWorker:
             shutil.rmtree(batch_dir, ignore_errors=True)
 
 
+# Keys a client may set. Everything else (outtmpl, paths, exec, cookiefile,
+# postprocessors, …) could write files or run commands on the server.
+_YTDL_OVERRIDE_KEYS = {
+    'http_headers',
+    'hls_use_mpegts',
+    'external_downloader',
+    'format_sort',
+    'merge_output_format',
+    'concurrent_fragment_downloads',
+    'retries',
+    'fragment_retries',
+    'socket_timeout',
+    'geo_bypass',
+    'geo_bypass_country',
+    'noplaylist',
+    'writesubtitles',
+    'writeautomaticsub',
+    'subtitleslangs',
+}
+_EXTERNAL_DOWNLOADERS = {'ffmpeg', 'native', 'aria2c', 'curl', 'wget'}
+
+
+class OverridesError(ValueError):
+    pass
+
+
 def parse_ytdl_overrides(raw: Any) -> dict:
     if not raw:
         return {}
-    if isinstance(raw, dict):
-        return raw
     if isinstance(raw, str):
         s = raw.strip()
         if not s:
             return {}
-        return json.loads(s)
-    return {}
+        try:
+            raw = json.loads(s)
+        except json.JSONDecodeError as exc:
+            raise OverridesError(f'ytdl_options_overrides is not valid JSON: {exc.msg}') from exc
+    if not isinstance(raw, dict):
+        raise OverridesError('ytdl_options_overrides must be a JSON object')
+
+    out: dict = {}
+    for key, value in raw.items():
+        if key not in _YTDL_OVERRIDE_KEYS:
+            log.warning('ignoring ytdl override %r (not allowed)', key)
+            continue
+        if key == 'http_headers':
+            if not isinstance(value, dict):
+                raise OverridesError('http_headers must be an object')
+            value = {
+                str(k)[:100]: str(v)[:8000]
+                for k, v in value.items()
+                if v is not None and '\n' not in str(k) + str(v) and '\r' not in str(k) + str(v)
+            }
+        elif key == 'external_downloader':
+            names = value.values() if isinstance(value, dict) else [value]
+            if any(str(n) not in _EXTERNAL_DOWNLOADERS for n in names):
+                raise OverridesError('external_downloader not allowed')
+        out[key] = value
+    return out
+
+
+def _copy_bytes(src, dst, nbytes: int, chunk: int = 1024 * 1024) -> None:
+    remaining = nbytes
+    while remaining > 0:
+        buf = src.read(min(chunk, remaining))
+        if not buf:
+            break
+        dst.write(buf)
+        remaining -= len(buf)
+
+
+def _remove_quiet(path: Optional[str]) -> None:
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass

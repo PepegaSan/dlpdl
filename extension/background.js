@@ -1,8 +1,9 @@
 import {
+  apiFetch,
   buildPageJobPayload,
   buildStreamJobPayload,
   clipsForMerge,
-  jobsEndpoint,
+  errorKeyForStatus,
   selectedClips,
 } from './lib/jobs-client.js';
 import {
@@ -25,7 +26,12 @@ import {
 } from './lib/media-sniffer.js';
 import { parseClockTime } from './lib/format-time.js';
 import { downloadHlsWindows } from './lib/hls-browser-fetch.js';
-import { clearStreamFetchHeaders, setStreamFetchHeaders } from './lib/dnr-headers.js';
+import {
+  clearAllStreamFetchHeaders,
+  clearStreamFetchHeaders,
+  setStreamFetchHeaders,
+} from './lib/dnr-headers.js';
+import { initI18n, t } from './lib/i18n.js';
 import { loadClipClipboard, saveClipClipboard } from './lib/clip-clipboard.js';
 import { openClipDirectUi } from './lib/open-ui.js';
 import { collectStreamCookies, mergeCookieHeader } from './lib/browser-cookies.js';
@@ -227,17 +233,36 @@ async function jobBodyWithTabMeta(body, tabId) {
   return enriched;
 }
 
+function backendError(text, fallback) {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed?.error) return String(parsed.error);
+  } catch {
+    /* plain text */
+  }
+  return text || fallback;
+}
+
 async function postJob(settings, body, tabId) {
-  const url = jobsEndpoint(settings.clipDirectBaseUrl);
   const payload = await jobBodyWithTabMeta(body, tabId);
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  let res;
+  try {
+    res = await apiFetch(settings, 'api/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    return { ok: false, errorKey: 'error.backendUnreachable', error: err.message };
+  }
   const text = await res.text();
   if (!res.ok) {
-    return { ok: false, error: text || res.statusText };
+    const errorKey = errorKeyForStatus(res.status);
+    return {
+      ok: false,
+      ...(errorKey ? { errorKey } : {}),
+      error: backendError(text, res.statusText),
+    };
   }
   try {
     return { ok: true, data: JSON.parse(text) };
@@ -316,21 +341,23 @@ function clipWindows(clips, mergeClips) {
   })).filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start);
 }
 
+/** @returns {Promise<boolean>} false when the backend says the job is gone/cancelled */
 async function postJobProgress(settings, jobId, msg, progress) {
   try {
-    await fetch(jobsEndpoint(settings.clipDirectBaseUrl, `api/jobs/${jobId}/progress`), {
+    const res = await apiFetch(settings, `api/jobs/${jobId}/progress`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ msg, progress }),
     });
+    return !(res.status === 404 || res.status === 409);
   } catch {
-    /* ignore */
+    return true;
   }
 }
 
 async function failBrowserJob(settings, jobId, error) {
   try {
-    await fetch(jobsEndpoint(settings.clipDirectBaseUrl, `api/jobs/${jobId}/fail`), {
+    await apiFetch(settings, `api/jobs/${jobId}/fail`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ error }),
@@ -340,27 +367,147 @@ async function failBrowserJob(settings, jobId, error) {
   }
 }
 
-async function ingestBrowserJob(settings, jobId, bytes, timelineStart, parts) {
-  const url = new URL(jobsEndpoint(settings.clipDirectBaseUrl, `api/jobs/${jobId}/ingest`));
+async function ingestBrowserJob(settings, jobId, blob, timelineStart, parts) {
+  const params = new URLSearchParams();
   if (Number.isFinite(timelineStart)) {
-    url.searchParams.set('timeline_start', String(timelineStart));
+    params.set('timeline_start', String(timelineStart));
   }
   if (Array.isArray(parts) && parts.length > 1) {
-    url.searchParams.set(
-      'parts',
-      parts.map((p) => `${p.timelineStart}:${p.bytes.byteLength}`).join(';'),
-    );
+    params.set('parts', parts.map((p) => `${p.timelineStart}:${p.size}`).join(';'));
   }
-  const res = await fetch(url.toString(), {
+  const query = params.toString();
+  const res = await apiFetch(settings, `api/jobs/${jobId}/ingest${query ? `?${query}` : ''}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/octet-stream' },
-    body: bytes,
+    body: blob,
   });
   const text = await res.text();
   if (!res.ok) {
-    return { ok: false, error: text || res.statusText };
+    return { ok: false, error: backendError(text, res.statusText) };
   }
   return { ok: true };
+}
+
+/*
+ * Browser-fetch jobs run one at a time in the service worker, after the
+ * popup/bar already got its answer. MV3 may kill an idle worker, so we keep it
+ * alive while working and remember active jobs in storage.session: a fresh
+ * worker fails whatever the previous one left behind.
+ */
+const ACTIVE_JOB_PREFIX = 'cdBrowserJob:';
+const KEEPALIVE_MS = 20_000;
+const PROGRESS_THROTTLE_MS = 700;
+let browserFetchChain = Promise.resolve();
+let browserFetchActive = 0;
+let keepAliveTimer = null;
+
+function holdServiceWorker(on) {
+  browserFetchActive += on ? 1 : -1;
+  if (browserFetchActive > 0 && !keepAliveTimer) {
+    keepAliveTimer = setInterval(() => {
+      chrome.runtime.getPlatformInfo().catch(() => {});
+    }, KEEPALIVE_MS);
+  } else if (browserFetchActive <= 0 && keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+    browserFetchActive = 0;
+  }
+}
+
+async function trackBrowserJob(jobId, active) {
+  const key = `${ACTIVE_JOB_PREFIX}${jobId}`;
+  try {
+    if (active) {
+      await chrome.storage.session.set({ [key]: Date.now() });
+    } else {
+      await chrome.storage.session.remove(key);
+    }
+  } catch {
+    /* storage.session unavailable */
+  }
+}
+
+async function failOrphanBrowserJobs() {
+  let all = {};
+  try {
+    all = await chrome.storage.session.get(null);
+  } catch {
+    return;
+  }
+  const keys = Object.keys(all).filter((k) => k.startsWith(ACTIVE_JOB_PREFIX));
+  if (!keys.length) return;
+  await chrome.storage.session.remove(keys);
+  const settings = await loadSettings();
+  await initI18n(settings.uiLocale).catch(() => {});
+  for (const key of keys) {
+    await failBrowserJob(settings, key.slice(ACTIVE_JOB_PREFIX.length), t('progress.workerRestarted'));
+  }
+}
+
+void clearAllStreamFetchHeaders();
+void failOrphanBrowserJobs();
+
+function remuxStepLabel(settings) {
+  if (settings.clipEncodeMode === 'exact') return t('progress.exactCut');
+  return settings.postRender ? t('progress.rerender') : t('progress.remux');
+}
+
+async function runBrowserFetch(job) {
+  const { settings, jobId, stream, headers, windows } = job;
+  await initI18n(settings.uiLocale).catch(() => {});
+  const abort = new AbortController();
+  let lastSent = 0;
+  let ruleId = null;
+  const onProgress = (frac, msg, info) => {
+    const now = Date.now();
+    if (now - lastSent < PROGRESS_THROTTLE_MS && frac < 0.96) return;
+    lastSent = now;
+    const label = info?.key ? t(info.key, info.params) : msg;
+    void postJobProgress(settings, jobId, label, frac).then((alive) => {
+      if (!alive) abort.abort();
+    });
+  };
+  try {
+    ruleId = await setStreamFetchHeaders(stream.url, headers);
+    const downloaded = await downloadHlsWindows(stream.url, windows, onProgress, abort.signal);
+    if (!(await postJobProgress(settings, jobId, remuxStepLabel(settings), 0.91))) {
+      return;
+    }
+    const ingested = await ingestBrowserJob(
+      settings,
+      jobId,
+      downloaded.blob,
+      downloaded.timelineStart,
+      downloaded.parts,
+    );
+    if (!ingested.ok) {
+      await failBrowserJob(settings, jobId, ingested.error || 'ingest failed');
+    }
+  } catch (err) {
+    if (abort.signal.aborted) return;
+    const detail = err?.message || String(err);
+    await failBrowserJob(settings, jobId, t('progress.browserFailed', { error: detail }));
+  } finally {
+    await clearStreamFetchHeaders(ruleId);
+  }
+}
+
+function enqueueBrowserFetch(job) {
+  holdServiceWorker(true);
+  // The backend fails browser jobs that stay silent too long; keep queued ones alive.
+  const waitPing = setInterval(() => {
+    void postJobProgress(job.settings, job.jobId, t('progress.waitingBrowser'), 0);
+  }, 60_000);
+  const run = browserFetchChain.then(async () => {
+    clearInterval(waitPing);
+    try {
+      await runBrowserFetch(job);
+    } finally {
+      await trackBrowserJob(job.jobId, false);
+      holdServiceWorker(false);
+    }
+  });
+  browserFetchChain = run.catch(() => {});
 }
 
 async function queueStreamBrowser(stream, pageUrl, tabUrl, clips, mergeClips, tabId, mergedCookies) {
@@ -382,43 +529,17 @@ async function queueStreamBrowser(stream, pageUrl, tabUrl, clips, mergeClips, ta
   if (!jobId) {
     return { ok: false, error: 'no job id' };
   }
+  await trackBrowserJob(jobId, true);
+  const windows = clipWindows(clips, mergeClips);
+  enqueueBrowserFetch({
+    settings,
+    jobId,
+    stream,
+    headers,
+    windows: mergeClips || windows.length <= 1 ? windows : windows.slice(0, 1),
+  });
   await maybeOpenUi(settings, { background: true });
-  try {
-    await setStreamFetchHeaders(stream.url, headers);
-    const windows = clipWindows(clips, mergeClips);
-    const downloaded = await downloadHlsWindows(
-      stream.url,
-      mergeClips || windows.length <= 1 ? windows : windows.slice(0, 1),
-      (frac, msg) => {
-        void postJobProgress(settings, jobId, msg, frac);
-      },
-    );
-    const exactCut = settings.clipEncodeMode === 'exact';
-    await postJobProgress(
-      settings,
-      jobId,
-      exactCut ? 'Exakter Schnitt…' : (settings.postRender ? 'Neu rendern (Keyframe-Fix)…' : 'Remux…'),
-      0.91,
-    );
-    const ingested = await ingestBrowserJob(
-      settings,
-      jobId,
-      downloaded.bytes,
-      downloaded.timelineStart,
-      downloaded.parts,
-    );
-    if (!ingested.ok) {
-      await failBrowserJob(settings, jobId, ingested.error || 'ingest failed');
-      return { ok: false, error: ingested.error };
-    }
-    return created;
-  } catch (err) {
-    const detail = err?.message || String(err);
-    await failBrowserJob(settings, jobId, `Browser download failed: ${detail}`);
-    return { ok: false, error: detail };
-  } finally {
-    await clearStreamFetchHeaders();
-  }
+  return { ...created, browserFetch: true };
 }
 
 async function queueStream(stream, pageUrl, clips, mergeClips, tabHint = null) {
@@ -768,6 +889,20 @@ async function forwardToTab(tabId, payload) {
   }
 }
 
+const COMMAND_ACTIONS = {
+  'mark-start': 'markStart',
+  'mark-end': 'markEnd',
+  'show-bar': 'showBar',
+};
+
+chrome.commands?.onCommand.addListener(async (command, tab) => {
+  const action = COMMAND_ACTIONS[command];
+  if (!action) return;
+  const tabId = tab?.id ?? (await activeTabId());
+  if (tabId == null || tabId < 0) return;
+  await forwardToTab(tabId, { action });
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.action === 'queueClips') {
     queueClips(msg.pageUrl, msg.clips, msg.mergeClips, sender?.tab?.id ?? msg.tabId)
@@ -986,16 +1121,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: 'no_clips' });
         return;
       }
-      let result = { ok: false, error: 'no_video_frame' };
-      try {
-        result = await chrome.tabs.sendMessage(tabId, {
-          action: 'replaceClips',
-          clips,
-          force: true,
-        });
-      } catch (err) {
-        result = { ok: false, error: String(err?.message || err) };
-      }
+      // Only frames with a video answer a forced replace (embed players live in iframes).
+      const result = (await sendToAllFrames(tabId, {
+        action: 'replaceClips',
+        clips,
+        force: true,
+      })) || { ok: false, error: 'no_video_frame' };
       if (result?.ok && Array.isArray(result.clips)) {
         const entry = session.clipEntry(tabId);
         session.setClips(
